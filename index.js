@@ -28,6 +28,7 @@ import createProxyUpdater from './modules/proxyUpdater.js';
 import ExecutorClass from './modules/executor.js';
 
 let encryptionManager = null;
+let encryptionInitialized = false;
 
 const fastify = Fastify({ logger: false });
 
@@ -41,25 +42,34 @@ if (!fs.existsSync(dbDir)) {
   console.log(`[INIT] Created database directory: ${dbDir}`);
 }
 
-if (config.ENCRYPTION && config.ENCRYPTION.ENABLED) {
-  try {
-    const { default: EncryptionManager } = await import('./modules/encryption.js');
-    const encryptionConfig = {
-      ...config,
-      ENCRYPTION: {
-        ...config.ENCRYPTION,
-        NODE_ID: config.NODE.ID
-      }
-    };
-    encryptionManager = new EncryptionManager(encryptionConfig);
-    console.log('[INIT] Encryption system loaded');
-  } catch (error) {
-    console.error('[INIT] Failed to load encryption:', error.message);
-    if (!config.ENCRYPTION) config.ENCRYPTION = {};
-    config.ENCRYPTION.ENABLED = false;
+// FIX: Proper async initialization untuk encryption
+async function initializeEncryption() {
+  if (config.ENCRYPTION && config.ENCRYPTION.ENABLED) {
+    try {
+      const { default: EncryptionManager } = await import('./modules/encryption.js');
+      const encryptionConfig = {
+        ...config,
+        ENCRYPTION: {
+          ...config.ENCRYPTION,
+          NODE_ID: config.NODE.ID
+        }
+      };
+      encryptionManager = new EncryptionManager(encryptionConfig);
+      encryptionInitialized = true;
+      console.log('[INIT] Encryption system loaded');
+      return true;
+    } catch (error) {
+      console.error('[INIT] Failed to load encryption:', error.message);
+      if (!config.ENCRYPTION) config.ENCRYPTION = {};
+      config.ENCRYPTION.ENABLED = false;
+      encryptionInitialized = false;
+      return false;
+    }
+  } else {
+    console.log('[INIT] Encryption disabled by config');
+    encryptionInitialized = false;
+    return false;
   }
-} else {
-  console.log('[INIT] Encryption disabled by config');
 }
 
 let methodsConfig = {};
@@ -78,7 +88,7 @@ const sharedData = {
   config,
   methodsConfig: {},
   executor: null,
-  encryptionManager,
+  encryptionManager: null,
   proxyUpdater: null,
   nodeMode: 'DIRECT',
   isRegistered: false,
@@ -121,12 +131,16 @@ const sharedData = {
   
   setProxyUpdater(updater) {
     this.proxyUpdater = updater;
+  },
+  
+  // FIX: Add method to update encryption manager reference
+  setEncryptionManager(manager) {
+    this.encryptionManager = manager;
   }
 };
 
 function loadMethodsConfig() {
   try {
-    // PERBAIKAN: pakai methodSyncModule.getMethodsWithAbsolutePaths
     const methodsWithPaths = methodSyncModule.getMethodsWithAbsolutePaths(config);
     
     if (!methodsWithPaths || Object.keys(methodsWithPaths).length === 0) {
@@ -146,7 +160,6 @@ function loadMethodsConfig() {
 
 function refreshMethodsConfig() {
   try {
-    // PERBAIKAN: pakai methodSyncModule.getMethodsWithAbsolutePaths
     const methodsWithPaths = methodSyncModule.getMethodsWithAbsolutePaths(config);
     sharedData.updateMethodsConfig(methodsWithPaths);
     
@@ -182,7 +195,8 @@ const encryptionDecorator = async (request, reply) => {
       return;
     }
 
-    if (request.body.envelope === 'secure' && encryptionManager && config.ENCRYPTION?.ENABLED) {
+    // FIX: Check if encryption is initialized before using
+    if (request.body.envelope === 'secure' && encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED) {
       const result = encryptionManager.processSecureMessage(request.body);
       if (result.success) {
         request.body = result.data;
@@ -215,7 +229,8 @@ const encryptionDecorator = async (request, reply) => {
 };
 
 function sendEncryptedResponse(reply, data, messageType = 'response') {
-  if (encryptionManager && config.ENCRYPTION?.ENABLED) {
+  // FIX: Check if encryption is fully initialized
+  if (encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED) {
     const encrypted = encryptionManager.createSecureMessage(data, messageType);
     reply.send(encrypted);
   } else {
@@ -270,7 +285,7 @@ function validateInput(target, time, reqPort, methods) {
 
 async function fetchServerInfo() {
   try {
-    const res = await fetchWithTimeout('https://httpbin.org/get', { timeout: 5000 });
+    const res = await fetchWithTimeout('https://httpbin.org/get', {}, 5000);
     const data = await res.json();
     console.log(`Server up: http://${data.origin}:${config.SERVER.PORT}`);
   } catch {
@@ -341,6 +356,7 @@ async function checkNodeReachability(ip, port) {
 
     let ipToCheck = ip || config.NODE.IP;
     
+    // FIX: Better IPv6 handling
     if (ipToCheck === '::1') {
       ipToCheck = '127.0.0.1';
     }
@@ -393,7 +409,9 @@ async function syncMethods() {
     const { syncMethodsWithMaster } = methodSyncModule;
     const result = await syncMethodsWithMaster(config);
     
+    // FIX: Proper await untuk refresh
     if (result && result.success && !result.up_to_date) {
+      await new Promise(resolve => setTimeout(resolve, 100)); // Give time for file write
       refreshMethodsConfig();
     }
     
@@ -541,7 +559,7 @@ fastify.get('/health', async (request, reply) => {
     status: 'ok',
     node_id: config.NODE.ID,
     timestamp: new Date().toISOString(),
-    encryption: !!(config.ENCRYPTION?.ENABLED),
+    encryption: encryptionInitialized && !!(config.ENCRYPTION?.ENABLED),
     mode: nodeMode,
     reachable: isReachable,
     methods_count: Object.keys(sharedData.methodsConfig).length,
@@ -557,6 +575,10 @@ async function initializeModules() {
     sharedData.executor = executor;
   }
   
+  // FIX: Initialize encryption first and wait for it
+  await initializeEncryption();
+  sharedData.setEncryptionManager(encryptionManager);
+  
   if (!heartbeatModule) {
     heartbeatModule = createHeartbeat(config, executor, sharedData.methodsConfig);
     console.log('[INIT] Heartbeat module created');
@@ -567,7 +589,8 @@ async function initializeModules() {
       console.log('[INIT] Testing connection to master...');
       const testResponse = await fetchWithTimeout(
         config.MASTER.URL + '/api/status',
-        { timeout: 5000 }
+        {},
+        5000
       );
       if (testResponse.ok) {
         console.log('[INIT] ✓ Master server is reachable');
@@ -662,7 +685,7 @@ function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
   
   console.log(
     `[INIT] Ready - Methods: ${Object.keys(sharedData.methodsConfig).length}, ` +
-    `Encryption: ${config.ENCRYPTION?.ENABLED ? 'ON' : 'OFF'}, ` +
+    `Encryption: ${config.ENCRYPTION?.ENABLED && encryptionInitialized ? 'ON' : 'OFF'}, ` +
     `Mode: ${nodeMode}, Reachable: ${isReachable ? 'YES' : 'NO'}`
   );
 }
@@ -725,7 +748,13 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[REVERSE-INIT] Connecting to master via WebSocket...');
   reverseClient.connect();
   
+  // FIX: Better connection state checking
+  let connectionCheckAttempts = 0;
+  const maxConnectionCheckAttempts = 30;
+  
   const setupInterval = setInterval(async () => {
+    connectionCheckAttempts++;
+    
     if (reverseClient.isConnected && reverseClient.isConnected()) {
       clearInterval(setupInterval);
       console.log('[REVERSE] WebSocket connected, starting setup...');
@@ -758,12 +787,9 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
         }
       }, methodsSyncInterval);
       
-    } else if (
-      reverseClient.getConnectionState && 
-      reverseClient.getConnectionState().state === 'NOT_CONNECTED'
-    ) {
+    } else if (connectionCheckAttempts >= maxConnectionCheckAttempts) {
       clearInterval(setupInterval);
-      console.log('[REVERSE] WebSocket not connecting, will retry in 10 seconds...');
+      console.log('[REVERSE] Connection timeout, will retry in 10 seconds...');
       setTimeout(() => startReverseMode(heartbeatInterval, methodsSyncInterval), 10000);
     }
   }, 1000);
@@ -792,7 +818,7 @@ function startHeartbeatService(heartbeatInterval) {
     console.log(`[HEARTBEAT] Started background heartbeat every ${heartbeatInterval}ms`);
   } else {
     heartbeatIntervalId = setInterval(() => {
-      if (encryptionManager && config.ENCRYPTION?.ENABLED) {
+      if (encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED) {
         heartbeatModule.sendEncryptedHeartbeat().catch((err) => {
           console.error('[HEARTBEAT] Error:', err.message);
         });
@@ -868,9 +894,17 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
 function gracefulShutdown(signal) {
   console.log(`\n[SHUTDOWN] Received ${signal}. Shutting down gracefully...`);
   
-  if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
-  if (methodsSyncIntervalId) clearInterval(methodsSyncIntervalId);
+  // FIX: Clear all intervals
+  if (heartbeatIntervalId) {
+    clearInterval(heartbeatIntervalId);
+    heartbeatIntervalId = null;
+  }
+  if (methodsSyncIntervalId) {
+    clearInterval(methodsSyncIntervalId);
+    methodsSyncIntervalId = null;
+  }
   
+  // FIX: Proper cleanup order
   if (proxyUpdater && proxyUpdater.stopAutoUpdate) {
     proxyUpdater.stopAutoUpdate();
   }
@@ -883,18 +917,26 @@ function gracefulShutdown(signal) {
   if (reverseClient && reverseClient.shutdown) {
     reverseClient.shutdown();
   }
-  if (executor.cleanup) {
+  if (executor && executor.cleanup) {
     executor.cleanup();
-  } else {
+  } else if (executor) {
     const killed = executor.killAllProcesses();
     console.log(`[SHUTDOWN] Killed ${killed} active processes`);
   }
   
   console.log('[SHUTDOWN] Cleanup completed');
   
-  setTimeout(() => {
+  // FIX: Close fastify properly
+  fastify.close(() => {
+    console.log('[SHUTDOWN] Fastify closed');
     process.exit(0);
-  }, 1000);
+  });
+  
+  // Force exit after 5 seconds
+  setTimeout(() => {
+    console.log('[SHUTDOWN] Force exit');
+    process.exit(0);
+  }, 5000);
 }
 
 // Startup server dengan async/await yang benar
@@ -928,7 +970,8 @@ async function startServer() {
       console.log('[INIT] WARNING: Cannot reach master, will try REVERSE mode if WS available');
     }
 
-    if (config.ENCRYPTION?.ENABLED && encryptionManager) {
+    // FIX: Test encryption after initialization
+    if (config.ENCRYPTION?.ENABLED && encryptionManager && encryptionInitialized) {
       try {
         const testResult = encryptionManager.testEncryption();
         console.log(`[ENCRYPTION-TEST] ${testResult.success ? 'PASSED' : 'FAILED'}`);

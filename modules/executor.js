@@ -15,6 +15,7 @@ class Executor extends EventEmitter {
     this.processCounter = 0;
     this.eventListeners = new Map();
     this.zombieCheckInterval = null;
+    this.isShuttingDown = false; // FIX: Add shutdown flag
     
     this.zombieConfig = {
       enabled: config.ZOMBIE_DETECTION?.ENABLED !== false,
@@ -26,7 +27,11 @@ class Executor extends EventEmitter {
     this.dataDir = path.join(__dirname, '..', 'lib', 'data');
     
     if (!fs.existsSync(this.dataDir)) {
-      fs.mkdirSync(this.dataDir, { recursive: true });
+      try {
+        fs.mkdirSync(this.dataDir, { recursive: true });
+      } catch (error) {
+        console.error('[EXEC-INIT] Failed to create data directory:', error.message);
+      }
     }
     
     this.systemCommands = new Set([
@@ -51,33 +56,54 @@ class Executor extends EventEmitter {
     console.log(`[EXEC-INIT] Data directory: ${this.dataDir}`);
   }
 
-  // Helper untuk menghapus event listener dengan kompatibilitas
+  // FIX: Improved event listener cleanup with better error handling
   _removeListener(emitter, event, handler) {
-    if (emitter && handler) {
+    if (!emitter || !handler) {
+      return;
+    }
+    
+    try {
       if (typeof emitter.off === 'function') {
         emitter.off(event, handler);
       } else if (typeof emitter.removeListener === 'function') {
         emitter.removeListener(event, handler);
       }
+    } catch (error) {
+      // Silently ignore errors during cleanup
     }
   }
 
-  // Membersihkan semua event listener untuk suatu process
+  // FIX: Enhanced cleanup with null checks
   _cleanupProcessListeners(processId) {
     const listeners = this.eventListeners.get(processId);
-    if (listeners) {
-      const processInfo = this.activeProcesses.get(processId);
-      const child = processInfo?.process;
-      
-      if (child) {
-        this._removeListener(child.stdout, 'data', listeners.stdoutHandler);
-        this._removeListener(child.stderr, 'data', listeners.stderrHandler);
-        this._removeListener(child, 'exit', listeners.exitHandler);
-        this._removeListener(child, 'error', listeners.errorHandler);
-      }
-      
-      this.eventListeners.delete(processId);
+    if (!listeners) {
+      return;
     }
+    
+    const processInfo = this.activeProcesses.get(processId);
+    const child = processInfo?.process;
+    
+    if (child) {
+      try {
+        // Remove all listeners with null checks
+        if (child.stdout && listeners.stdoutHandler) {
+          this._removeListener(child.stdout, 'data', listeners.stdoutHandler);
+        }
+        if (child.stderr && listeners.stderrHandler) {
+          this._removeListener(child.stderr, 'data', listeners.stderrHandler);
+        }
+        if (listeners.exitHandler) {
+          this._removeListener(child, 'exit', listeners.exitHandler);
+        }
+        if (listeners.errorHandler) {
+          this._removeListener(child, 'error', listeners.errorHandler);
+        }
+      } catch (error) {
+        // Silently ignore cleanup errors
+      }
+    }
+    
+    this.eventListeners.delete(processId);
   }
 
   startZombieChecker() {
@@ -86,7 +112,9 @@ class Executor extends EventEmitter {
     }
     
     this.zombieCheckInterval = setInterval(() => {
-      this.checkAndKillZombieProcesses();
+      if (!this.isShuttingDown) {
+        this.checkAndKillZombieProcesses();
+      }
     }, this.zombieConfig.checkInterval);
     
     console.log(
@@ -102,20 +130,26 @@ class Executor extends EventEmitter {
     }
   }
 
+  // FIX: Improved zombie detection logic with proper grace period handling
   checkAndKillZombieProcesses() {
     const now = Date.now();
     const zombieProcesses = [];
     
     for (const [processId, info] of this.activeProcesses) {
-      if (
-        info.expectedEndTime &&
-        now > info.expectedEndTime + this.zombieConfig.gracePeriod
-      ) {
-        const overtime = now - info.expectedEndTime;
+      // FIX: Only check processes that have expected end time
+      if (!info.expectedEndTime) {
+        continue;
+      }
+      
+      // FIX: Calculate overtime properly with grace period
+      const timeSinceExpected = now - info.expectedEndTime;
+      
+      // Only consider as zombie if overtime exceeds grace period
+      if (timeSinceExpected > this.zombieConfig.gracePeriod) {
         zombieProcesses.push({
           processId,
           info,
-          overtime
+          overtime: timeSinceExpected
         });
       }
     }
@@ -130,7 +164,7 @@ class Executor extends EventEmitter {
         const overtimeSeconds = Math.round(zombie.overtime / 1000);
         console.log(
           `[EXEC-ZOMBIE] Process ${zombie.processId} (PID: ${zombie.info.pid}) ` +
-          `overtime: ${overtimeSeconds}s`
+          `overtime: ${overtimeSeconds}s (grace period: ${this.zombieConfig.gracePeriod}ms)`
         );
 
         if (this.zombieConfig.autoKill) {
@@ -178,14 +212,25 @@ class Executor extends EventEmitter {
 
   cleanup() {
     console.log('[EXEC] Cleaning up executor resources...');
+    
+    // FIX: Set shutdown flag to prevent race conditions
+    this.isShuttingDown = true;
 
     this.stopZombieChecker();
 
     const killed = this.killAllProcesses();
     console.log(`[EXEC] Killed ${killed} active processes during cleanup`);
 
+    // FIX: Clear all event listeners properly
+    for (const processId of this.eventListeners.keys()) {
+      this._cleanupProcessListeners(processId);
+    }
+    
     this.eventListeners.clear();
     this.activeProcesses.clear();
+    
+    // FIX: Remove all event emitter listeners
+    this.removeAllListeners();
 
     console.log('[EXEC] Executor cleanup completed');
   }
@@ -223,13 +268,19 @@ class Executor extends EventEmitter {
     return result;
   }
 
+  // FIX: Improved file finding with better error handling
   findFileInDataDir(filename) {
     filename = filename.replace(/^["']|["']$/g, '');
     
+    // FIX: Handle absolute paths properly
     if (path.isAbsolute(filename)) {
-      return filename;
+      if (fs.existsSync(filename)) {
+        return filename;
+      }
+      // If absolute path doesn't exist, continue to search in data dir
     }
     
+    // Check if it's a system command
     if (this.systemCommands.has(filename)) {
       return filename;
     }
@@ -242,8 +293,8 @@ class Executor extends EventEmitter {
     ];
     
     for (const filePath of possiblePaths) {
-      if (fs.existsSync(filePath)) {
-        try {
+      try {
+        if (fs.existsSync(filePath)) {
           const stats = fs.statSync(filePath);
           if (!stats.isDirectory()) {
             const ext = path.extname(filePath).toLowerCase();
@@ -264,12 +315,13 @@ class Executor extends EventEmitter {
             }
             return filePath;
           }
-        } catch (e) {
-          // ignore stat error
         }
+      } catch (e) {
+        // ignore stat error and continue
       }
     }
     
+    // Return original filename if not found
     return filename;
   }
 
@@ -281,6 +333,7 @@ class Executor extends EventEmitter {
     for (let i = 0; i < resolvedParts.length; i++) {
       const part = resolvedParts[i];
       
+      // Skip flags, placeholders, and assignments
       if (part.startsWith('-') || part.startsWith('{') || part.includes('=')) {
         continue;
       }
@@ -295,6 +348,14 @@ class Executor extends EventEmitter {
   }
 
   execute(command, options = {}) {
+    // FIX: Check if shutting down
+    if (this.isShuttingDown) {
+      return Promise.reject({
+        success: false,
+        error: 'Executor is shutting down'
+      });
+    }
+    
     const processId = ++this.processCounter;
     const startTime = Date.now();
     
@@ -377,7 +438,8 @@ class Executor extends EventEmitter {
 
       if (expectedDuration > 0) {
         console.log(
-          `[EXEC ${processId}] Expected duration: ${expectedDuration / 1000}s`
+          `[EXEC ${processId}] Expected duration: ${expectedDuration / 1000}s, ` +
+          `will be zombie after: ${(expectedDuration + this.zombieConfig.gracePeriod) / 1000}s`
         );
       }
 
@@ -402,18 +464,23 @@ class Executor extends EventEmitter {
         executable
       });
 
+      // FIX: Better event handler management
       const stdoutHandler = (data) => {
-        this.emit('process_stdout', {
-          processId,
-          data: data.toString()
-        });
+        if (!this.isShuttingDown) {
+          this.emit('process_stdout', {
+            processId,
+            data: data.toString()
+          });
+        }
       };
 
       const stderrHandler = (data) => {
-        this.emit('process_stderr', {
-          processId,
-          data: data.toString()
-        });
+        if (!this.isShuttingDown) {
+          this.emit('process_stderr', {
+            processId,
+            data: data.toString()
+          });
+        }
       };
 
       const exitHandler = (code, signal) => {
@@ -424,9 +491,10 @@ class Executor extends EventEmitter {
         
         const endTime = Date.now();
         const duration = endTime - startTime;
-        const wasZombie =
-          expectedEndTime &&
-          duration > expectedDuration + this.zombieConfig.gracePeriod;
+        
+        // FIX: Proper zombie calculation with grace period
+        const wasZombie = expectedEndTime && 
+          (duration > expectedDuration + this.zombieConfig.gracePeriod);
 
         processInfo.killed =
           processInfo.killed ||
@@ -436,21 +504,25 @@ class Executor extends EventEmitter {
         this.activeProcesses.delete(processId);
         this._cleanupProcessListeners(processId);
 
-        this.emit('process_completed', {
-          processId,
-          command: resolvedCommand,
-          duration,
-          code,
-          signal,
-          wasZombie,
-          expectedDuration,
-          actualDuration: duration,
-          executable
-        });
+        if (!this.isShuttingDown) {
+          this.emit('process_completed', {
+            processId,
+            command: resolvedCommand,
+            duration,
+            code,
+            signal,
+            wasZombie,
+            expectedDuration,
+            actualDuration: duration,
+            executable
+          });
+        }
 
         if (wasZombie) {
           console.log(
-            `[EXEC ${processId}] Exited as ZOMBIE. duration=${duration}ms`
+            `[EXEC ${processId}] Exited as ZOMBIE. ` +
+            `duration=${duration}ms, expected=${expectedDuration}ms, ` +
+            `grace=${this.zombieConfig.gracePeriod}ms`
           );
         } else {
           console.log(
@@ -482,25 +554,36 @@ class Executor extends EventEmitter {
           });
         }
 
-        this.emit('process_error', {
-          processId,
-          command: resolvedCommand,
-          error: error.message,
-          executable
-        });
+        if (!this.isShuttingDown) {
+          this.emit('process_error', {
+            processId,
+            command: resolvedCommand,
+            error: error.message,
+            executable
+          });
+        }
       };
 
-      childProcess.stdout?.on('data', stdoutHandler);
-      childProcess.stderr?.on('data', stderrHandler);
-      childProcess.on('exit', exitHandler);
-      childProcess.on('error', errorHandler);
+      // FIX: Add error handling for stream listeners
+      try {
+        if (childProcess.stdout) {
+          childProcess.stdout.on('data', stdoutHandler);
+        }
+        if (childProcess.stderr) {
+          childProcess.stderr.on('data', stderrHandler);
+        }
+        childProcess.on('exit', exitHandler);
+        childProcess.on('error', errorHandler);
 
-      this.eventListeners.set(processId, {
-        stdoutHandler,
-        stderrHandler,
-        exitHandler,
-        errorHandler
-      });
+        this.eventListeners.set(processId, {
+          stdoutHandler,
+          stderrHandler,
+          exitHandler,
+          errorHandler
+        });
+      } catch (error) {
+        console.error(`[EXEC ${processId}] Failed to attach listeners:`, error.message);
+      }
     });
   }
 
@@ -515,22 +598,52 @@ class Executor extends EventEmitter {
       if (processInfo.process && !processInfo.killed) {
         const child = processInfo.process;
         processInfo.killed = true;
-        child.kill('SIGKILL');
-        console.log(
-          `[EXEC ${processId}] Sent SIGKILL to process ${processInfo.pid}`
-        );
+        
+        // FIX: Try SIGTERM first, then SIGKILL
+        try {
+          child.kill('SIGTERM');
+          console.log(
+            `[EXEC ${processId}] Sent SIGTERM to process ${processInfo.pid}`
+          );
+          
+          // Give process 2 seconds to terminate gracefully
+          setTimeout(() => {
+            if (this.activeProcesses.has(processId)) {
+              try {
+                child.kill('SIGKILL');
+                console.log(
+                  `[EXEC ${processId}] Sent SIGKILL to process ${processInfo.pid}`
+                );
+              } catch (e) {
+                // Process might already be dead
+              }
+            }
+          }, 2000);
+        } catch (killError) {
+          // Try SIGKILL immediately if SIGTERM fails
+          try {
+            child.kill('SIGKILL');
+            console.log(
+              `[EXEC ${processId}] Sent SIGKILL to process ${processInfo.pid}`
+            );
+          } catch (e) {
+            console.error(`[EXEC ${processId}] Kill failed:`, e.message);
+          }
+        }
       }
 
       this.activeProcesses.delete(processId);
       this._cleanupProcessListeners(processId);
 
-      this.emit('process_killed', {
-        processId,
-        pid: processInfo.pid,
-        command: processInfo.command,
-        reason: 'manual_kill',
-        executable: processInfo.executable
-      });
+      if (!this.isShuttingDown) {
+        this.emit('process_killed', {
+          processId,
+          pid: processInfo.pid,
+          command: processInfo.command,
+          reason: 'manual_kill',
+          executable: processInfo.executable
+        });
+      }
 
       console.log(`[EXEC ${processId}] Process terminated`);
       return true;
@@ -563,12 +676,12 @@ class Executor extends EventEmitter {
 
   getActiveProcesses() {
     const processes = [];
+    const now = Date.now();
 
     for (const [processId, info] of this.activeProcesses) {
-      const now = Date.now();
-      const isZombie =
-        info.expectedEndTime &&
-        now > info.expectedEndTime + this.zombieConfig.gracePeriod;
+      // FIX: Proper zombie calculation
+      const isZombie = info.expectedEndTime &&
+        (now > info.expectedEndTime + this.zombieConfig.gracePeriod);
       
       processes.push({
         processId,
@@ -580,7 +693,7 @@ class Executor extends EventEmitter {
         expectedDuration: info.expectedDuration,
         expectedEndTime: info.expectedEndTime,
         isZombie,
-        overtime: isZombie ? now - info.expectedEndTime : 0,
+        overtime: isZombie ? (now - info.expectedEndTime) : 0,
         executable: info.executable
       });
     }
@@ -596,9 +709,8 @@ class Executor extends EventEmitter {
     }
 
     const now = Date.now();
-    const isZombie =
-      info.expectedEndTime &&
-      now > info.expectedEndTime + this.zombieConfig.gracePeriod;
+    const isZombie = info.expectedEndTime &&
+      (now > info.expectedEndTime + this.zombieConfig.gracePeriod);
 
     return {
       processId,
@@ -610,7 +722,7 @@ class Executor extends EventEmitter {
       expectedDuration: info.expectedDuration,
       expectedEndTime: info.expectedEndTime,
       isZombie,
-      overtime: isZombie ? now - info.expectedEndTime : 0,
+      overtime: isZombie ? (now - info.expectedEndTime) : 0,
       executable: info.executable
     };
   }
@@ -690,7 +802,8 @@ class Executor extends EventEmitter {
         active.length > 0
           ? active.reduce((sum, p) => sum + p.duration, 0) / active.length
           : 0,
-      dataDir: this.dataDir
+      dataDir: this.dataDir,
+      isShuttingDown: this.isShuttingDown
     };
   }
 }

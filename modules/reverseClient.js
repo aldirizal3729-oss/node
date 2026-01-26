@@ -37,6 +37,7 @@ function createReverseClient(config, executor, methodsConfig) {
   let pingInterval = null;
   let reconnectAttempts = 0;
   const maxReconnectAttempts = config.REVERSE?.MAX_RECONNECT_ATTEMPTS || 10;
+  let lastSuccessfulConnection = null; // FIX: Track last successful connection
   
   let masterDownDetection = {
     lastHeartbeatSuccess: Date.now(),
@@ -64,7 +65,6 @@ function createReverseClient(config, executor, methodsConfig) {
         console.log('[REVERSE] Encryption loaded for WebSocket');
       } catch (error) {
         console.error('[REVERSE] Failed to load encryption:', error.message);
-        // Non-fatal error, continue without encryption
       }
     })();
   }
@@ -87,6 +87,8 @@ function createReverseClient(config, executor, methodsConfig) {
         
         if (!ws || ws.readyState !== WebSocket.OPEN) {
           console.log('[REVERSE] Attempting WebSocket reconnect after master recovery...');
+          // FIX: Reset reconnect attempts when master comes back
+          reconnectAttempts = 0;
           scheduleImmediateReconnect();
         }
       }
@@ -104,8 +106,9 @@ function createReverseClient(config, executor, methodsConfig) {
         }
       }
       
-      if (now - masterDownDetection.lastHeartbeatSuccess > 300000) { // 5 menit
-        console.log('[REVERSE] No successful heartbeat for 5 minutes, forcing reconnection...');
+      // FIX: More conservative timeout for force reconnect
+      if (now - masterDownDetection.lastHeartbeatSuccess > 600000) { // 10 minutes instead of 5
+        console.log('[REVERSE] No successful heartbeat for 10 minutes, forcing reconnection...');
         forceReconnect();
       }
     }
@@ -123,7 +126,10 @@ function createReverseClient(config, executor, methodsConfig) {
       ws = null;
     }
     
-    reconnectAttempts = 0;
+    // FIX: Only reset if we had a recent successful connection
+    if (lastSuccessfulConnection && (Date.now() - lastSuccessfulConnection) < 300000) {
+      reconnectAttempts = 0;
+    }
     
     scheduleImmediateReconnect();
   }
@@ -235,7 +241,8 @@ function createReverseClient(config, executor, methodsConfig) {
           ws_state: ws ? ws.readyState : 'NO_CONNECTION',
           encryption: !!(config.ENCRYPTION && config.ENCRYPTION.ENABLED),
           master_status: masterDownDetection.isMasterDown ? 'down' : 'up',
-          consecutive_failures: masterDownDetection.consecutiveFailures
+          consecutive_failures: masterDownDetection.consecutiveFailures,
+          reconnect_attempts: reconnectAttempts
         },
         node_config: {
           ip: config.NODE.IP || null,
@@ -518,7 +525,8 @@ function createReverseClient(config, executor, methodsConfig) {
         methods_count: Object.keys(currentMethodsConfig).length,
         ws_connected: ws && ws.readyState === WebSocket.OPEN,
         encryption: !!(config.ENCRYPTION && config.ENCRYPTION.ENABLED),
-        master_status: masterDownDetection.isMasterDown ? 'down' : 'up'
+        master_status: masterDownDetection.isMasterDown ? 'down' : 'up',
+        reconnect_attempts: reconnectAttempts
       };
     } catch (error) {
       console.error('[REVERSE] Error getting simple status:', error);
@@ -599,7 +607,7 @@ function createReverseClient(config, executor, methodsConfig) {
     }
 
     console.log(
-      `[REVERSE] WS: Connecting to ${config.MASTER.WS_URL} (attempt ${reconnectAttempts + 1})`
+      `[REVERSE] WS: Connecting to ${config.MASTER.WS_URL} (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts})`
     );
 
     try {
@@ -621,7 +629,10 @@ function createReverseClient(config, executor, methodsConfig) {
 
       ws.on('open', async () => {
         console.log('[REVERSE] WS: ✓ Connected to master');
+        
+        // FIX: Reset reconnect attempts on successful connection
         reconnectAttempts = 0;
+        lastSuccessfulConnection = Date.now();
         masterDownDetection.isMasterDown = false;
         masterCameBack = false;
 
@@ -716,16 +727,30 @@ function createReverseClient(config, executor, methodsConfig) {
 
         if (!isShuttingDown) {
           reconnectAttempts++;
+          
+          // FIX: Better max attempts handling with reset after long successful connection
           if (reconnectAttempts >= maxReconnectAttempts) {
-            console.log('[REVERSE] WS: Max reconnect attempts reached, giving up');
-            setTimeout(() => {
+            const timeSinceLastSuccess = lastSuccessfulConnection 
+              ? (Date.now() - lastSuccessfulConnection) 
+              : Infinity;
+            
+            // If we had a long successful connection, reset attempts
+            if (timeSinceLastSuccess > 300000) { // 5 minutes
+              console.log('[REVERSE] WS: Resetting reconnect attempts after long successful connection');
               reconnectAttempts = 0;
-              console.log('[REVERSE] WS: Reset reconnect attempts, will try again');
               scheduleReconnect();
-            }, 300000);
-            return;
+            } else {
+              console.log('[REVERSE] WS: Max reconnect attempts reached, will retry after cooldown');
+              setTimeout(() => {
+                reconnectAttempts = 0;
+                console.log('[REVERSE] WS: Cooldown complete, reset reconnect attempts');
+                scheduleReconnect();
+              }, 300000); // 5 minutes cooldown
+              return;
+            }
+          } else {
+            scheduleReconnect();
           }
-          scheduleReconnect();
         }
       });
 
@@ -736,16 +761,28 @@ function createReverseClient(config, executor, methodsConfig) {
 
         if (!isShuttingDown) {
           reconnectAttempts++;
+          
           if (reconnectAttempts >= maxReconnectAttempts) {
-            console.log('[REVERSE] WS: Max reconnect attempts reached, giving up');
-            setTimeout(() => {
+            const timeSinceLastSuccess = lastSuccessfulConnection 
+              ? (Date.now() - lastSuccessfulConnection) 
+              : Infinity;
+            
+            if (timeSinceLastSuccess > 300000) {
+              console.log('[REVERSE] WS: Resetting reconnect attempts after long successful connection');
               reconnectAttempts = 0;
-              console.log('[REVERSE] WS: Reset reconnect attempts, will try again');
               scheduleReconnect();
-            }, 300000);
-            return;
+            } else {
+              console.log('[REVERSE] WS: Max reconnect attempts reached after error');
+              setTimeout(() => {
+                reconnectAttempts = 0;
+                console.log('[REVERSE] WS: Error cooldown complete');
+                scheduleReconnect();
+              }, 300000);
+              return;
+            }
+          } else {
+            scheduleReconnect();
           }
-          scheduleReconnect();
         }
       });
     } catch (error) {
@@ -757,6 +794,7 @@ function createReverseClient(config, executor, methodsConfig) {
     }
   }
 
+  // FIX: Improved exponential backoff with jitter and max delay
   function scheduleReconnect() {
     if (isShuttingDown) {
       return;
@@ -766,9 +804,15 @@ function createReverseClient(config, executor, methodsConfig) {
       clearTimeout(reconnectTimeout);
     }
 
-    const baseDelay = Math.min(30000 * Math.pow(1.5, reconnectAttempts), 300000);
+    // FIX: Better exponential backoff calculation
+    const baseDelay = 5000; // Start with 5 seconds
+    const maxDelay = 300000; // Max 5 minutes
+    const exponentialDelay = Math.min(
+      baseDelay * Math.pow(1.5, reconnectAttempts),
+      maxDelay
+    );
     const jitter = Math.random() * 5000; // 0-5s jitter
-    const delay = baseDelay + jitter;
+    const delay = exponentialDelay + jitter;
 
     console.log(
       `[REVERSE] WS: Reconnecting in ${Math.round(
@@ -1125,6 +1169,8 @@ function createReverseClient(config, executor, methodsConfig) {
           if (masterCameBack && (!ws || ws.readyState !== WebSocket.OPEN)) {
             masterCameBack = false;
             console.log('[REVERSE] Master is back, attempting WebSocket reconnection...');
+            // FIX: Reset reconnect attempts when master comes back
+            reconnectAttempts = 0;
             scheduleImmediateReconnect();
           }
         } else {
@@ -1216,9 +1262,10 @@ function createReverseClient(config, executor, methodsConfig) {
             state: ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][
               ws.readyState
             ],
-            bufferedAmount: ws.bufferedAmount
+            bufferedAmount: ws.bufferedAmount,
+            reconnectAttempts
           }
-        : { readyState: -1, state: 'NOT_CONNECTED' },
+        : { readyState: -1, state: 'NOT_CONNECTED', reconnectAttempts },
     getMethodsCount: () =>
       Object.keys(currentMethodsConfig).length,
     getMethodsVersion: getMethodsVersionHash,
