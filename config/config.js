@@ -125,6 +125,17 @@ const config = {
     ]
   },
   
+  // P2P Hybrid Configuration
+  P2P: {
+    ENABLED: true, // Enable P2P hybrid mode
+    DISCOVERY_INTERVAL: 60000, // 1 minute - interval untuk discovery peers dari master
+    PEER_TIMEOUT: 180000, // 3 minutes - timeout untuk peer yang tidak aktif
+    MAX_PEERS: 2, // maksimal peers yang dapat terkoneksi
+    AUTO_CONNECT: true, // otomatis koneksi ke peers yang reachable
+    RELAY_FALLBACK: true, // fallback ke relay lewat master jika P2P gagal
+    HEARTBEAT_INTERVAL: 30000 // 30 seconds - interval heartbeat antar peers
+  },
+  
   MESSAGES: {
     REQUIRED_FIELDS: 'target, time, methods wajib diisi',
     INVALID_METHOD: 'methods tidak valid',
