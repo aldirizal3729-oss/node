@@ -64,8 +64,8 @@ const config = {
   },
 
   MASTER: {
-    URL: 'http://217.160.125.125:13734',
-    WS_URL: 'ws://217.160.125.125:13734/ws',
+    URL: 'http://217.160.125.128:13656',
+    WS_URL: 'ws://217.160.125.128:13656/ws',
     HEARTBEAT_INTERVAL: 30000,
     METHODS_SYNC_INTERVAL: 60000,
     TIMEOUT: 10000,
@@ -125,16 +125,16 @@ const config = {
     ]
   },
   
-  // P2P Hybrid Configuration
   P2P: {
-    ENABLED: true, // Enable P2P hybrid mode
-    DISCOVERY_INTERVAL: 60000, // 1 minute - interval untuk discovery peers dari master
-    PEER_TIMEOUT: 180000, // 3 minutes - timeout untuk peer yang tidak aktif
-    MAX_PEERS: 2, // maksimal peers yang dapat terkoneksi
-    AUTO_CONNECT: true, // otomatis koneksi ke peers yang reachable
-    RELAY_FALLBACK: true, // fallback ke relay lewat master jika P2P gagal
-    HEARTBEAT_INTERVAL: 30000 // 30 seconds - interval heartbeat antar peers
-  },
+  ENABLED: true,                    // ✅ Must be true
+  DISCOVERY_INTERVAL: 60000,        // 1 minute
+  PEER_TIMEOUT: 180000,             // 3 minutes
+  MAX_PEERS: 5,                    // Adjust
+  AUTO_CONNECT: true,               // ✅ Recommended
+  RELAY_FALLBACK: true,             // ✅ Recommended
+  HEARTBEAT_INTERVAL: 30000,        // 30 seconds
+  CONNECTION_TIMEOUT: 10000,        // 10 seconds
+},
   
   MESSAGES: {
     REQUIRED_FIELDS: 'target, time, methods wajib diisi',
