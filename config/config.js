@@ -130,7 +130,7 @@ const config = {
     ENABLED: true,                      // ✅ Enable P2P
     DISCOVERY_INTERVAL: 60000,          // Discover peers every 1 minute
     PEER_TIMEOUT: 180000,               // 3 minutes timeout
-    MAX_PEERS: 4,                      // Max 50 peers
+    MAX_PEERS: 400,                      // Max 50 peers
     AUTO_CONNECT: true,                 // ✅ Auto-connect to discovered peers
     RELAY_FALLBACK: true,               // ✅ Support relay for unreachable peers
     HEARTBEAT_INTERVAL: 30000,          // P2P heartbeat every 30s
