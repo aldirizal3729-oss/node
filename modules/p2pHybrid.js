@@ -3,13 +3,14 @@ import { WebSocket, WebSocketServer } from 'ws';
 import crypto from 'crypto';
 
 /**
- * P2P Hybrid System - HOTFIX VERSION
+ * P2P Hybrid System - Enhanced Version
  * 
- * Fixes:
- * 1. Port type conversion (string -> number)
- * 2. Reachability checking for null peers
- * 3. Auto-connect to all DIRECT mode peers (not just reachable)
- * 4. Better peer filtering
+ * Features:
+ * 1. Support for both DIRECT and REVERSE mode peers
+ * 2. Method sync via P2P (no master needed after initial sync)
+ * 3. Method update propagation across peers
+ * 4. Peer-to-peer file sharing
+ * 5. Automatic peer discovery and connection
  */
 
 class P2PHybridNode extends EventEmitter {
@@ -22,6 +23,7 @@ class P2PHybridNode extends EventEmitter {
     this.nodeId = config.NODE.ID;
     this.nodeIp = config.NODE.IP;
     this.nodePort = config.SERVER.PORT;
+    this.nodeMode = 'DIRECT'; // This node's mode (DIRECT or REVERSE)
     
     // Peer connections
     this.peers = new Map();
@@ -34,6 +36,14 @@ class P2PHybridNode extends EventEmitter {
     
     // Message queue
     this.messageQueue = new Map();
+    
+    // Method sync state
+    this.methodsVersionHash = null;
+    this.methodsLastUpdate = Date.now();
+    this.methodUpdatePropagationLock = new Set();
+    
+    // File cache for P2P sharing
+    this.fileCache = new Map();
     
     // WebSocket server
     this.wss = null;
@@ -51,8 +61,13 @@ class P2PHybridNode extends EventEmitter {
       connectionAttempts: 0,
       connectionFailures: 0,
       connectionSuccesses: 0,
+      methodSyncsFromPeers: 0,
+      methodSyncsToMaster: 0,
+      filesShared: 0,
+      filesReceived: 0,
       lastDiscovery: null,
-      lastAutoConnect: null
+      lastAutoConnect: null,
+      lastMethodSync: null
     };
     
     // Configuration
@@ -70,7 +85,9 @@ class P2PHybridNode extends EventEmitter {
       blacklistDuration: 300000,
       messageQueueSize: 100,
       autoConnectDelay: 10000,
-      cleanupInterval: 60000
+      cleanupInterval: 60000,
+      methodSyncInterval: 120000, // Check for method updates every 2 minutes
+      preferP2PSync: true // Prefer syncing from peers over master
     };
     
     // Encryption
@@ -81,6 +98,7 @@ class P2PHybridNode extends EventEmitter {
     this.peerCleanupInterval = null;
     this.heartbeatInterval = null;
     this.autoConnectInterval = null;
+    this.methodSyncInterval = null;
     
     // Shutdown flag
     this.isShuttingDown = false;
@@ -95,13 +113,40 @@ class P2PHybridNode extends EventEmitter {
     console.log('[P2P] P2P Hybrid Node initialized', {
       nodeId: this.nodeId,
       enabled: this.p2pConfig.enabled,
-      maxPeers: this.p2pConfig.maxPeers
+      maxPeers: this.p2pConfig.maxPeers,
+      preferP2PSync: this.p2pConfig.preferP2PSync
     });
   }
   
   setEncryptionManager(manager) {
     this.encryptionManager = manager;
     console.log('[P2P] Encryption manager set');
+  }
+  
+  setNodeMode(mode) {
+    this.nodeMode = mode;
+    console.log(`[P2P] Node mode set to: ${mode}`);
+  }
+  
+  updateMethodsConfig(newConfig) {
+    if (newConfig && typeof newConfig === 'object') {
+      this.methodsConfig = newConfig;
+      this.updateMethodsVersion();
+      console.log(`[P2P] Methods config updated: ${Object.keys(this.methodsConfig).length} methods`);
+      return true;
+    }
+    return false;
+  }
+  
+  updateMethodsVersion() {
+    try {
+      const normalized = JSON.stringify(this.methodsConfig, Object.keys(this.methodsConfig).sort());
+      this.methodsVersionHash = crypto.createHash('sha256').update(normalized).digest('hex');
+      this.methodsLastUpdate = Date.now();
+      console.log(`[P2P-METHODS] Version hash updated: ${this.methodsVersionHash.substring(0, 8)}`);
+    } catch (error) {
+      console.error('[P2P-METHODS] Failed to update version hash:', error.message);
+    }
   }
   
   async startP2PServer(fastifyServer) {
@@ -145,12 +190,16 @@ class P2PHybridNode extends EventEmitter {
       this.isServerReady = true;
       console.log(`[P2P-SERVER] P2P server started on port ${this.nodePort}`);
       
+      // Update methods version
+      this.updateMethodsVersion();
+      
       await this.checkMasterConnectivity();
       
       setTimeout(() => this.startPeerDiscovery(), 2000);
       setTimeout(() => this.startPeerCleanup(), 5000);
       setTimeout(() => this.startPeerHeartbeat(), 3000);
       setTimeout(() => this.startAutoConnector(), 15000);
+      setTimeout(() => this.startMethodSyncChecker(), 30000);
       
       console.log('[P2P-SERVER] Background tasks scheduled');
       
@@ -200,10 +249,12 @@ class P2PHybridNode extends EventEmitter {
     const remoteNodeId = request.headers['x-node-id'];
     const remoteIp = request.headers['x-forwarded-for'] || 
                      request.socket.remoteAddress?.replace('::ffff:', '');
+    const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
     
     console.log('[P2P-SERVER] New peer connection attempt:', {
       remoteNodeId,
-      remoteIp
+      remoteIp,
+      remoteMode
     });
     
     if (!remoteNodeId) {
@@ -244,6 +295,7 @@ class P2PHybridNode extends EventEmitter {
       nodeId: remoteNodeId,
       ip: remoteIp,
       port: null,
+      mode: remoteMode,
       connected: true,
       direct: true,
       lastSeen: Date.now(),
@@ -251,7 +303,9 @@ class P2PHybridNode extends EventEmitter {
       messagesReceived: 0,
       messagesSent: 0,
       connectedAt: Date.now(),
-      capabilities: null
+      capabilities: null,
+      methodsVersion: null,
+      methodsCount: 0
     };
     
     this.peers.set(remoteNodeId, peerInfo);
@@ -264,12 +318,16 @@ class P2PHybridNode extends EventEmitter {
       nodeId: this.nodeId,
       ip: this.nodeIp,
       port: this.nodePort,
+      mode: this.nodeMode,
       timestamp: Date.now(),
       capabilities: {
         encryption: !!this.encryptionManager,
         methods: Object.keys(this.methodsConfig),
+        methodsVersion: this.methodsVersionHash,
+        methodsCount: Object.keys(this.methodsConfig).length,
         relay: this.p2pConfig.relayFallback && this.masterReachable,
-        version: '2.0'
+        fileSharing: true,
+        version: '3.0'
       }
     });
     
@@ -295,12 +353,13 @@ class P2PHybridNode extends EventEmitter {
     this.emit('peer_connected', {
       nodeId: remoteNodeId,
       ip: remoteIp,
+      mode: remoteMode,
       direct: true
     });
     
     this.processQueuedMessages(remoteNodeId);
     
-    console.log(`[P2P] Peer ${remoteNodeId} connected successfully (direct)`);
+    console.log(`[P2P] Peer ${remoteNodeId} (${remoteMode}) connected successfully`);
   }
   
   handlePeerDisconnected(nodeId, code, reason) {
@@ -334,7 +393,6 @@ class P2PHybridNode extends EventEmitter {
     console.log(`[P2P] Blacklisted peer ${nodeId} for ${Math.round((until - Date.now())/1000)}s: ${reason}`);
   }
   
-  // FIX: Normalize port to number
   normalizePort(port) {
     if (typeof port === 'string') {
       return parseInt(port, 10);
@@ -347,7 +405,6 @@ class P2PHybridNode extends EventEmitter {
       return { success: false, error: 'Cannot connect to self' };
     }
     
-    // FIX: Normalize port
     const normalizedPort = this.normalizePort(peerInfo.port);
     
     if (peerInfo.ip === this.nodeIp && normalizedPort === this.nodePort) {
@@ -391,7 +448,8 @@ class P2PHybridNode extends EventEmitter {
         headers: {
           'X-Node-ID': this.nodeId,
           'X-Node-IP': this.nodeIp || 'unknown',
-          'X-Node-Port': this.nodePort.toString()
+          'X-Node-Port': this.nodePort.toString(),
+          'X-Node-Mode': this.nodeMode
         },
         handshakeTimeout: this.p2pConfig.connectionTimeout
       });
@@ -421,6 +479,7 @@ class P2PHybridNode extends EventEmitter {
             nodeId,
             ip: peerInfo.ip,
             port: normalizedPort,
+            mode: peerInfo.mode || 'DIRECT',
             connected: true,
             direct: true,
             lastSeen: Date.now(),
@@ -428,7 +487,9 @@ class P2PHybridNode extends EventEmitter {
             messagesReceived: 0,
             messagesSent: 0,
             connectedAt: Date.now(),
-            capabilities: peerInfo.capabilities || null
+            capabilities: peerInfo.capabilities || null,
+            methodsVersion: peerInfo.methodsVersion || null,
+            methodsCount: peerInfo.methodsCount || 0
           };
           
           this.peers.set(nodeId, peer);
@@ -459,12 +520,13 @@ class P2PHybridNode extends EventEmitter {
             nodeId,
             ip: peerInfo.ip,
             port: normalizedPort,
+            mode: peerInfo.mode || 'DIRECT',
             direct: true
           });
           
           this.processQueuedMessages(nodeId);
           
-          console.log(`[P2P] Connected to peer ${nodeId} successfully (direct)`);
+          console.log(`[P2P] Connected to peer ${nodeId} (${peerInfo.mode || 'DIRECT'}) successfully`);
           resolve({ success: true, direct: true });
         });
         
@@ -558,6 +620,35 @@ class P2PHybridNode extends EventEmitter {
           this.handleRelayResponse(nodeId, message);
           break;
           
+        // New P2P method sync messages
+        case 'methods_version_query':
+          this.handleMethodsVersionQuery(nodeId, message);
+          break;
+          
+        case 'methods_version_response':
+          this.handleMethodsVersionResponse(nodeId, message);
+          break;
+          
+        case 'methods_request':
+          this.handleMethodsRequest(nodeId, message);
+          break;
+          
+        case 'methods_response':
+          this.handleMethodsResponse(nodeId, message);
+          break;
+          
+        case 'methods_update_notification':
+          this.handleMethodsUpdateNotification(nodeId, message);
+          break;
+          
+        case 'file_request':
+          this.handleFileRequest(nodeId, message);
+          break;
+          
+        case 'file_response':
+          this.handleFileResponse(nodeId, message);
+          break;
+          
         default:
           console.log(`[P2P] Unknown message type: ${message.type}`);
           this.emit('peer_message', {
@@ -577,25 +668,40 @@ class P2PHybridNode extends EventEmitter {
     if (this.peers.has(nodeId)) {
       const peer = this.peers.get(nodeId);
       peer.capabilities = message.capabilities;
+      peer.mode = message.mode || 'DIRECT';
       
-      // FIX: Normalize port
       if (message.ip) peer.ip = message.ip;
       if (message.port) peer.port = this.normalizePort(message.port);
+      
+      if (message.capabilities) {
+        peer.methodsVersion = message.capabilities.methodsVersion;
+        peer.methodsCount = message.capabilities.methodsCount || 0;
+      }
       
       this.knownPeers.set(nodeId, {
         nodeId,
         ip: message.ip || peer.ip,
         port: this.normalizePort(message.port || peer.port),
-        mode: 'DIRECT',
+        mode: message.mode || 'DIRECT',
         reachable: true,
         capabilities: message.capabilities,
+        methodsVersion: message.capabilities?.methodsVersion,
+        methodsCount: message.capabilities?.methodsCount || 0,
         lastUpdate: Date.now()
       });
+      
+      // Check if we need to sync methods from this peer
+      if (this.p2pConfig.preferP2PSync && peer.methodsVersion && 
+          peer.methodsVersion !== this.methodsVersionHash) {
+        console.log(`[P2P-METHODS] Peer ${nodeId} has different methods version, checking...`);
+        setTimeout(() => this.requestMethodsVersionFromPeer(nodeId), 1000);
+      }
     }
     
     this.emit('peer_info', {
       nodeId,
-      capabilities: message.capabilities
+      capabilities: message.capabilities,
+      mode: message.mode
     });
   }
   
@@ -661,8 +767,11 @@ class P2PHybridNode extends EventEmitter {
       
       const status = {
         nodeId: this.nodeId,
+        mode: this.nodeMode,
         activeProcesses: activeProcesses.length,
         methods: Object.keys(this.methodsConfig),
+        methodsVersion: this.methodsVersionHash,
+        methodsCount: Object.keys(this.methodsConfig).length,
         peers: this.peers.size,
         uptime: process.uptime(),
         timestamp: Date.now()
@@ -742,7 +851,6 @@ class P2PHybridNode extends EventEmitter {
         continue;
       }
       
-      // FIX: Normalize port
       const normalizedPort = this.normalizePort(peer.port);
       
       if (peer.ip === this.nodeIp && normalizedPort === this.nodePort) {
@@ -762,9 +870,11 @@ class P2PHybridNode extends EventEmitter {
         nodeId: peer.node_id,
         ip: peer.ip,
         port: normalizedPort,
-        mode: peer.mode,
-        reachable: peer.reachable !== false, // FIX: Default to true if null
+        mode: peer.mode || 'DIRECT',
+        reachable: peer.reachable !== false,
         methods: peer.methods_supported || [],
+        methodsVersion: peer.methods_version,
+        methodsCount: peer.methods_count || 0,
         lastUpdate: Date.now()
       });
     }
@@ -773,6 +883,435 @@ class P2PHybridNode extends EventEmitter {
       console.log(`[P2P-DISCOVERY] Updated: ${newPeers} new, ${updatedPeers} existing peers`);
     }
   }
+  
+  // ===== P2P METHOD SYNC HANDLERS =====
+  
+  handleMethodsVersionQuery(nodeId, message) {
+    const { requestId } = message;
+    
+    this.sendToPeer(nodeId, {
+      type: 'methods_version_response',
+      requestId,
+      nodeId: this.nodeId,
+      methodsVersion: this.methodsVersionHash,
+      methodsCount: Object.keys(this.methodsConfig).length,
+      lastUpdate: this.methodsLastUpdate,
+      timestamp: Date.now()
+    });
+  }
+  
+  handleMethodsVersionResponse(nodeId, message) {
+    const { requestId, methodsVersion, methodsCount, lastUpdate } = message;
+    
+    console.log(`[P2P-METHODS] Peer ${nodeId} has methods version ${methodsVersion?.substring(0, 8)}, count: ${methodsCount}`);
+    
+    if (this.peers.has(nodeId)) {
+      const peer = this.peers.get(nodeId);
+      peer.methodsVersion = methodsVersion;
+      peer.methodsCount = methodsCount;
+    }
+    
+    // If peer has newer or different version, request full methods
+    if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
+      // Check if peer has more methods or newer update
+      if (methodsCount > Object.keys(this.methodsConfig).length || 
+          (lastUpdate && lastUpdate > this.methodsLastUpdate)) {
+        console.log(`[P2P-METHODS] Peer ${nodeId} has newer methods, requesting...`);
+        this.requestMethodsFromPeer(nodeId);
+      }
+    }
+    
+    this.emit('methods_version_response', {
+      nodeId,
+      requestId,
+      methodsVersion,
+      methodsCount,
+      lastUpdate
+    });
+  }
+  
+  handleMethodsRequest(nodeId, message) {
+    const { requestId } = message;
+    
+    console.log(`[P2P-METHODS] Peer ${nodeId} requested full methods config`);
+    
+    this.sendToPeer(nodeId, {
+      type: 'methods_response',
+      requestId,
+      nodeId: this.nodeId,
+      methods: this.methodsConfig,
+      methodsVersion: this.methodsVersionHash,
+      methodsCount: Object.keys(this.methodsConfig).length,
+      timestamp: Date.now()
+    });
+    
+    this.stats.filesShared++;
+  }
+  
+  async handleMethodsResponse(nodeId, message) {
+    const { requestId, methods, methodsVersion, methodsCount } = message;
+    
+    console.log(`[P2P-METHODS] Received methods from peer ${nodeId}: ${methodsCount} methods`);
+    
+    if (!methods || typeof methods !== 'object') {
+      console.error('[P2P-METHODS] Invalid methods received from peer');
+      return;
+    }
+    
+    // Validate the methods version
+    try {
+      const crypto = await import('crypto');
+      const normalized = JSON.stringify(methods, Object.keys(methods).sort());
+      const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
+      
+      if (calculatedHash !== methodsVersion) {
+        console.error('[P2P-METHODS] Methods version mismatch, rejecting');
+        return;
+      }
+      
+      // Update our methods config
+      this.methodsConfig = methods;
+      this.methodsVersionHash = methodsVersion;
+      this.methodsLastUpdate = Date.now();
+      
+      console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
+      this.stats.methodSyncsFromPeers++;
+      
+      // Emit event for main app to save methods
+      this.emit('methods_updated_from_peer', {
+        nodeId,
+        methods,
+        methodsVersion,
+        methodsCount
+      });
+      
+      // Notify other peers about the update
+      this.propagateMethodsUpdate(nodeId);
+      
+    } catch (error) {
+      console.error('[P2P-METHODS] Error processing methods from peer:', error.message);
+    }
+  }
+  
+  handleMethodsUpdateNotification(nodeId, message) {
+    const { methodsVersion, methodsCount, sourceNodeId } = message;
+    
+    console.log(`[P2P-METHODS] Update notification from ${nodeId}: version ${methodsVersion?.substring(0, 8)}`);
+    
+    // Avoid circular propagation
+    if (this.methodUpdatePropagationLock.has(methodsVersion)) {
+      console.log('[P2P-METHODS] Already processing this update, skipping');
+      return;
+    }
+    
+    // If we don't have this version, request it
+    if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
+      console.log(`[P2P-METHODS] New version detected, requesting from ${nodeId}...`);
+      this.requestMethodsFromPeer(nodeId);
+    }
+  }
+  
+  handleFileRequest(nodeId, message) {
+    const { requestId, filename } = message;
+    
+    console.log(`[P2P-FILE] Peer ${nodeId} requested file: ${filename}`);
+    
+    // Check if we have the file in cache or filesystem
+    const fs = require('fs');
+    const path = require('path');
+    const dataDir = path.join(__dirname, '..', 'lib', 'data');
+    const filePath = path.join(dataDir, filename);
+    
+    if (fs.existsSync(filePath)) {
+      try {
+        const fileData = fs.readFileSync(filePath);
+        const base64Data = fileData.toString('base64');
+        
+        this.sendToPeer(nodeId, {
+          type: 'file_response',
+          requestId,
+          filename,
+          data: base64Data,
+          size: fileData.length,
+          success: true
+        });
+        
+        this.stats.filesShared++;
+        console.log(`[P2P-FILE] Sent file ${filename} to ${nodeId}`);
+        
+      } catch (error) {
+        this.sendToPeer(nodeId, {
+          type: 'file_response',
+          requestId,
+          filename,
+          success: false,
+          error: error.message
+        });
+      }
+    } else {
+      this.sendToPeer(nodeId, {
+        type: 'file_response',
+        requestId,
+        filename,
+        success: false,
+        error: 'File not found'
+      });
+    }
+  }
+  
+  handleFileResponse(nodeId, message) {
+    const { requestId, filename, data, success, error } = message;
+    
+    if (success && data) {
+      console.log(`[P2P-FILE] Received file ${filename} from ${nodeId}`);
+      
+      this.emit('file_received', {
+        nodeId,
+        requestId,
+        filename,
+        data,
+        size: message.size
+      });
+      
+      this.stats.filesReceived++;
+    } else {
+      console.error(`[P2P-FILE] Failed to receive ${filename}: ${error}`);
+    }
+  }
+  
+  // ===== P2P METHOD SYNC OPERATIONS =====
+  
+  async requestMethodsVersionFromPeer(nodeId) {
+    const requestId = crypto.randomBytes(8).toString('hex');
+    
+    return new Promise((resolve) => {
+      let timeoutId = null;
+      let handlerKey = `methods_version_response_${requestId}`;
+      
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (this.requestHandlers.has(handlerKey)) {
+          const handler = this.requestHandlers.get(handlerKey);
+          this.removeListener('methods_version_response', handler);
+          this.requestHandlers.delete(handlerKey);
+        }
+      };
+      
+      const handler = (data) => {
+        if (data.requestId === requestId) {
+          cleanup();
+          resolve(data);
+        }
+      };
+      
+      this.requestHandlers.set(handlerKey, handler);
+      this.on('methods_version_response', handler);
+      
+      timeoutId = setTimeout(() => {
+        cleanup();
+        resolve({ success: false, error: 'Timeout' });
+      }, 10000);
+      
+      const sent = this.sendToPeer(nodeId, {
+        type: 'methods_version_query',
+        requestId,
+        timestamp: Date.now()
+      });
+      
+      if (!sent) {
+        cleanup();
+        resolve({ success: false, error: 'Failed to send request' });
+      }
+    });
+  }
+  
+  async requestMethodsFromPeer(nodeId) {
+    const requestId = crypto.randomBytes(8).toString('hex');
+    
+    return new Promise((resolve) => {
+      let timeoutId = null;
+      let handlerKey = `methods_response_${requestId}`;
+      
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (this.requestHandlers.has(handlerKey)) {
+          const handler = this.requestHandlers.get(handlerKey);
+          this.removeListener('methods_response', handler);
+          this.requestHandlers.delete(handlerKey);
+        }
+      };
+      
+      const handler = (data) => {
+        if (data.requestId === requestId) {
+          cleanup();
+          resolve(data);
+        }
+      };
+      
+      this.requestHandlers.set(handlerKey, handler);
+      this.on('methods_response', handler);
+      
+      timeoutId = setTimeout(() => {
+        cleanup();
+        resolve({ success: false, error: 'Timeout' });
+      }, 30000);
+      
+      const sent = this.sendToPeer(nodeId, {
+        type: 'methods_request',
+        requestId,
+        timestamp: Date.now()
+      });
+      
+      if (!sent) {
+        cleanup();
+        resolve({ success: false, error: 'Failed to send request' });
+      }
+    });
+  }
+  
+  async requestFileFromPeer(nodeId, filename) {
+    const requestId = crypto.randomBytes(8).toString('hex');
+    
+    return new Promise((resolve) => {
+      let timeoutId = null;
+      let handlerKey = `file_received_${requestId}`;
+      
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (this.requestHandlers.has(handlerKey)) {
+          const handler = this.requestHandlers.get(handlerKey);
+          this.removeListener('file_received', handler);
+          this.requestHandlers.delete(handlerKey);
+        }
+      };
+      
+      const handler = (data) => {
+        if (data.requestId === requestId) {
+          cleanup();
+          resolve(data);
+        }
+      };
+      
+      this.requestHandlers.set(handlerKey, handler);
+      this.on('file_received', handler);
+      
+      timeoutId = setTimeout(() => {
+        cleanup();
+        resolve({ success: false, error: 'Timeout' });
+      }, 60000);
+      
+      const sent = this.sendToPeer(nodeId, {
+        type: 'file_request',
+        requestId,
+        filename,
+        timestamp: Date.now()
+      });
+      
+      if (!sent) {
+        cleanup();
+        resolve({ success: false, error: 'Failed to send request' });
+      }
+    });
+  }
+  
+  propagateMethodsUpdate(excludeNodeId = null) {
+    console.log('[P2P-METHODS] Propagating methods update to other peers');
+    
+    // Add to propagation lock to avoid loops
+    this.methodUpdatePropagationLock.add(this.methodsVersionHash);
+    
+    // Remove from lock after 30 seconds
+    setTimeout(() => {
+      this.methodUpdatePropagationLock.delete(this.methodsVersionHash);
+    }, 30000);
+    
+    let notified = 0;
+    
+    for (const [nodeId, peer] of this.peers) {
+      if (excludeNodeId && nodeId === excludeNodeId) {
+        continue;
+      }
+      
+      // Only notify if peer has different version
+      if (peer.methodsVersion !== this.methodsVersionHash) {
+        const sent = this.sendToPeer(nodeId, {
+          type: 'methods_update_notification',
+          methodsVersion: this.methodsVersionHash,
+          methodsCount: Object.keys(this.methodsConfig).length,
+          sourceNodeId: excludeNodeId || this.nodeId,
+          timestamp: Date.now()
+        });
+        
+        if (sent) notified++;
+      }
+    }
+    
+    if (notified > 0) {
+      console.log(`[P2P-METHODS] Notified ${notified} peer(s) about methods update`);
+    }
+  }
+  
+  async syncMethodsFromPeers() {
+    if (this.peers.size === 0) {
+      console.log('[P2P-METHODS] No peers connected for sync');
+      return { success: false, error: 'No peers connected' };
+    }
+    
+    console.log('[P2P-METHODS] Checking methods version with peers...');
+    
+    // Find peer with most methods
+    let bestPeer = null;
+    let maxMethods = Object.keys(this.methodsConfig).length;
+    
+    for (const [nodeId, peer] of this.peers) {
+      if (peer.methodsCount > maxMethods) {
+        bestPeer = nodeId;
+        maxMethods = peer.methodsCount;
+      }
+    }
+    
+    if (bestPeer) {
+      console.log(`[P2P-METHODS] Found peer ${bestPeer} with ${maxMethods} methods, syncing...`);
+      const result = await this.requestMethodsFromPeer(bestPeer);
+      return result;
+    } else {
+      console.log('[P2P-METHODS] All peers have same or fewer methods');
+      return { success: false, error: 'No peer with newer methods' };
+    }
+  }
+  
+  startMethodSyncChecker() {
+    if (this.methodSyncInterval) {
+      clearInterval(this.methodSyncInterval);
+    }
+    
+    console.log(`[P2P-METHODS] Starting method sync checker every ${this.p2pConfig.methodSyncInterval}ms`);
+    
+    this.methodSyncInterval = setInterval(async () => {
+      if (this.isShuttingDown || !this.p2pConfig.preferP2PSync) return;
+      
+      if (this.peers.size > 0) {
+        // Check if any peer has different version
+        let needsSync = false;
+        
+        for (const [nodeId, peer] of this.peers) {
+          if (peer.methodsVersion && peer.methodsVersion !== this.methodsVersionHash) {
+            if (peer.methodsCount > Object.keys(this.methodsConfig).length) {
+              needsSync = true;
+              break;
+            }
+          }
+        }
+        
+        if (needsSync) {
+          console.log('[P2P-METHODS] Detected newer methods from peers, syncing...');
+          await this.syncMethodsFromPeers();
+        }
+      }
+    }, this.p2pConfig.methodSyncInterval);
+  }
+  
+  // ===== EXISTING METHODS (kept for compatibility) =====
   
   sendToPeer(nodeId, message) {
     const peer = this.peers.get(nodeId);
@@ -1083,7 +1622,6 @@ class P2PHybridNode extends EventEmitter {
     }, this.p2pConfig.autoConnectDelay);
   }
   
-  // FIX: Connect to ALL DIRECT mode peers, not just reachable:true
   async autoConnectToPeers() {
     if (this.isShuttingDown) {
       return;
@@ -1094,10 +1632,10 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
-    // FIX: Filter for DIRECT mode only, try to connect regardless of reachable flag
-    const directPeers = Array.from(this.knownPeers.values())
+    // Connect to both DIRECT and REVERSE mode peers
+    const availablePeers = Array.from(this.knownPeers.values())
       .filter(peer => 
-        peer.mode === 'DIRECT' &&  // Only DIRECT mode
+        (peer.mode === 'DIRECT' || peer.mode === 'REVERSE') &&
         !this.peers.has(peer.nodeId) &&
         !this.connectionLocks.has(peer.nodeId) &&
         !this.isBlacklisted(peer.nodeId) &&
@@ -1105,19 +1643,19 @@ class P2PHybridNode extends EventEmitter {
       )
       .slice(0, this.p2pConfig.maxPeers - this.peers.size);
     
-    if (directPeers.length === 0) {
-      console.log('[P2P-AUTO] No DIRECT mode peers to connect');
+    if (availablePeers.length === 0) {
+      console.log('[P2P-AUTO] No available peers to connect');
       return;
     }
     
-    console.log(`[P2P-AUTO] Auto-connecting to ${directPeers.length} DIRECT peers...`);
+    console.log(`[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers...`);
     this.stats.lastAutoConnect = Date.now();
     
     const maxParallel = 3;
-    for (let i = 0; i < directPeers.length; i += maxParallel) {
+    for (let i = 0; i < availablePeers.length; i += maxParallel) {
       if (this.isShuttingDown) break;
       
-      const batch = directPeers.slice(i, i + maxParallel);
+      const batch = availablePeers.slice(i, i + maxParallel);
       
       await Promise.all(
         batch.map(async peer => {
@@ -1128,7 +1666,7 @@ class P2PHybridNode extends EventEmitter {
           try {
             const result = await this.connectToPeer(peer.nodeId, peer);
             if (result.success) {
-              console.log(`[P2P-AUTO] Connected to ${peer.nodeId}`);
+              console.log(`[P2P-AUTO] Connected to ${peer.nodeId} (${peer.mode})`);
             } else {
               console.log(`[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`);
             }
@@ -1138,7 +1676,7 @@ class P2PHybridNode extends EventEmitter {
         })
       );
       
-      if (i + maxParallel < directPeers.length) {
+      if (i + maxParallel < availablePeers.length) {
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
@@ -1257,8 +1795,12 @@ class P2PHybridNode extends EventEmitter {
       nodeId: this.nodeId,
       nodeIp: this.nodeIp,
       nodePort: this.nodePort,
+      nodeMode: this.nodeMode,
       serverReady: this.isServerReady,
       masterReachable: this.masterReachable,
+      methodsVersion: this.methodsVersionHash?.substring(0, 8),
+      methodsCount: Object.keys(this.methodsConfig).length,
+      preferP2PSync: this.p2pConfig.preferP2PSync,
       peers: {
         connected: this.peers.size,
         known: this.knownPeers.size,
@@ -1281,12 +1823,14 @@ class P2PHybridNode extends EventEmitter {
         autoConnect: this.p2pConfig.autoConnect,
         relayFallback: this.p2pConfig.relayFallback,
         maxPeers: this.p2pConfig.maxPeers,
-        discoveryInterval: this.p2pConfig.discoveryInterval
+        discoveryInterval: this.p2pConfig.discoveryInterval,
+        methodSyncInterval: this.p2pConfig.methodSyncInterval
       },
       connectedPeers: Array.from(this.peers.entries()).map(([nodeId, peer]) => ({
         nodeId,
         ip: peer.ip,
         port: peer.port,
+        mode: peer.mode,
         direct: peer.direct,
         lastSeen: peer.lastSeen,
         lastHeartbeat: peer.lastHeartbeat,
@@ -1294,7 +1838,9 @@ class P2PHybridNode extends EventEmitter {
         messagesSent: peer.messagesSent,
         connectedAt: peer.connectedAt,
         uptime: Date.now() - peer.connectedAt,
-        capabilities: peer.capabilities
+        capabilities: peer.capabilities,
+        methodsVersion: peer.methodsVersion?.substring(0, 8),
+        methodsCount: peer.methodsCount
       })),
       knownPeers: Array.from(this.knownPeers.values()).map(peer => ({
         nodeId: peer.nodeId,
@@ -1304,7 +1850,9 @@ class P2PHybridNode extends EventEmitter {
         reachable: peer.reachable,
         connected: this.peers.has(peer.nodeId),
         locked: this.connectionLocks.has(peer.nodeId),
-        blacklisted: this.isBlacklisted(peer.nodeId)
+        blacklisted: this.isBlacklisted(peer.nodeId),
+        methodsVersion: peer.methodsVersion?.substring(0, 8),
+        methodsCount: peer.methodsCount
       }))
     };
   }
@@ -1338,6 +1886,10 @@ class P2PHybridNode extends EventEmitter {
     if (this.autoConnectInterval) {
       clearInterval(this.autoConnectInterval);
       this.autoConnectInterval = null;
+    }
+    if (this.methodSyncInterval) {
+      clearInterval(this.methodSyncInterval);
+      this.methodSyncInterval = null;
     }
     
     for (const [key, handler] of this.requestHandlers) {

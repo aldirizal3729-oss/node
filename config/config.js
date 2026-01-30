@@ -66,8 +66,8 @@ const config = {
   MASTER: {
     URL: 'http://217.160.125.128:13656',
     WS_URL: 'ws://217.160.125.128:13656/ws',
-    HEARTBEAT_INTERVAL: 30000,
-    METHODS_SYNC_INTERVAL: 60000,
+    HEARTBEAT_INTERVAL: 30000,          // Heartbeat only (30s)
+    METHODS_SYNC_INTERVAL: 300000,      // Fallback master sync (5 min) - rarely used
     TIMEOUT: 10000,
     NOTIFY_ON_SYNC: true
   },
@@ -125,16 +125,35 @@ const config = {
     ]
   },
   
+  // ===== ENHANCED P2P CONFIGURATION =====
   P2P: {
-  ENABLED: true,                    // ✅ Must be true
-  DISCOVERY_INTERVAL: 60000,        // 1 minute
-  PEER_TIMEOUT: 180000,             // 3 minutes
-  MAX_PEERS: 5,                    // Adjust
-  AUTO_CONNECT: true,               // ✅ Recommended
-  RELAY_FALLBACK: true,             // ✅ Recommended
-  HEARTBEAT_INTERVAL: 30000,        // 30 seconds
-  CONNECTION_TIMEOUT: 10000,        // 10 seconds
-},
+    ENABLED: true,                      // ✅ Enable P2P
+    DISCOVERY_INTERVAL: 60000,          // Discover peers every 1 minute
+    PEER_TIMEOUT: 180000,               // 3 minutes timeout
+    MAX_PEERS: 4,                      // Max 50 peers
+    AUTO_CONNECT: true,                 // ✅ Auto-connect to discovered peers
+    RELAY_FALLBACK: true,               // ✅ Support relay for unreachable peers
+    HEARTBEAT_INTERVAL: 30000,          // P2P heartbeat every 30s
+    CONNECTION_TIMEOUT: 10000,          // 10s connection timeout
+    
+    // ===== METHOD SYNC CONFIGURATION =====
+    PREFER_P2P_SYNC: true,              // ✅ Prefer syncing from peers over master
+    METHOD_SYNC_INTERVAL: 120000,       // Check method version with peers every 2 minutes
+    AUTO_PROPAGATE_UPDATES: true,       // ✅ Auto-propagate method updates to peers
+    
+    // ===== FILE SHARING =====
+    ENABLE_FILE_SHARING: true,          // ✅ Share files via P2P
+    FILE_CACHE_SIZE: 100,               // Cache up to 100 files
+    FILE_TRANSFER_TIMEOUT: 60000,       // 60s file transfer timeout
+    
+    // ===== ADVANCED SETTINGS =====
+    MAX_RECONNECT_ATTEMPTS: 3,
+    CONNECTION_BACKOFF_MS: 5000,
+    BLACKLIST_DURATION: 300000,         // 5 minutes
+    MESSAGE_QUEUE_SIZE: 100,
+    AUTO_CONNECT_DELAY: 10000,
+    CLEANUP_INTERVAL: 60000,
+  },
   
   MESSAGES: {
     REQUIRED_FIELDS: 'target, time, methods wajib diisi',
@@ -150,6 +169,7 @@ const config = {
   LOGGING: {
     LEVEL: process.env.LOG_LEVEL || 'info',
     ENCRYPTION_DEBUG: process.env.ENCRYPTION_DEBUG === 'true',
+    P2P_DEBUG: process.env.P2P_DEBUG === 'true',
   }
 };
 

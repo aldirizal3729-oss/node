@@ -92,7 +92,7 @@ const sharedData = {
   executor: null,
   encryptionManager: null,
   proxyUpdater: null,
-  p2pNode: null, // P2P Node reference
+  p2pNode: null,
   nodeMode: 'DIRECT',
   isRegistered: false,
   isReachable: false,
@@ -110,8 +110,7 @@ const sharedData = {
     
     // Update P2P node methods config
     if (p2pNode) {
-      p2pNode.methodsConfig = newConfig;
-      console.log(`[SHARED] P2P methods config updated: ${Object.keys(newConfig).length} methods`);
+      p2pNode.updateMethodsConfig(newConfig);
     }
     
     console.log(`[SHARED] Methods config updated: ${Object.keys(newConfig).length} methods`);
@@ -415,12 +414,35 @@ async function checkNodeReachability(ip, port) {
 
 async function syncMethods() {
   try {
+    // Prefer P2P sync if we have connected peers
+    if (p2pNode && p2pNode.peers.size > 0 && p2pNode.p2pConfig.preferP2PSync) {
+      console.log('[SYNC] Attempting P2P method sync...');
+      const p2pResult = await p2pNode.syncMethodsFromPeers();
+      
+      if (p2pResult && p2pResult.success !== false) {
+        console.log('[SYNC] ✓ Methods synced from P2P peers');
+        p2pNode.stats.lastMethodSync = Date.now();
+        return p2pResult;
+      } else {
+        console.log('[SYNC] P2P sync not available, falling back to master');
+      }
+    }
+    
+    // Fallback to master sync
     const { syncMethodsWithMaster } = methodSyncModule;
     const result = await syncMethodsWithMaster(config);
     
     if (result && result.success && !result.up_to_date) {
       await new Promise(resolve => setTimeout(resolve, 100));
       refreshMethodsConfig();
+      
+      // Propagate update to P2P peers
+      if (p2pNode && p2pNode.peers.size > 0) {
+        console.log('[SYNC] Propagating methods update to P2P peers...');
+        p2pNode.updateMethodsConfig(sharedData.methodsConfig);
+        p2pNode.propagateMethodsUpdate();
+        p2pNode.stats.methodSyncsToMaster++;
+      }
     }
     
     return result;
@@ -652,6 +674,23 @@ fastify.post('/p2p/attack', async (request, reply) => {
   });
 });
 
+// P2P Method Sync Endpoint
+fastify.post('/p2p/sync-methods', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.status(503).send({
+      status: 'error',
+      error: 'P2P is not initialized'
+    });
+  }
+  
+  const result = await p2pNode.syncMethodsFromPeers();
+  
+  reply.send({
+    status: result.success !== false ? 'ok' : 'error',
+    ...result
+  });
+});
+
 // ======================
 // INITIALIZATION
 // ======================
@@ -750,12 +789,20 @@ async function determineNetworkMode() {
 function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
   console.log(`[INIT] Starting operations for ${nodeMode} mode...`);
   
+  // Initial sync from master
   setTimeout(async () => {
     try {
-      console.log('[INIT] Performing initial methods sync...');
-      const syncResult = await syncMethods();
+      console.log('[INIT] Performing initial methods sync from master...');
+      const { syncMethodsWithMaster } = methodSyncModule;
+      const syncResult = await syncMethodsWithMaster(config);
       if (syncResult && syncResult.success) {
-        console.log(`[INIT] ✓ Methods sync completed`);
+        console.log(`[INIT] ✓ Methods sync completed from master`);
+        refreshMethodsConfig();
+        
+        // Update P2P node with latest methods
+        if (p2pNode) {
+          p2pNode.updateMethodsConfig(sharedData.methodsConfig);
+        }
       }
     } catch (error) {
       console.error('[INIT] Initial sync error:', error.message);
@@ -774,7 +821,8 @@ function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
     `[INIT] Ready - Methods: ${Object.keys(sharedData.methodsConfig).length}, ` +
     `Encryption: ${config.ENCRYPTION?.ENABLED && encryptionInitialized ? 'ON' : 'OFF'}, ` +
     `Mode: ${nodeMode}, Reachable: ${isReachable ? 'YES' : 'NO'}, ` +
-    `P2P: ${p2pNode ? 'ENABLED' : 'DISABLED'}`
+    `P2P: ${p2pNode ? 'ENABLED' : 'DISABLED'}, ` +
+    `P2P Peers: ${p2pNode ? p2pNode.peers.size : 0}`
   );
 }
 
@@ -788,7 +836,6 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
         return;
       }
       
-      // FIX: Validasi bahwa heartbeatModule adalah object dengan method autoRegister
       if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
         console.error('[INIT] Heartbeat module is invalid!', typeof heartbeatModule);
         console.error('[INIT] Available keys:', Object.keys(heartbeatModule || {}));
@@ -805,7 +852,9 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
         sharedData.setRegistered(true);
         
         startHeartbeatService(heartbeatInterval);
-        startPeriodicSync(methodsSyncInterval);
+        
+        // Use P2P sync for periodic updates instead of master
+        startPeriodicP2PSync(methodsSyncInterval);
         
       } else {
         console.log('[INIT] Registration failed (DIRECT mode):', registerResult.error);
@@ -821,11 +870,9 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
         }
       }
     } catch (error) {
-      // FIX: Proper error handling
       console.error('[INIT] Error in startDirectMode:', error);
       console.error('[INIT] Stack trace:', error.stack);
       
-      // Fallback to REVERSE mode if available
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
         console.log('[INIT] Falling back to REVERSE mode after error...');
         nodeMode = 'REVERSE';
@@ -885,16 +932,8 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
         console.log(`[REVERSE] Started WebSocket heartbeat every ${heartbeatInterval}ms`);
       }
       
-      methodsSyncIntervalId = setInterval(async () => {
-        try {
-          const syncResult = await syncMethods();
-          if (syncResult && syncResult.success && !syncResult.up_to_date) {
-            console.log('[REVERSE-SYNC] Methods updated from master');
-          }
-        } catch (error) {
-          console.error('[REVERSE-SYNC] Error:', error.message);
-        }
-      }, methodsSyncInterval);
+      // Use P2P sync instead of periodic master sync
+      startPeriodicP2PSync(methodsSyncInterval);
       
     } else if (connectionCheckAttempts >= maxConnectionCheckAttempts) {
       clearInterval(setupInterval);
@@ -941,7 +980,8 @@ function startHeartbeatService(heartbeatInterval) {
   }
 }
 
-function startPeriodicSync(methodsSyncInterval) {
+// Replace master sync with P2P sync
+function startPeriodicP2PSync(methodsSyncInterval) {
   methodsSyncIntervalId = setInterval(async () => {
     if (!isRegistered) {
       console.log('[PERIODIC-SYNC] Skipped - not registered');
@@ -949,10 +989,12 @@ function startPeriodicSync(methodsSyncInterval) {
     }
     
     try {
+      // Try P2P sync first
       const syncResult = await syncMethods();
       if (syncResult && syncResult.success && !syncResult.up_to_date) {
-        console.log('[PERIODIC-SYNC] Methods updated from master');
+        console.log('[PERIODIC-SYNC] Methods updated');
         
+        // Only notify master of version update (no full sync)
         if (heartbeatModule && heartbeatModule.updateMethodsVersion) {
           await heartbeatModule.updateMethodsVersion();
         }
@@ -961,7 +1003,7 @@ function startPeriodicSync(methodsSyncInterval) {
       console.error('[PERIODIC-SYNC] Error:', error.message);
     }
   }, methodsSyncInterval);
-  console.log(`[PERIODIC-SYNC] Started periodic sync every ${methodsSyncInterval}ms`);
+  console.log(`[PERIODIC-SYNC] Started P2P-based periodic sync every ${methodsSyncInterval}ms`);
 }
 
 async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
@@ -973,12 +1015,10 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
   }
   
   try {
-    // FIX: Validasi bahwa heartbeatModule adalah object dengan method autoRegister
     if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
       console.error('[INIT] Heartbeat module is invalid for retry!', typeof heartbeatModule);
       console.error('[INIT] Available keys:', Object.keys(heartbeatModule || {}));
       
-      // Fallback to REVERSE mode if available
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
         console.log('[INIT] Switching to REVERSE mode after validation failure');
         nodeMode = 'REVERSE';
@@ -999,7 +1039,7 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
       if (methodsSyncIntervalId) clearInterval(methodsSyncIntervalId);
       
       startHeartbeatService(heartbeatInterval);
-      startPeriodicSync(methodsSyncInterval);
+      startPeriodicP2PSync(methodsSyncInterval);
       
     } else {
       console.log('[INIT] ✗ Registration retry failed:', retryResult.error);
@@ -1015,11 +1055,9 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
       }
     }
   } catch (error) {
-    // FIX: Proper error handling
     console.error('[INIT] Error in retryRegistration:', error);
     console.error('[INIT] Stack trace:', error.stack);
     
-    // Fallback to REVERSE mode if available
     if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
       console.log('[INIT] Falling back to REVERSE mode after error...');
       nodeMode = 'REVERSE';
@@ -1109,7 +1147,7 @@ async function startServer() {
           
           // Setup P2P event listeners
           p2pNode.on('peer_connected', (data) => {
-            console.log(`[P2P-EVENT] Peer connected: ${data.nodeId} (${data.direct ? 'direct' : 'relay'})`);
+            console.log(`[P2P-EVENT] Peer connected: ${data.nodeId} (${data.mode} - ${data.direct ? 'direct' : 'relay'})`);
           });
           
           p2pNode.on('peer_disconnected', (data) => {
@@ -1118,6 +1156,28 @@ async function startServer() {
           
           p2pNode.on('peer_info', (data) => {
             console.log(`[P2P-EVENT] Peer info received from ${data.nodeId}`, data.capabilities);
+          });
+          
+          // Listen for methods updates from peers
+          p2pNode.on('methods_updated_from_peer', async (data) => {
+            console.log(`[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving...`);
+            
+            try {
+              // Save to local file
+              const methodsPath = config.SERVER.METHODS_PATH;
+              fs.writeFileSync(methodsPath, JSON.stringify(data.methods, null, 2));
+              console.log('[P2P-EVENT] ✓ Methods saved to local file');
+              
+              // Update shared config
+              refreshMethodsConfig();
+              
+              // Notify master about version update
+              if (heartbeatModule && heartbeatModule.updateMethodsVersion) {
+                await heartbeatModule.updateMethodsVersion();
+              }
+            } catch (error) {
+              console.error('[P2P-EVENT] Failed to save methods:', error.message);
+            }
           });
           
         } else {
@@ -1162,13 +1222,18 @@ async function startServer() {
     }
 
     const heartbeatInterval = config.MASTER?.HEARTBEAT_INTERVAL || 30000;
-    const methodsSyncInterval = config.MASTER?.METHODS_SYNC_INTERVAL || 60000;
+    const methodsSyncInterval = config.MASTER?.METHODS_SYNC_INTERVAL || 120000; // Increased to 2 minutes
 
     const modeInfo = await determineNetworkMode();
     nodeMode = modeInfo.mode;
     sharedData.setNodeMode(nodeMode);
     isReachable = modeInfo.reachable;
     sharedData.setReachable(isReachable);
+    
+    // Set P2P node mode
+    if (p2pNode) {
+      p2pNode.setNodeMode(nodeMode);
+    }
     
     console.log(`[INIT] Final mode: ${nodeMode}, Reachable: ${isReachable}`);
 
