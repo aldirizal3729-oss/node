@@ -596,6 +596,7 @@ fastify.get('/health', async (request, reply) => {
     encryption: encryptionInitialized && !!(config.ENCRYPTION?.ENABLED),
     mode: nodeMode,
     reachable: isReachable,
+    registered: isRegistered,
     methods_count: Object.keys(sharedData.methodsConfig).length,
     ip: config.NODE.IP || 'unknown',
     port: config.SERVER.PORT,
@@ -789,26 +790,6 @@ async function determineNetworkMode() {
 function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
   console.log(`[INIT] Starting operations for ${nodeMode} mode...`);
   
-  // Initial sync from master
-  setTimeout(async () => {
-    try {
-      console.log('[INIT] Performing initial methods sync from master...');
-      const { syncMethodsWithMaster } = methodSyncModule;
-      const syncResult = await syncMethodsWithMaster(config);
-      if (syncResult && syncResult.success) {
-        console.log(`[INIT] ✓ Methods sync completed from master`);
-        refreshMethodsConfig();
-        
-        // Update P2P node with latest methods
-        if (p2pNode) {
-          p2pNode.updateMethodsConfig(sharedData.methodsConfig);
-        }
-      }
-    } catch (error) {
-      console.error('[INIT] Initial sync error:', error.message);
-    }
-  }, 1000);
-  
   if (nodeMode === 'DIRECT') {
     startDirectMode(heartbeatInterval, methodsSyncInterval);
   } else if (nodeMode === 'REVERSE') {
@@ -816,65 +797,132 @@ function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
   } else {
     startStandaloneMode();
   }
-  
-  console.log(
-    `[INIT] Ready - Methods: ${Object.keys(sharedData.methodsConfig).length}, ` +
-    `Encryption: ${config.ENCRYPTION?.ENABLED && encryptionInitialized ? 'ON' : 'OFF'}, ` +
-    `Mode: ${nodeMode}, Reachable: ${isReachable ? 'YES' : 'NO'}, ` +
-    `P2P: ${p2pNode ? 'ENABLED' : 'DISABLED'}, ` +
-    `P2P Peers: ${p2pNode ? p2pNode.peers.size : 0}`
-  );
 }
 
 function startDirectMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[INIT] Starting DIRECT mode operations...');
+  console.log('[INIT] ⏳ Waiting for successful registration before starting other services...');
   
   setTimeout(async () => {
     try {
       if (!heartbeatModule) {
-        console.error('[INIT] Heartbeat module not initialized!');
+        console.error('[INIT] ✗ Heartbeat module not initialized!');
         return;
       }
       
       if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
-        console.error('[INIT] Heartbeat module is invalid!', typeof heartbeatModule);
+        console.error('[INIT] ✗ Heartbeat module is invalid!', typeof heartbeatModule);
         console.error('[INIT] Available keys:', Object.keys(heartbeatModule || {}));
         return;
       }
       
-      console.log('[INIT] Attempting registration to master (DIRECT mode)...');
+      console.log('[INIT] 🔄 Attempting registration to master (DIRECT mode)...');
       
       const registerResult = await heartbeatModule.autoRegister();
       
       if (registerResult.success) {
-        console.log('[INIT] Registration successful (DIRECT mode)');
+        console.log('='.repeat(80));
+        console.log('[INIT] ✅ REGISTRATION SUCCESSFUL (DIRECT mode)');
+        console.log('='.repeat(80));
         isRegistered = true;
         sharedData.setRegistered(true);
         
-        startHeartbeatService(heartbeatInterval);
+        // Setelah registrasi berhasil, baru jalankan fitur-fitur lain
+        console.log('\n[POST-REGISTRATION] Starting post-registration services...\n');
         
-        // Use P2P sync for periodic updates instead of master
+        // 1. Start heartbeat service
+        console.log('[POST-REGISTRATION] 1/5 Starting heartbeat service...');
+        startHeartbeatService(heartbeatInterval);
+        console.log('[POST-REGISTRATION] ✓ Heartbeat service started');
+        
+        // 2. Initialize methods sync
+        console.log('\n[POST-REGISTRATION] 2/5 Performing initial methods sync...');
+        setTimeout(async () => {
+          try {
+            const syncResult = await syncMethods();
+            if (syncResult && syncResult.success) {
+              console.log('[POST-REGISTRATION] ✓ Initial methods sync completed');
+              console.log(`[POST-REGISTRATION] Methods count: ${Object.keys(sharedData.methodsConfig).length}`);
+              refreshMethodsConfig();
+              
+              // Update P2P node dengan methods terbaru
+              if (p2pNode) {
+                p2pNode.updateMethodsConfig(sharedData.methodsConfig);
+                console.log('[POST-REGISTRATION] ✓ P2P node updated with latest methods');
+              }
+            } else {
+              console.log('[POST-REGISTRATION] ⚠ Initial methods sync failed, will retry periodically');
+            }
+          } catch (error) {
+            console.error('[POST-REGISTRATION] ✗ Initial methods sync error:', error.message);
+          }
+        }, 2000);
+        
+        // 3. Start proxy updater (if enabled)
+        if (config.PROXY && config.PROXY.AUTO_UPDATE) {
+          console.log('\n[POST-REGISTRATION] 3/5 Starting proxy auto-updater...');
+          setTimeout(() => {
+            if (!proxyUpdater) {
+              console.log('[POST-REGISTRATION] ⚠ Proxy updater not initialized, skipping');
+              return;
+            }
+            
+            const interval = config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
+            proxyUpdater.startAutoUpdate(interval);
+            console.log(`[POST-REGISTRATION] ✓ Proxy auto-update started (every ${interval} minutes)`);
+          }, 3000);
+        } else {
+          console.log('\n[POST-REGISTRATION] 3/5 Proxy auto-updater disabled');
+        }
+        
+        // 4. Start P2P services (if enabled and initialized)
+        if (p2pNode && p2pNode.p2pConfig.enabled) {
+          console.log('\n[POST-REGISTRATION] 4/5 P2P services already running...');
+          setTimeout(() => {
+            console.log(`[POST-REGISTRATION] ✓ P2P Status: ${p2pNode.peers.size} peers connected`);
+          }, 4000);
+        } else {
+          console.log('\n[POST-REGISTRATION] 4/5 P2P disabled or not initialized');
+        }
+        
+        // 5. Start periodic P2P sync
+        console.log('\n[POST-REGISTRATION] 5/5 Starting periodic sync...');
         startPeriodicP2PSync(methodsSyncInterval);
+        console.log('[POST-REGISTRATION] ✓ Periodic sync started');
+        
+        console.log('\n' + '='.repeat(80));
+        console.log('[POST-REGISTRATION] ✅ ALL POST-REGISTRATION SERVICES STARTED SUCCESSFULLY');
+        console.log('='.repeat(80));
+        console.log(`[READY] Node ready - Mode: ${nodeMode}, Registered: ${isRegistered}, Reachable: ${isReachable}`);
+        console.log(`[READY] Methods: ${Object.keys(sharedData.methodsConfig).length}, Encryption: ${config.ENCRYPTION?.ENABLED && encryptionInitialized ? 'ON' : 'OFF'}`);
+        console.log(`[READY] P2P: ${p2pNode ? 'ENABLED' : 'DISABLED'}, P2P Peers: ${p2pNode ? p2pNode.peers.size : 0}`);
+        console.log('='.repeat(80) + '\n');
         
       } else {
-        console.log('[INIT] Registration failed (DIRECT mode):', registerResult.error);
+        console.log('='.repeat(80));
+        console.log('[INIT] ✗ REGISTRATION FAILED (DIRECT mode):', registerResult.error);
+        console.log('='.repeat(80));
         
         if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-          console.log('[INIT] Trying fallback to REVERSE mode...');
+          console.log('[INIT] 🔄 Attempting fallback to REVERSE mode...\n');
           nodeMode = 'REVERSE';
           sharedData.setNodeMode('REVERSE');
           startReverseMode(heartbeatInterval, methodsSyncInterval);
         } else {
-          console.log('[INIT] Will retry registration in 30 seconds...');
+          console.log('[INIT] ⏳ Will retry registration in 30 seconds...\n');
           setTimeout(() => retryRegistration(heartbeatInterval, methodsSyncInterval), 30000);
         }
       }
     } catch (error) {
-      console.error('[INIT] Error in startDirectMode:', error);
+      console.error('\n' + '='.repeat(80));
+      console.error('[INIT] ✗ ERROR IN DIRECT MODE STARTUP');
+      console.error('='.repeat(80));
+      console.error('[INIT] Error:', error.message);
       console.error('[INIT] Stack trace:', error.stack);
+      console.error('='.repeat(80) + '\n');
       
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-        console.log('[INIT] Falling back to REVERSE mode after error...');
+        console.log('[INIT] 🔄 Falling back to REVERSE mode after error...\n');
         nodeMode = 'REVERSE';
         sharedData.setNodeMode('REVERSE');
         startReverseMode(heartbeatInterval, methodsSyncInterval);
@@ -885,9 +933,10 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
 
 function startReverseMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[INIT] Starting REVERSE mode operations...');
+  console.log('[INIT] ⏳ Waiting for WebSocket connection and registration...');
   
   if (!config.MASTER?.WS_URL) {
-    console.log('[INIT] ERROR: MASTER.WS_URL not configured for REVERSE mode');
+    console.log('[INIT] ✗ ERROR: MASTER.WS_URL not configured for REVERSE mode');
     console.log('[INIT] Falling back to STANDALONE mode');
     startStandaloneMode();
     return;
@@ -896,13 +945,13 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
   try {
     reverseClient = createReverseClient(config, executor, sharedData.methodsConfig);
   } catch (error) {
-    console.error('[INIT] Failed to create reverse client:', error.message);
+    console.error('[INIT] ✗ Failed to create reverse client:', error.message);
     console.log('[INIT] Falling back to STANDALONE mode');
     startStandaloneMode();
     return;
   }
   
-  console.log('[REVERSE-INIT] Connecting to master via WebSocket...');
+  console.log('[REVERSE-INIT] 🔄 Connecting to master via WebSocket...');
   reverseClient.connect();
   
   let connectionCheckAttempts = 0;
@@ -913,38 +962,95 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
     
     if (reverseClient.isConnected && reverseClient.isConnected()) {
       clearInterval(setupInterval);
-      console.log('[REVERSE] WebSocket connected, starting setup...');
+      console.log('\n' + '='.repeat(80));
+      console.log('[REVERSE] ✅ WEBSOCKET CONNECTED');
+      console.log('='.repeat(80));
       
+      // Attempt REST registration
       try {
+        console.log('\n[REVERSE] 🔄 Attempting REST registration...');
         const registerResult = await reverseClient.registerWithMaster();
+        
         if (registerResult.success) {
-          console.log('[REVERSE] ✓ Registered with master via REST');
+          console.log('='.repeat(80));
+          console.log('[REVERSE] ✅ REGISTRATION SUCCESSFUL (via REST)');
+          console.log('='.repeat(80));
           isRegistered = true;
           sharedData.setRegistered(true);
+          
+          // Start post-registration services
+          console.log('\n[POST-REGISTRATION] Starting post-registration services...\n');
+          
+          // 1. Start WebSocket heartbeat
+          console.log('[POST-REGISTRATION] 1/4 Starting WebSocket heartbeat...');
+          if (reverseClient.startBackgroundHeartbeat) {
+            backgroundWSHeartbeat = reverseClient.startBackgroundHeartbeat(heartbeatInterval);
+            backgroundWSHeartbeat.start();
+            console.log(`[POST-REGISTRATION] ✓ WebSocket heartbeat started (every ${heartbeatInterval}ms)`);
+          }
+          
+          // 2. Initialize methods sync
+          console.log('\n[POST-REGISTRATION] 2/4 Performing initial methods sync...');
+          setTimeout(async () => {
+            try {
+              const syncResult = await syncMethods();
+              if (syncResult && syncResult.success) {
+                console.log('[POST-REGISTRATION] ✓ Initial methods sync completed');
+                refreshMethodsConfig();
+                
+                if (p2pNode) {
+                  p2pNode.updateMethodsConfig(sharedData.methodsConfig);
+                }
+              }
+            } catch (error) {
+              console.error('[POST-REGISTRATION] ✗ Methods sync error:', error.message);
+            }
+          }, 2000);
+          
+          // 3. Start proxy updater
+          if (config.PROXY && config.PROXY.AUTO_UPDATE && proxyUpdater) {
+            console.log('\n[POST-REGISTRATION] 3/4 Starting proxy auto-updater...');
+            setTimeout(() => {
+              const interval = config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
+              proxyUpdater.startAutoUpdate(interval);
+              console.log(`[POST-REGISTRATION] ✓ Proxy auto-update started`);
+            }, 3000);
+          }
+          
+          // 4. Start periodic sync
+          console.log('\n[POST-REGISTRATION] 4/4 Starting periodic sync...');
+          startPeriodicP2PSync(methodsSyncInterval);
+          
+          console.log('\n' + '='.repeat(80));
+          console.log('[POST-REGISTRATION] ✅ ALL SERVICES STARTED SUCCESSFULLY (REVERSE MODE)');
+          console.log('='.repeat(80));
+          console.log(`[READY] Node ready - Mode: ${nodeMode}, Registered: ${isRegistered}`);
+          console.log('='.repeat(80) + '\n');
+          
+        } else {
+          console.log('[REVERSE] ⚠ REST registration failed:', registerResult.error);
+          console.log('[REVERSE] Will retry via WebSocket messages');
         }
       } catch (error) {
-        console.error('[REVERSE] REST registration error:', error.message);
+        console.error('[REVERSE] ✗ REST registration error:', error.message);
       }
-      
-      if (reverseClient.startBackgroundHeartbeat) {
-        backgroundWSHeartbeat = reverseClient.startBackgroundHeartbeat(heartbeatInterval);
-        backgroundWSHeartbeat.start();
-        console.log(`[REVERSE] Started WebSocket heartbeat every ${heartbeatInterval}ms`);
-      }
-      
-      // Use P2P sync instead of periodic master sync
-      startPeriodicP2PSync(methodsSyncInterval);
       
     } else if (connectionCheckAttempts >= maxConnectionCheckAttempts) {
       clearInterval(setupInterval);
-      console.log('[REVERSE] Connection timeout, will retry in 10 seconds...');
+      console.log('[REVERSE] ✗ WebSocket connection timeout, will retry in 10 seconds...');
       setTimeout(() => startReverseMode(heartbeatInterval, methodsSyncInterval), 10000);
+    } else {
+      if (connectionCheckAttempts % 5 === 0) {
+        console.log(`[REVERSE] ⏳ Waiting for connection... (${connectionCheckAttempts}/${maxConnectionCheckAttempts})`);
+      }
     }
   }, 1000);
 }
 
 function startStandaloneMode() {
-  console.log('[INIT] Starting STANDALONE mode - no master connection');
+  console.log('\n' + '='.repeat(80));
+  console.log('[INIT] STARTING STANDALONE MODE - No master connection');
+  console.log('='.repeat(80));
   
   setTimeout(async () => {
     try {
@@ -952,9 +1058,15 @@ function startStandaloneMode() {
       const syncResult = await syncMethods();
       if (syncResult && syncResult.success) {
         console.log('[STANDALONE] ✓ Methods sync completed');
+        console.log(`[STANDALONE] Methods count: ${Object.keys(sharedData.methodsConfig).length}`);
       }
+      
+      console.log('\n' + '='.repeat(80));
+      console.log('[READY] Node ready in STANDALONE mode');
+      console.log(`[READY] Methods: ${Object.keys(sharedData.methodsConfig).length}`);
+      console.log('='.repeat(80) + '\n');
     } catch (error) {
-      console.error('[STANDALONE] Sync error:', error.message);
+      console.error('[STANDALONE] ✗ Sync error:', error.message);
     }
   }, 2000);
 }
@@ -963,7 +1075,7 @@ function startHeartbeatService(heartbeatInterval) {
   if (heartbeatModule.startBackgroundHeartbeat) {
     backgroundHeartbeat = heartbeatModule.startBackgroundHeartbeat(heartbeatInterval);
     backgroundHeartbeat.start();
-    console.log(`[HEARTBEAT] Started background heartbeat every ${heartbeatInterval}ms`);
+    console.log(`[HEARTBEAT] Background heartbeat started (every ${heartbeatInterval}ms)`);
   } else {
     heartbeatIntervalId = setInterval(() => {
       if (encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED) {
@@ -976,7 +1088,7 @@ function startHeartbeatService(heartbeatInterval) {
         });
       }
     }, heartbeatInterval);
-    console.log(`[HEARTBEAT] Started interval heartbeat every ${heartbeatInterval}ms`);
+    console.log(`[HEARTBEAT] Interval heartbeat started (every ${heartbeatInterval}ms)`);
   }
 }
 
@@ -1003,20 +1115,22 @@ function startPeriodicP2PSync(methodsSyncInterval) {
       console.error('[PERIODIC-SYNC] Error:', error.message);
     }
   }, methodsSyncInterval);
-  console.log(`[PERIODIC-SYNC] Started P2P-based periodic sync every ${methodsSyncInterval}ms`);
+  console.log(`[PERIODIC-SYNC] P2P-based periodic sync started (every ${methodsSyncInterval}ms)`);
 }
 
 async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
-  console.log('[INIT] Retrying registration...');
+  console.log('\n' + '='.repeat(80));
+  console.log('[INIT] 🔄 RETRYING REGISTRATION...');
+  console.log('='.repeat(80));
   
   if (!heartbeatModule) {
-    console.error('[INIT] Heartbeat module not available for retry');
+    console.error('[INIT] ✗ Heartbeat module not available for retry');
     return;
   }
   
   try {
     if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
-      console.error('[INIT] Heartbeat module is invalid for retry!', typeof heartbeatModule);
+      console.error('[INIT] ✗ Heartbeat module is invalid for retry!', typeof heartbeatModule);
       console.error('[INIT] Available keys:', Object.keys(heartbeatModule || {}));
       
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
@@ -1031,19 +1145,23 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
     const retryResult = await heartbeatModule.autoRegister();
     
     if (retryResult.success) {
-      console.log('[INIT] ✓ Registration successful on retry');
+      console.log('='.repeat(80));
+      console.log('[INIT] ✅ REGISTRATION SUCCESSFUL ON RETRY');
+      console.log('='.repeat(80));
       isRegistered = true;
       sharedData.setRegistered(true);
       
       if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
       if (methodsSyncIntervalId) clearInterval(methodsSyncIntervalId);
       
-      startHeartbeatService(heartbeatInterval);
-      startPeriodicP2PSync(methodsSyncInterval);
+      // Start all services after successful registration
+      startDirectMode(heartbeatInterval, methodsSyncInterval);
       
     } else {
-      console.log('[INIT] ✗ Registration retry failed:', retryResult.error);
-      console.log('[INIT] Will retry again in 60 seconds...');
+      console.log('='.repeat(80));
+      console.log('[INIT] ✗ REGISTRATION RETRY FAILED:', retryResult.error);
+      console.log('='.repeat(80));
+      console.log('[INIT] Will retry again in 60 seconds...\n');
       
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
         console.log('[INIT] Switching to REVERSE mode after multiple failures');
@@ -1055,7 +1173,7 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
       }
     }
   } catch (error) {
-    console.error('[INIT] Error in retryRegistration:', error);
+    console.error('[INIT] ✗ Error in retryRegistration:', error);
     console.error('[INIT] Stack trace:', error.stack);
     
     if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
@@ -1122,14 +1240,19 @@ async function startServer() {
   try {
     await fastify.listen({ port: config.SERVER.PORT, host: '0.0.0.0' });
     
-    console.log(`Node server started on port ${config.SERVER.PORT}`);
+    console.log('\n' + '='.repeat(80));
+    console.log('NODE SERVER STARTED');
+    console.log('='.repeat(80));
+    console.log(`Port: ${config.SERVER.PORT}`);
     console.log(`Node ID: ${config.NODE.ID}`);
     console.log(`Encryption: ${config.ENCRYPTION?.ENABLED ? 'ENABLED' : 'DISABLED'}`);
+    console.log('='.repeat(80) + '\n');
 
+    // Load initial methods config (local only)
     refreshMethodsConfig();
-    console.log(`Loaded ${Object.keys(sharedData.methodsConfig).length} methods`);
+    console.log(`[INIT] Loaded ${Object.keys(sharedData.methodsConfig).length} methods (local)`);
     
-    // Initialize P2P Hybrid Node
+    // Initialize P2P Hybrid Node (sebelum registrasi)
     if (config.P2P && config.P2P.ENABLED) {
       try {
         console.log('[P2P] Initializing P2P Hybrid Node...');
@@ -1155,7 +1278,7 @@ async function startServer() {
           });
           
           p2pNode.on('peer_info', (data) => {
-            console.log(`[P2P-EVENT] Peer info received from ${data.nodeId}`, data.capabilities);
+            console.log(`[P2P-EVENT] Peer info received from ${data.nodeId}`);
           });
           
           // Listen for methods updates from peers
@@ -1190,25 +1313,25 @@ async function startServer() {
       console.log('[P2P] P2P is disabled in config');
     }
     
+    // Initialize proxy updater (sebelum registrasi, tapi jangan auto-start)
     if (config.PROXY && config.PROXY.AUTO_UPDATE) {
       try {
         proxyUpdater = createProxyUpdater(config);
         sharedData.setProxyUpdater(proxyUpdater);
-        
-        const interval = config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
-        proxyUpdater.startAutoUpdate(interval);
-        console.log(`[PROXY] Auto-update every ${interval} minutes`);
+        console.log('[PROXY] Proxy updater initialized (will start after registration)');
       } catch (error) {
         console.error('[PROXY] Init error:', error.message);
       }
     }
 
+    // Initialize modules
     const masterReachable = await initializeModules();
     
     if (!masterReachable && config.MASTER?.URL) {
       console.log('[INIT] WARNING: Cannot reach master, will try REVERSE mode if WS available');
     }
 
+    // Test encryption
     if (config.ENCRYPTION?.ENABLED && encryptionManager && encryptionInitialized) {
       try {
         const testResult = encryptionManager.testEncryption();
@@ -1222,8 +1345,9 @@ async function startServer() {
     }
 
     const heartbeatInterval = config.MASTER?.HEARTBEAT_INTERVAL || 30000;
-    const methodsSyncInterval = config.MASTER?.METHODS_SYNC_INTERVAL || 120000; // Increased to 2 minutes
+    const methodsSyncInterval = config.MASTER?.METHODS_SYNC_INTERVAL || 120000;
 
+    // Determine network mode
     const modeInfo = await determineNetworkMode();
     nodeMode = modeInfo.mode;
     sharedData.setNodeMode(nodeMode);
@@ -1237,6 +1361,7 @@ async function startServer() {
     
     console.log(`[INIT] Final mode: ${nodeMode}, Reachable: ${isReachable}`);
 
+    // Start mode-based operations (ini akan handle registrasi dan post-registration)
     startModeBasedOperations(heartbeatInterval, methodsSyncInterval);
 
     await fetchServerInfo().catch(() => {});

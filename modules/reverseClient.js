@@ -3,7 +3,6 @@ import WebSocket from 'ws';
 import fs from 'fs';
 import { calculateMethodsVersionHash, syncMethodsWithMaster } from './methodSync.js';
 
-// Helper function untuk fetch dengan timeout menggunakan AbortController
 async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -37,7 +36,7 @@ function createReverseClient(config, executor, methodsConfig) {
   let pingInterval = null;
   let reconnectAttempts = 0;
   const maxReconnectAttempts = config.REVERSE?.MAX_RECONNECT_ATTEMPTS || 10;
-  let lastSuccessfulConnection = null; // FIX: Track last successful connection
+  let lastSuccessfulConnection = null; 
   
   let masterDownDetection = {
     lastHeartbeatSuccess: Date.now(),
@@ -87,7 +86,6 @@ function createReverseClient(config, executor, methodsConfig) {
         
         if (!ws || ws.readyState !== WebSocket.OPEN) {
           console.log('[REVERSE] Attempting WebSocket reconnect after master recovery...');
-          // FIX: Reset reconnect attempts when master comes back
           reconnectAttempts = 0;
           scheduleImmediateReconnect();
         }
@@ -106,8 +104,7 @@ function createReverseClient(config, executor, methodsConfig) {
         }
       }
       
-      // FIX: More conservative timeout for force reconnect
-      if (now - masterDownDetection.lastHeartbeatSuccess > 600000) { // 10 minutes instead of 5
+      if (now - masterDownDetection.lastHeartbeatSuccess > 600000) { 
         console.log('[REVERSE] No successful heartbeat for 10 minutes, forcing reconnection...');
         forceReconnect();
       }
@@ -121,12 +118,10 @@ function createReverseClient(config, executor, methodsConfig) {
       try {
         ws.close();
       } catch (error) {
-        // Ignore error
       }
       ws = null;
     }
     
-    // FIX: Only reset if we had a recent successful connection
     if (lastSuccessfulConnection && (Date.now() - lastSuccessfulConnection) < 300000) {
       reconnectAttempts = 0;
     }
@@ -630,7 +625,6 @@ function createReverseClient(config, executor, methodsConfig) {
       ws.on('open', async () => {
         console.log('[REVERSE] WS: ✓ Connected to master');
         
-        // FIX: Reset reconnect attempts on successful connection
         reconnectAttempts = 0;
         lastSuccessfulConnection = Date.now();
         masterDownDetection.isMasterDown = false;
@@ -728,14 +722,12 @@ function createReverseClient(config, executor, methodsConfig) {
         if (!isShuttingDown) {
           reconnectAttempts++;
           
-          // FIX: Better max attempts handling with reset after long successful connection
           if (reconnectAttempts >= maxReconnectAttempts) {
             const timeSinceLastSuccess = lastSuccessfulConnection 
               ? (Date.now() - lastSuccessfulConnection) 
               : Infinity;
             
-            // If we had a long successful connection, reset attempts
-            if (timeSinceLastSuccess > 300000) { // 5 minutes
+            if (timeSinceLastSuccess > 300000) { 
               console.log('[REVERSE] WS: Resetting reconnect attempts after long successful connection');
               reconnectAttempts = 0;
               scheduleReconnect();
@@ -745,7 +737,7 @@ function createReverseClient(config, executor, methodsConfig) {
                 reconnectAttempts = 0;
                 console.log('[REVERSE] WS: Cooldown complete, reset reconnect attempts');
                 scheduleReconnect();
-              }, 300000); // 5 minutes cooldown
+              }, 300000); 
               return;
             }
           } else {
@@ -794,7 +786,6 @@ function createReverseClient(config, executor, methodsConfig) {
     }
   }
 
-  // FIX: Improved exponential backoff with jitter and max delay
   function scheduleReconnect() {
     if (isShuttingDown) {
       return;
@@ -804,14 +795,13 @@ function createReverseClient(config, executor, methodsConfig) {
       clearTimeout(reconnectTimeout);
     }
 
-    // FIX: Better exponential backoff calculation
-    const baseDelay = 5000; // Start with 5 seconds
-    const maxDelay = 300000; // Max 5 minutes
+    const baseDelay = 5000; 
+    const maxDelay = 300000; 
     const exponentialDelay = Math.min(
       baseDelay * Math.pow(1.5, reconnectAttempts),
       maxDelay
     );
-    const jitter = Math.random() * 5000; // 0-5s jitter
+    const jitter = Math.random() * 5000; 
     const delay = exponentialDelay + jitter;
 
     console.log(
@@ -1169,7 +1159,6 @@ function createReverseClient(config, executor, methodsConfig) {
           if (masterCameBack && (!ws || ws.readyState !== WebSocket.OPEN)) {
             masterCameBack = false;
             console.log('[REVERSE] Master is back, attempting WebSocket reconnection...');
-            // FIX: Reset reconnect attempts when master comes back
             reconnectAttempts = 0;
             scheduleImmediateReconnect();
           }
@@ -1238,7 +1227,6 @@ function createReverseClient(config, executor, methodsConfig) {
         }
         ws.close();
       } catch {
-        // Ignore error
       }
     }
   }

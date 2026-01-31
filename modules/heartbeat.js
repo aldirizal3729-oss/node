@@ -5,7 +5,6 @@ import { calculateMethodsVersionHash } from './methodSync.js';
 
 const execPromise = promisify(exec);
 
-// Helper function untuk fetch dengan timeout menggunakan AbortController
 async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -36,7 +35,6 @@ async function createHeartbeat(config, executor, methodsConfig) {
   let encryptionManager = null;
   if (config.ENCRYPTION && config.ENCRYPTION.ENABLED) {
     try {
-      // dynamic import karena ESM
       const { default: EncryptionManager } = await import('./encryption.js');
       encryptionManager = new EncryptionManager({
         ...config,
@@ -48,7 +46,6 @@ async function createHeartbeat(config, executor, methodsConfig) {
       console.log('[HEARTBEAT] Encryption loaded');
     } catch (error) {
       console.error('[HEARTBEAT] Failed to load encryption:', error.message);
-      // Non-fatal error, continue tanpa encryption
     }
   }
 

