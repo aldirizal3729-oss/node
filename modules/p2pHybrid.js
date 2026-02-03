@@ -1,6 +1,12 @@
 import EventEmitter from 'events';
 import { WebSocket, WebSocketServer } from 'ws';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 class P2PHybridNode extends EventEmitter {
   constructor(config, executor, methodsConfig) {
@@ -1032,8 +1038,6 @@ class P2PHybridNode extends EventEmitter {
     
     console.log(`[P2P-FILE] Peer ${nodeId} requested file: ${filename}`);
     
-    const fs = require('fs');
-    const path = require('path');
     const dataDir = path.join(__dirname, '..', 'lib', 'data');
     const filePath = path.join(dataDir, filename);
     
@@ -1373,6 +1377,14 @@ class P2PHybridNode extends EventEmitter {
     const queue = this.messageQueue.get(nodeId);
     
     if (queue.length === 0) {
+      this.messageQueue.delete(nodeId);
+      return;
+    }
+    
+    const peer = this.peers.get(nodeId);
+    if (!peer || !peer.ws || peer.ws.readyState !== WebSocket.OPEN) {
+      // Peer not actually ready — leave queue intact for next connection attempt
+      console.log(`[P2P] Peer ${nodeId} not ready, keeping ${queue.length} queued message(s)`);
       return;
     }
     
@@ -1382,13 +1394,18 @@ class P2PHybridNode extends EventEmitter {
     let failed = 0;
     
     for (const item of queue) {
-      if (this.sendToPeer(nodeId, item.message)) {
+      try {
+        peer.ws.send(JSON.stringify(item.message));
+        peer.messagesSent++;
+        this.stats.messagesSent++;
         sent++;
-      } else {
+      } catch (error) {
+        console.error(`[P2P] Failed to flush queued message to ${nodeId}:`, error.message);
         failed++;
       }
     }
     
+    // Queue fully drained — remove it
     this.messageQueue.delete(nodeId);
     
     console.log(`[P2P] Processed queue for ${nodeId}: ${sent} sent, ${failed} failed`);
@@ -1734,7 +1751,8 @@ class P2PHybridNode extends EventEmitter {
       
       let removedLocks = 0;
       for (const nodeId of this.connectionLocks) {
-        if (this.peers.has(nodeId)) {
+        if (!this.peers.has(nodeId)) {
+          // Lock exists but no peer materialised — connection attempt was abandoned
           this.connectionLocks.delete(nodeId);
           removedLocks++;
         }

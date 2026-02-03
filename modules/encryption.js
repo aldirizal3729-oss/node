@@ -2,6 +2,7 @@ import crypto from 'crypto';
 
 class EncryptionManager {
   constructor(config) {
+    // Initialize all properties first before validation
     this.config = {
       ENABLED: true,
       VERSION: '1.0',
@@ -18,6 +19,7 @@ class EncryptionManager {
       NODE_ID: null
     };
     
+    // Apply configuration
     if (config && config.ENCRYPTION) {
       Object.assign(this.config, config.ENCRYPTION);
     }
@@ -26,15 +28,17 @@ class EncryptionManager {
       this.config.NODE_ID = config.NODE.ID;
     }
     
+    // Set shared secret
+    this.sharedSecret = null;
     if (this.config.SHARED_SECRET) {
       this.sharedSecret = this.config.SHARED_SECRET;
     } else if (config && config.SHARED_SECRET) {
       this.sharedSecret = config.SHARED_SECRET;
-    } else {
-      this.sharedSecret = null;
     }
     
+    // FIX Bug #9: Validate AFTER all initialization, disable before throwing
     if (this.config.ENABLED && !this.sharedSecret) {
+      this.config.ENABLED = false; // Disable to prevent partial initialization
       throw new Error('SHARED_SECRET is required when encryption is enabled');
     }
     
@@ -265,6 +269,15 @@ class EncryptionManager {
       }
       
       if (envelope.envelope === 'plain') {
+        // FIX Bug #11: Validate payload exists
+        if (!envelope.payload) {
+          return {
+            success: false,
+            error: 'Plain envelope missing payload',
+            shouldFallback: true
+          };
+        }
+        
         return {
           success: true,
           data: envelope.payload,
@@ -279,6 +292,15 @@ class EncryptionManager {
           success: false,
           error: 'Invalid message envelope type',
           shouldFallback: true
+        };
+      }
+
+      // FIX Bug #11: Validate secure envelope has payload
+      if (!envelope.payload) {
+        return {
+          success: false,
+          error: 'Secure envelope missing payload',
+          shouldFallback: false
         };
       }
 
@@ -370,6 +392,7 @@ class EncryptionManager {
       const expectedBuffer = Buffer.from(expected, 'hex');
       const signatureBuffer = Buffer.from(signature, 'hex');
       
+      // FIX Bug #10: Check length BEFORE timingSafeEqual to prevent timing attacks
       if (expectedBuffer.length !== signatureBuffer.length) {
         return false;
       }

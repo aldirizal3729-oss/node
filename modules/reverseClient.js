@@ -1086,12 +1086,11 @@ function createReverseClient(config, executor, methodsConfig) {
           `[REVERSE] WS: Methods updated notification from master`
         );
         console.log(
-          `[REVERSE] WS: Master version: ${master_version.substring(
-            0,
-            8
-          )}, Methods: ${method_count}`
+          `[REVERSE] WS: Master version: ${master_version?.substring(0, 8) ?? 'unknown'}, Methods: ${method_count ?? 'unknown'}`
         );
-        console.log(`[REVERSE] WS: ${message}`);
+        if (message) {
+          console.log(`[REVERSE] WS: ${message}`);
+        }
 
         const ackResponse = {
           type: 'methods_updated_ack',

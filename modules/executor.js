@@ -55,8 +55,10 @@ class Executor extends EventEmitter {
     console.log(`[EXEC-INIT] Data directory: ${this.dataDir}`);
   }
 
+  // FIX Bug #35: Improve error handling and logging
   _removeListener(emitter, event, handler) {
     if (!emitter || !handler) {
+      console.warn('[EXEC] Attempted to remove listener with null emitter or handler');
       return;
     }
     
@@ -65,8 +67,11 @@ class Executor extends EventEmitter {
         emitter.off(event, handler);
       } else if (typeof emitter.removeListener === 'function') {
         emitter.removeListener(event, handler);
+      } else {
+        console.warn('[EXEC] Emitter has no off or removeListener method');
       }
     } catch (error) {
+      console.error(`[EXEC] Error removing listener for ${event}:`, error.message);
     }
   }
 
@@ -83,11 +88,15 @@ class Executor extends EventEmitter {
       try {
         if (child.stdout && listeners.stdoutHandler) {
           this._removeListener(child.stdout, 'data', listeners.stdoutHandler);
-          this._removeListener(child.stdout, 'error', () => {});
+          if (listeners.stdoutErrorHandler) {
+            this._removeListener(child.stdout, 'error', listeners.stdoutErrorHandler);
+          }
         }
         if (child.stderr && listeners.stderrHandler) {
           this._removeListener(child.stderr, 'data', listeners.stderrHandler);
-          this._removeListener(child.stderr, 'error', () => {});
+          if (listeners.stderrErrorHandler) {
+            this._removeListener(child.stderr, 'error', listeners.stderrErrorHandler);
+          }
         }
         if (listeners.exitHandler) {
           this._removeListener(child, 'exit', listeners.exitHandler);
@@ -99,6 +108,7 @@ class Executor extends EventEmitter {
           this._removeListener(child, 'close', listeners.closeHandler);
         }
       } catch (error) {
+        console.error('[EXEC] Error during listener cleanup:', error.message);
       }
     }
     
@@ -129,6 +139,7 @@ class Executor extends EventEmitter {
     }
   }
 
+  // FIX Bug #36: Track kill failures
   checkAndKillZombieProcesses() {
     const now = Date.now();
     const zombieProcesses = [];
@@ -155,6 +166,8 @@ class Executor extends EventEmitter {
       );
       
       let killedCount = 0;
+      let failedCount = 0;
+      
       for (const zombie of zombieProcesses) {
         const overtimeSeconds = Math.round(zombie.overtime / 1000);
         console.log(
@@ -168,6 +181,11 @@ class Executor extends EventEmitter {
             console.log(
               `[EXEC-ZOMBIE] Auto-killed process ${zombie.processId}`
             );
+          } else {
+            failedCount++;
+            console.error(
+              `[EXEC-ZOMBIE] Failed to kill process ${zombie.processId}`
+            );
           }
         }
       }
@@ -176,6 +194,7 @@ class Executor extends EventEmitter {
         timestamp: now,
         count: zombieProcesses.length,
         killed: killedCount,
+        failed: failedCount,
         processes: zombieProcesses.map(z => ({
           processId: z.processId,
           pid: z.info.pid,
@@ -244,21 +263,40 @@ class Executor extends EventEmitter {
     return result;
   }
 
+  // FIX Bug #37: Add path traversal protection
   findFileInDataDir(filename) {
     filename = filename.replace(/^["']|["']$/g, '');
     
+    // SECURITY: Prevent path traversal
+    if (filename.includes('..')) {
+      console.warn(`[EXEC] Rejected path with traversal: ${filename}`);
+      return filename;
+    }
+    
+    // Check if absolute path and validate it's within allowed directories
     if (path.isAbsolute(filename)) {
-      if (fs.existsSync(filename)) {
+      const normalized = path.normalize(filename);
+      const normalizedDataDir = path.normalize(this.dataDir);
+      const isInDataDir = normalized.startsWith(normalizedDataDir);
+      
+      if (!isInDataDir) {
+        console.warn(`[EXEC] Rejected absolute path outside data dir: ${filename}`);
         return filename;
+      }
+      
+      if (fs.existsSync(normalized)) {
+        return normalized;
       }
     }
     
+    // System command check
     if (this.systemCommands.has(filename)) {
       return filename;
     }
     
+    // Search in allowed directories only
     const possiblePaths = [
-      path.join(this.dataDir, filename),    
+      path.join(this.dataDir, filename),
       path.join(this.dataDir, 'scripts', filename),
       path.join(this.dataDir, 'bin', filename),
       path.join(this.dataDir, 'tools', filename)
@@ -266,10 +304,19 @@ class Executor extends EventEmitter {
     
     for (const filePath of possiblePaths) {
       try {
-        if (fs.existsSync(filePath)) {
-          const stats = fs.statSync(filePath);
+        // Double-check normalized path is in data dir
+        const normalized = path.normalize(filePath);
+        const normalizedDataDir = path.normalize(this.dataDir);
+        
+        if (!normalized.startsWith(normalizedDataDir)) {
+          console.warn(`[EXEC] Path normalization resulted in traversal: ${filePath}`);
+          continue;
+        }
+        
+        if (fs.existsSync(normalized)) {
+          const stats = fs.statSync(normalized);
           if (!stats.isDirectory()) {
-            const ext = path.extname(filePath).toLowerCase();
+            const ext = path.extname(normalized).toLowerCase();
             const isExecutableType =
               !ext || 
               ext === '.sh' || 
@@ -280,11 +327,12 @@ class Executor extends EventEmitter {
             
             if (isExecutableType) {
               try {
-                fs.chmodSync(filePath, '755');
+                fs.chmodSync(normalized, '755');
               } catch (e) {
+                console.warn(`[EXEC] Could not chmod ${normalized}:`, e.message);
               }
             }
-            return filePath;
+            return normalized;
           }
         }
       } catch (e) {
@@ -316,12 +364,44 @@ class Executor extends EventEmitter {
     return resolvedParts;
   }
 
+  // FIX Bug #38: Add command injection protection
   execute(command, options = {}) {
     if (this.isShuttingDown) {
       return Promise.reject({
         success: false,
         error: 'Executor is shutting down'
       });
+    }
+    
+    // SECURITY: Basic command injection prevention
+    if (!command || typeof command !== 'string') {
+      return Promise.reject({
+        success: false,
+        error: 'Invalid command type'
+      });
+    }
+    
+    // Check for dangerous patterns
+    const dangerousPatterns = [
+      /;\s*rm\s+-rf/i,
+      /&&\s*rm\s+-rf/i,
+      /\|\s*sh/i,
+      /\|\s*bash/i,
+      /`.*`/,
+      /\$\(/,
+      />\s*\/dev\//i,
+      /curl.*\|\s*bash/i,
+      /wget.*\|\s*bash/i
+    ];
+    
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(command)) {
+        console.error(`[EXEC] Rejected dangerous command pattern: ${pattern}`);
+        return Promise.reject({
+          success: false,
+          error: 'Command contains dangerous pattern'
+        });
+      }
     }
     
     const processId = ++this.processCounter;
@@ -417,17 +497,6 @@ class Executor extends EventEmitter {
         startTime,
         expectedDuration,
         expectedEndTime,
-        executable
-      });
-
-      resolved = true;
-      resolve({
-        success: true,
-        processId,
-        pid: childProcess.pid,
-        message: 'Process started',
-        startTime,
-        expectedDuration,
         executable
       });
 
@@ -542,6 +611,8 @@ class Executor extends EventEmitter {
         }
       };
 
+      // Attach ALL listeners BEFORE resolving the promise so that a
+      // synchronous 'error' event is never missed.
       try {
         if (childProcess.stdout) {
           childProcess.stdout.on('data', stdoutHandler);
@@ -567,6 +638,18 @@ class Executor extends EventEmitter {
       } catch (error) {
         console.error(`[EXEC ${processId}] Failed to attach listeners:`, error.message);
       }
+
+      // Resolve only after listeners are safely in place
+      resolved = true;
+      resolve({
+        success: true,
+        processId,
+        pid: childProcess.pid,
+        message: 'Process started',
+        startTime,
+        expectedDuration,
+        executable
+      });
     });
   }
 
@@ -596,6 +679,7 @@ class Executor extends EventEmitter {
                   `[EXEC ${processId}] Sent SIGKILL to process ${processInfo.pid}`
                 );
               } catch (e) {
+                console.error(`[EXEC ${processId}] SIGKILL failed:`, e.message);
               }
             }
           }, 2000);

@@ -74,15 +74,17 @@ function createProxyUpdater(config) {
   }
   
   async function updateProxyFile() {
+    // FIX Bug #1: Check isRunning before entering try block
     if (isRunning) {
       console.log('[PROXY] Update already running, skip');
       return { success: false, error: 'Already running' };
     }
     
-    isRunning = true;
-    console.log('[PROXY] Updating proxy.txt...');
-    
+    // FIX Bug #1: Use try-finally to ensure cleanup
     try {
+      isRunning = true; // Set flag inside try block
+      console.log('[PROXY] Updating proxy.txt...');
+      
       const allProxies = [];
       
       for (const source of proxySources) {
@@ -109,7 +111,6 @@ function createProxyUpdater(config) {
       
       if (uniqueProxies.length === 0) {
         console.log('[PROXY] No proxies found');
-        isRunning = false;
         return { success: false, error: 'No proxies found' };
       }
       
@@ -118,7 +119,6 @@ function createProxyUpdater(config) {
       
       console.log(`[PROXY] Updated! ${uniqueProxies.length} proxies saved to ${proxyFile}`);
       
-      isRunning = false;
       return { 
         success: true, 
         count: uniqueProxies.length,
@@ -127,13 +127,16 @@ function createProxyUpdater(config) {
       
     } catch (error) {
       console.error('[PROXY] Update failed:', error);
-      isRunning = false;
       return { success: false, error: error.message };
+    } finally {
+      // FIX Bug #1: Ensure isRunning is always reset
+      isRunning = false;
     }
   }
   
   function startAutoUpdate(intervalMinutes = 10) {
-    if (updateInterval) clearInterval(updateInterval);
+    // FIX Bug #2: Always cleanup before creating new interval
+    stopAutoUpdate();
     
     const intervalMs = intervalMinutes * 60 * 1000;
     
@@ -166,7 +169,9 @@ function createProxyUpdater(config) {
         return content.split('\n').filter(line => line.trim() !== '').length;
       }
       return 0;
-    } catch {
+    } catch (error) {
+      // FIX Bug #3: Log error before returning
+      console.error('[PROXY] Error getting proxy count:', error.message);
       return 0;
     }
   }
@@ -181,7 +186,8 @@ function createProxyUpdater(config) {
         .map(line => line.trim());
       
       return limit > 0 ? proxies.slice(0, limit) : proxies;
-    } catch {
+    } catch (error) {
+      console.error('[PROXY] Error getting proxy list:', error.message);
       return [];
     }
   }

