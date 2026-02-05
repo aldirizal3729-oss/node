@@ -425,6 +425,13 @@ async function syncMethods() {
       if (p2pResult && p2pResult.success !== false) {
         console.log('[SYNC] ✓ Methods synced from P2P peers');
         p2pNode.stats.lastMethodSync = Date.now();
+        
+        // IMPROVED: Propagate immediately to all other peers
+        setImmediate(() => {
+          const propagated = p2pNode.propagateMethodsUpdateImmediate();
+          console.log(`[SYNC] ✓ Propagated to ${propagated} peer(s) immediately`);
+        });
+        
         return p2pResult;
       } else {
         console.log('[SYNC] P2P sync not available, falling back to master');
@@ -436,14 +443,22 @@ async function syncMethods() {
     const result = await syncMethodsWithMaster(config);
     
     if (result && result.success && !result.up_to_date) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Update local config
       refreshMethodsConfig();
       
-      // Propagate update to P2P peers
+      // IMPROVED: Propagate to P2P peers IMMEDIATELY
       if (p2pNode && p2pNode.peers.size > 0) {
-        console.log('[SYNC] Propagating methods update to P2P peers...');
+        console.log('[SYNC] Propagating methods update to P2P peers IMMEDIATELY...');
+        
+        // Update P2P node with new methods
         p2pNode.updateMethodsConfig(sharedData.methodsConfig);
-        p2pNode.propagateMethodsUpdate();
+        
+        // Propagate with zero delay
+        setImmediate(() => {
+          const propagated = p2pNode.propagateMethodsUpdateImmediate();
+          console.log(`[SYNC] ✓ Propagated to ${propagated} peer(s) with ZERO delay`);
+        });
+        
         p2pNode.stats.methodSyncsToMaster++;
       }
     }
@@ -453,6 +468,25 @@ async function syncMethods() {
     console.error('[SYNC] Error sync methods:', error.message);
     return null;
   }
+}
+
+async function forceImmediatePropagation() {
+  if (!p2pNode || p2pNode.peers.size === 0) {
+    console.log('[FORCE-PROPAGATE] No P2P peers to propagate to');
+    return 0;
+  }
+  
+  console.log('[FORCE-PROPAGATE] Forcing immediate propagation to all peers...');
+  
+  // Update P2P node methods first
+  p2pNode.updateMethodsConfig(sharedData.methodsConfig);
+  
+  // Propagate immediately
+  const propagated = p2pNode.propagateMethodsUpdateImmediate();
+  
+  console.log(`[FORCE-PROPAGATE] ✓ Propagated to ${propagated} peer(s) immediately`);
+  
+  return propagated;
 }
 
 // ======================
@@ -710,6 +744,33 @@ fastify.post('/p2p/sync-methods', async (request, reply) => {
     status: result.success !== false ? 'ok' : 'error',
     ...result
   });
+});
+
+fastify.post('/p2p/propagate-methods', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.status(503).send({
+      status: 'error',
+      error: 'P2P is not initialized'
+    });
+  }
+  
+  try {
+    const propagated = await forceImmediatePropagation();
+    
+    reply.send({
+      status: 'ok',
+      message: 'Methods propagated immediately',
+      peers_notified: propagated,
+      methods_count: Object.keys(sharedData.methodsConfig).length,
+      methods_version: sharedData.getMethodsVersionHash().substring(0, 8),
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    reply.status(500).send({
+      status: 'error',
+      error: error.message
+    });
+  }
 });
 
 // ======================
@@ -1303,25 +1364,40 @@ async function startServer() {
           
           // Listen for methods updates from peers
           p2pNode.on('methods_updated_from_peer', async (data) => {
-            console.log(`[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving...`);
-            
-            try {
-              // Save to local file
-              const methodsPath = config.SERVER.METHODS_PATH;
-              fs.writeFileSync(methodsPath, JSON.stringify(data.methods, null, 2));
-              console.log('[P2P-EVENT] ✓ Methods saved to local file');
-              
-              // Update shared config
-              refreshMethodsConfig();
-              
-              // Notify master about version update
-              if (heartbeatModule && heartbeatModule.updateMethodsVersion) {
-                await heartbeatModule.updateMethodsVersion();
-              }
-            } catch (error) {
-              console.error('[P2P-EVENT] Failed to save methods:', error.message);
-            }
-          });
+  console.log(`[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving and propagating IMMEDIATELY...`);
+  
+  try {
+    // Save to local file IMMEDIATELY
+    const methodsPath = config.SERVER.METHODS_PATH;
+    fs.writeFileSync(methodsPath, JSON.stringify(data.methods, null, 2));
+    console.log('[P2P-EVENT] ✓ Methods saved to local file');
+    
+    // Update shared config IMMEDIATELY
+    refreshMethodsConfig();
+    console.log('[P2P-EVENT] ✓ Shared config updated');
+    
+    // Notify master IMMEDIATELY (don't wait)
+    if (heartbeatModule && heartbeatModule.updateMethodsVersion) {
+      // Fire and forget - don't await
+      heartbeatModule.updateMethodsVersion().then(() => {
+        console.log('[P2P-EVENT] ✓ Master notified of version update');
+      }).catch(error => {
+        console.error('[P2P-EVENT] Failed to notify master:', error.message);
+      });
+    }
+    
+    // CRITICAL: Propagate to ALL connected P2P peers IMMEDIATELY
+    if (p2pNode && p2pNode.peers.size > 0) {
+      setImmediate(() => {
+        const propagated = p2pNode.propagateMethodsUpdateImmediate(data.nodeId, data.methodsVersion);
+        console.log(`[P2P-EVENT] ✓ Propagated to ${propagated} additional peer(s) with ZERO delay`);
+      });
+    }
+    
+  } catch (error) {
+    console.error('[P2P-EVENT] Failed to save/propagate methods:', error.message);
+  }
+});
           
         } else {
           console.log('[P2P] ✗ Failed to start P2P Hybrid Node');

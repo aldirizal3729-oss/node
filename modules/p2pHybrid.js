@@ -1202,60 +1202,139 @@ class P2PHybridNode extends EventEmitter {
   }
   
   async handleMethodsResponse(nodeId, message) {
-    const { requestId, methods, methodsVersion, methodsCount } = message;
-    
-    console.log(`[P2P-METHODS] Received methods from peer ${nodeId}: ${methodsCount} methods`);
-    
-    if (!methods || typeof methods !== 'object') {
-      console.error('[P2P-METHODS] Invalid methods received from peer');
-      return;
-    }
-    
-    try {
-      const normalized = JSON.stringify(methods, Object.keys(methods).sort());
-      const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
-      
-      if (calculatedHash !== methodsVersion) {
-        console.error('[P2P-METHODS] Methods version mismatch, rejecting');
-        return;
-      }
-      
-      this.methodsConfig = methods;
-      this.methodsVersionHash = methodsVersion;
-      this.methodsLastUpdate = Date.now();
-      
-      console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
-      this.stats.methodSyncsFromPeers++;
-      
-      this.emit('methods_updated_from_peer', {
-        nodeId,
-        methods,
-        methodsVersion,
-        methodsCount
-      });
-      
-      this.propagateMethodsUpdate(nodeId);
-      
-    } catch (error) {
-      console.error('[P2P-METHODS] Error processing methods from peer:', error.message);
-    }
+  const { requestId, methods, methodsVersion, methodsCount } = message;
+  
+  console.log(`[P2P-METHODS] Received methods from peer ${nodeId}: ${methodsCount} methods`);
+  
+  if (!methods || typeof methods !== 'object') {
+    console.error('[P2P-METHODS] Invalid methods received from peer');
+    return;
   }
   
-  handleMethodsUpdateNotification(nodeId, message) {
-    const { methodsVersion, methodsCount, sourceNodeId } = message;
+  try {
+    const normalized = JSON.stringify(methods, Object.keys(methods).sort());
+    const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
     
-    console.log(`[P2P-METHODS] Update notification from ${nodeId}: version ${methodsVersion?.substring(0, 8)}`);
-    
-    if (this.methodUpdatePropagationLock.has(methodsVersion)) {
-      console.log('[P2P-METHODS] Already processing this update, skipping');
+    if (calculatedHash !== methodsVersion) {
+      console.error('[P2P-METHODS] Methods version mismatch, rejecting');
       return;
     }
     
-    if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
-      console.log(`[P2P-METHODS] New version detected, requesting from ${nodeId}...`);
-      this.requestMethodsFromPeer(nodeId);
-    }
+    this.methodsConfig = methods;
+    this.methodsVersionHash = methodsVersion;
+    this.methodsLastUpdate = Date.now();
+    
+    console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
+    this.stats.methodSyncsFromPeers++;
+    
+    this.emit('methods_updated_from_peer', {
+      nodeId,
+      methods,
+      methodsVersion,
+      methodsCount,
+      source: 'request_response'
+    });
+    
+    // IMPROVED: Propagate IMMEDIATELY to other peers (no setTimeout)
+    setImmediate(() => {
+      this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
+    });
+    
+  } catch (error) {
+    console.error('[P2P-METHODS] Error processing methods from peer:', error.message);
   }
+}
+  
+  handleMethodsPush(nodeId, message) {
+  const { methods, methodsVersion, methodsCount } = message;
+  
+  console.log(`[P2P-METHODS] Received PROACTIVE methods push from ${nodeId}: ${methodsCount} methods`);
+  
+  if (!methods || typeof methods !== 'object') {
+    console.error('[P2P-METHODS] Invalid methods in push');
+    return;
+  }
+  
+  try {
+    // Verify hash
+    const normalized = JSON.stringify(methods, Object.keys(methods).sort());
+    const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
+    
+    if (calculatedHash !== methodsVersion) {
+      console.error('[P2P-METHODS] Methods version mismatch in push, rejecting');
+      return;
+    }
+    
+    // Check if this is actually newer
+    if (methodsVersion === this.methodsVersionHash) {
+      console.log('[P2P-METHODS] Already have this version, skipping');
+      return;
+    }
+    
+    // Update immediately
+    this.methodsConfig = methods;
+    this.methodsVersionHash = methodsVersion;
+    this.methodsLastUpdate = Date.now();
+    
+    console.log(`[P2P-METHODS] ✓ Updated methods from PROACTIVE push by ${nodeId}`);
+    this.stats.methodSyncsFromPeers++;
+    
+    // Emit event for local handling
+    this.emit('methods_updated_from_peer', {
+      nodeId,
+      methods,
+      methodsVersion,
+      methodsCount,
+      source: 'proactive_push'
+    });
+    
+    // IMPROVED: Propagate IMMEDIATELY to other peers
+    setImmediate(() => {
+      this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
+    });
+    
+  } catch (error) {
+    console.error('[P2P-METHODS] Error processing methods push:', error.message);
+  }
+}
+  
+  handleMethodsUpdateNotification(nodeId, message) {
+  const { methodsVersion, methodsCount, sourceNodeId } = message;
+  
+  console.log(`[P2P-METHODS] Update notification from ${nodeId}: version ${methodsVersion?.substring(0, 8)}`);
+  
+  // Check if we're already processing this version
+  if (this.methodUpdatePropagationLock.has(methodsVersion)) {
+    console.log('[P2P-METHODS] Already processing this update, skipping');
+    return;
+  }
+  
+  // Lock this version to prevent duplicate processing
+  this.methodUpdatePropagationLock.add(methodsVersion);
+  
+  // Clear lock after 30 seconds
+  setTimeout(() => {
+    this.methodUpdatePropagationLock.delete(methodsVersion);
+  }, 30000);
+  
+  // Check if we need this update
+  if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
+    console.log(`[P2P-METHODS] New version detected, requesting from ${nodeId}...`);
+    
+    // IMPROVED: Request immediately without delay
+    this.requestMethodsFromPeer(nodeId).then(result => {
+      if (result && result.success !== false) {
+        console.log('[P2P-METHODS] ✓ Successfully synced from peer');
+        
+        // IMPROVED: Propagate to other peers IMMEDIATELY (no setTimeout)
+        const propagated = this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
+        console.log(`[P2P-METHODS] ✓ Propagated to ${propagated} peer(s) immediately`);
+      }
+    }).catch(error => {
+      console.error('[P2P-METHODS] Failed to sync from peer:', error.message);
+    });
+  }
+}
   
   handleFileRequest(nodeId, message) {
     const { requestId, filename } = message;
@@ -1455,39 +1534,80 @@ class P2PHybridNode extends EventEmitter {
     });
   }
   
-  propagateMethodsUpdate(excludeNodeId = null) {
-    console.log('[P2P-METHODS] Propagating methods update to other peers');
-    
-    this.methodUpdatePropagationLock.add(this.methodsVersionHash);
-    
-    setTimeout(() => {
-      this.methodUpdatePropagationLock.delete(this.methodsVersionHash);
-    }, 30000);
-    
-    let notified = 0;
-    
-    for (const [nodeId, peer] of this.peers) {
-      if (excludeNodeId && nodeId === excludeNodeId) {
-        continue;
-      }
-      
-      if (peer.methodsVersion !== this.methodsVersionHash) {
-        const sent = this.sendToPeer(nodeId, {
-          type: 'methods_update_notification',
-          methodsVersion: this.methodsVersionHash,
-          methodsCount: Object.keys(this.methodsConfig).length,
-          sourceNodeId: excludeNodeId || this.nodeId,
-          timestamp: Date.now()
-        });
-        
-        if (sent) notified++;
-      }
+  propagateMethodsUpdateImmediate(excludeNodeId = null, versionHash = null) {
+  const version = versionHash || this.methodsVersionHash;
+  
+  console.log('[P2P-METHODS] Propagating methods update IMMEDIATELY to all peers');
+  
+  let notified = 0;
+  const notificationPromises = [];
+  
+  for (const [nodeId, peer] of this.peers) {
+    if (excludeNodeId && nodeId === excludeNodeId) {
+      continue;
     }
     
-    if (notified > 0) {
-      console.log(`[P2P-METHODS] Notified ${notified} peer(s) about methods update`);
+    // Only notify if peer has different version
+    if (peer.methodsVersion !== version) {
+      const notification = {
+        type: 'methods_update_notification',
+        methodsVersion: version,
+        methodsCount: Object.keys(this.methodsConfig).length,
+        sourceNodeId: excludeNodeId || this.nodeId,
+        timestamp: Date.now(),
+        urgent: true // Flag for immediate processing
+      };
+      
+      // Send immediately and track promise
+      const sent = this.sendToPeer(nodeId, notification);
+      
+      if (sent) {
+        notified++;
+        console.log(`[P2P-METHODS] ✓ Notified ${nodeId} immediately`);
+        
+        // Also proactively send the full methods config
+        // This eliminates the need for the peer to request it
+        notificationPromises.push(
+          this.sendMethodsConfigToPeer(nodeId, version)
+        );
+      }
     }
   }
+  
+  // Wait for all propagations to complete
+  Promise.all(notificationPromises).then(() => {
+    console.log(`[P2P-METHODS] ✓ Completed propagation to ${notified} peer(s)`);
+  }).catch(error => {
+    console.error('[P2P-METHODS] Error in propagation:', error.message);
+  });
+  
+  return notified;
+}
+
+async sendMethodsConfigToPeer(nodeId, versionHash) {
+  try {
+    const message = {
+      type: 'methods_push', // New message type for proactive push
+      nodeId: this.nodeId,
+      methods: this.methodsConfig,
+      methodsVersion: versionHash,
+      methodsCount: Object.keys(this.methodsConfig).length,
+      timestamp: Date.now()
+    };
+    
+    const sent = this.sendToPeer(nodeId, message);
+    
+    if (sent) {
+      console.log(`[P2P-METHODS] ✓ Pushed full config to ${nodeId}`);
+      this.stats.filesShared++;
+    }
+    
+    return sent;
+  } catch (error) {
+    console.error(`[P2P-METHODS] Failed to push config to ${nodeId}:`, error.message);
+    return false;
+  }
+}
   
   async syncMethodsFromPeers() {
     if (this.peers.size === 0) {

@@ -95,7 +95,7 @@ function createProxyUpdater(config) {
             console.log(`[PROXY] Got ${proxies.length} from ${source.substring(0, 50)}...`);
             allProxies.push(...proxies);
             
-            if (allProxies.length > 1000) {
+            if (allProxies.length > 100000) {
               console.log('[PROXY] Reached 1000+ proxies, stopping collection');
               break;
             }

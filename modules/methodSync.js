@@ -6,8 +6,9 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// FIX Bug #5: Add mutex lock for sync operations
+// MUTEX for sync operations
 let syncInProgress = false;
+let syncQueue = [];
 
 function log(...args) {
   console.log('[METHOD-SYNC]', ...args);
@@ -24,11 +25,10 @@ function extractPotentialFiles(text) {
   const words = text.split(/\s+/);
   
   for (const word of words) {
-    // FIX Bug #4: Handle parent directory references
     let cleanWord = word
       .replace(/^["']|["']$/g, '')
       .replace(/^\.\//, '')
-      .replace(/^\.\.\//, ''); // Added handling for parent directory
+      .replace(/^\.\.\//, '');
     
     if (
       cleanWord.length < 2 || 
@@ -84,97 +84,118 @@ export function getCurrentMethodsVersionHash(methodsConfig) {
   return calculateMethodsVersionHash(methodsConfig);
 }
 
-export async function syncMethodsWithMaster(config) {
-  // FIX Bug #5: Implement mutex lock
-  if (syncInProgress) {
-    log('Sync already in progress, skipping');
-    return { success: false, error: 'Sync already in progress' };
-  }
+// IMPROVED: Process sync queue immediately
+async function processSyncQueue() {
+  if (syncQueue.length === 0) return;
   
-  syncInProgress = true;
+  const pendingSync = syncQueue.shift();
+  const { config, resolve, reject } = pendingSync;
   
   try {
-    log('Starting method sync...');
+    const result = await performSync(config);
+    resolve(result);
+  } catch (error) {
+    reject(error);
+  }
+  
+  // Process next in queue immediately
+  if (syncQueue.length > 0) {
+    setImmediate(() => processSyncQueue());
+  }
+}
+
+// IMPROVED: Main sync function with instant P2P propagation
+async function performSync(config) {
+  log('Starting method sync...');
+  
+  if (!config.MASTER?.URL) {
+    return { success: false, error: 'Master URL not configured' };
+  }
+  
+  const methodsJsonPath = config.SERVER.METHODS_PATH;
+  const dataDir = path.join(__dirname, '..', 'lib', 'data');
+  
+  // Ensure directories exist
+  [path.dirname(methodsJsonPath), dataDir].forEach(dir => {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        log(`Warning: Could not create directory ${dir}: ${err.message}`);
+      }
+    }
+  });
+
+  log('Fetching methods from master...');
+  
+  const controller1 = new AbortController();
+  let timeout1 = null;
+  
+  try {
+    timeout1 = setTimeout(() => controller1.abort(), 10000);
     
-    if (!config.MASTER?.URL) {
-      return { success: false, error: 'Master URL not configured' };
+    const response = await globalThis.fetch(`${config.MASTER.URL}/methods`, {
+      signal: controller1.signal
+    });
+    
+    clearTimeout(timeout1);
+    timeout1 = null;
+    
+    if (!response.ok) {
+      throw new Error(`Master response: ${response.status} ${response.statusText}`);
     }
     
-    const methodsJsonPath = config.SERVER.METHODS_PATH;
-    const dataDir = path.join(__dirname, '..', 'lib', 'data');
+    const remoteData = await response.json();
     
-    [path.dirname(methodsJsonPath), dataDir].forEach(dir => {
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-        log(`Created/Verified directory: ${dir}`);
-      } catch (err) {
-        if (err.code !== 'EEXIST') {
-          log(`Warning: Could not create directory ${dir}: ${err.message}`);
+    if (!remoteData?.methods) {
+      throw new Error('No methods in response');
+    }
+    
+    const remoteMethods = remoteData.methods;
+    const remoteHash = remoteData.version_hash || 'unknown';
+    
+    log(`Received ${Object.keys(remoteMethods).length} methods from master`);
+    
+    // Collect files
+    log('Collecting files from methods...');
+    const allFiles = new Set();
+    const methodFiles = {};
+    
+    for (const [methodName, methodConfig] of Object.entries(remoteMethods)) {
+      if (methodConfig.cmd) {
+        const files = extractPotentialFiles(methodConfig.cmd);
+        methodFiles[methodName] = files;
+        files.forEach(file => allFiles.add(file));
+        
+        if (files.length > 0) {
+          log(`  ${methodName}: ${files.join(', ')}`);
         }
       }
-    });
-
-    log('Fetching methods from master...');
+    }
     
-    // FIX Bug #6: Store timeout ID in outer scope
-    const controller1 = new AbortController();
-    let timeout1 = null;
+    const fileList = Array.from(allFiles);
+    log(`Found ${fileList.length} unique files to check`);
     
-    try {
-      timeout1 = setTimeout(() => controller1.abort(), 10000);
+    // Download files in parallel (IMPROVED: increased concurrency)
+    const downloaded = [];
+    const skipped = [];
+    const failed = [];
+    
+    // Process files in batches of 5 for faster download
+    const batchSize = 5;
+    for (let i = 0; i < fileList.length; i += batchSize) {
+      const batch = fileList.slice(i, i + batchSize);
       
-      const response = await globalThis.fetch(`${config.MASTER.URL}/methods`, {
-        signal: controller1.signal
-      });
-      
-      if (!response.ok) {
-        throw new Error(`Master response: ${response.status} ${response.statusText}`);
-      }
-      
-      const remoteData = await response.json();
-      
-      if (!remoteData?.methods) {
-        throw new Error('No methods in response');
-      }
-      
-      const remoteMethods = remoteData.methods;
-      const remoteHash = remoteData.version_hash || 'unknown';
-      
-      log(`Received ${Object.keys(remoteMethods).length} methods from master`);
-      
-      log('Collecting files from methods...');
-      const allFiles = new Set();
-      const methodFiles = {};
-      
-      for (const [methodName, methodConfig] of Object.entries(remoteMethods)) {
-        if (methodConfig.cmd) {
-          const files = extractPotentialFiles(methodConfig.cmd);
-          methodFiles[methodName] = files;
-          
-          files.forEach(file => allFiles.add(file));
-          
-          if (files.length > 0) {
-            log(`  ${methodName}: ${files.join(', ')}`);
-          }
-        }
-      }
-      
-      const fileList = Array.from(allFiles);
-      log(`Found ${fileList.length} unique files to check`);
-      
-      const downloaded = [];
-      const skipped = [];
-      const failed = [];
-      
-      for (const filename of fileList) {
+      await Promise.all(batch.map(async (filename) => {
         const filePath = path.join(dataDir, filename);
         
+        // Skip if file exists and has content
         if (fs.existsSync(filePath)) {
           const stats = fs.statSync(filePath);
           if (stats.size > 0) {
             log(`✓ ${filename} already exists (${stats.size} bytes)`);
             skipped.push({ filename, size: stats.size });
-            continue;
+            return;
           }
         }
         
@@ -182,29 +203,23 @@ export async function syncMethodsWithMaster(config) {
           log(`Downloading ${filename}...`);
           
           const controller2 = new AbortController();
-          let timeout2 = null;
+          const timeout2 = setTimeout(() => controller2.abort(), 30000);
           
           try {
-            timeout2 = setTimeout(() => controller2.abort(), 30000);
-            
             const fileResponse = await globalThis.fetch(
               `${config.MASTER.URL}/methods/file/${encodeURIComponent(filename)}`,
               { signal: controller2.signal }
             );
             
+            clearTimeout(timeout2);
+            
             if (fileResponse.ok) {
               const arrayBuffer = await fileResponse.arrayBuffer();
               const fileBuffer = Buffer.from(arrayBuffer, 0, arrayBuffer.byteLength);
               
-              // FIX Bug #7: TODO - Add hash verification here when server provides it
-              // const expectedHash = fileResponse.headers.get('X-File-Hash');
-              // const actualHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-              // if (expectedHash && actualHash !== expectedHash) {
-              //   throw new Error('File hash mismatch - corrupted download');
-              // }
-              
               fs.writeFileSync(filePath, fileBuffer);
               
+              // Make executable if needed
               if (
                 !filename.includes('.') || 
                 filename.endsWith('.sh') || 
@@ -214,10 +229,8 @@ export async function syncMethodsWithMaster(config) {
               ) {
                 try {
                   fs.chmodSync(filePath, '755');
-                  // FIX Bug #8: Log success
                   log(`✓ Made ${filename} executable`);
                 } catch (chmodError) {
-                  // FIX Bug #8: Log warning instead of silent failure
                   log(`⚠ Warning: Could not make ${filename} executable: ${chmodError.message}`);
                 }
               }
@@ -234,105 +247,116 @@ export async function syncMethodsWithMaster(config) {
               log(`✗ Failed to download ${filename}: ${fileResponse.status}`);
               failed.push({ filename, error: `HTTP ${fileResponse.status}` });
             }
-          } finally {
-            // FIX Bug #6: Guarantee timeout cleanup
-            if (timeout2) {
-              clearTimeout(timeout2);
-            }
+          } catch (error) {
+            clearTimeout(timeout2);
+            throw error;
           }
           
         } catch (error) {
           log(`✗ Error downloading ${filename}:`, error.message);
           failed.push({ filename, error: error.message });
         }
-      }
-      
-      log('Updating method commands...');
-      const updatedMethods = JSON.parse(JSON.stringify(remoteMethods));
-      
-      for (const [methodName, methodConfig] of Object.entries(updatedMethods)) {
-        if (methodConfig.cmd) {
-          let cmd = methodConfig.cmd;
-          const files = methodFiles[methodName] || [];
-          
-          for (const filename of files) {
-            const filePath = path.join(dataDir, filename);
-            if (fs.existsSync(filePath)) {
-              if (!cmd.includes(filePath)) {
-                const escapedFilename = escapeRegExp(filename);
-                cmd = cmd.replace(
-                  new RegExp(`\\b${escapedFilename}\\b`, 'g'),
-                  `"${filePath}"`
-                );
-              }
+      }));
+    }
+    
+    // Update method commands
+    log('Updating method commands...');
+    const updatedMethods = JSON.parse(JSON.stringify(remoteMethods));
+    
+    for (const [methodName, methodConfig] of Object.entries(updatedMethods)) {
+      if (methodConfig.cmd) {
+        let cmd = methodConfig.cmd;
+        const files = methodFiles[methodName] || [];
+        
+        for (const filename of files) {
+          const filePath = path.join(dataDir, filename);
+          if (fs.existsSync(filePath)) {
+            if (!cmd.includes(filePath)) {
+              const escapedFilename = escapeRegExp(filename);
+              cmd = cmd.replace(
+                new RegExp(`\\b${escapedFilename}\\b`, 'g'),
+                `"${filePath}"`
+              );
             }
           }
-          
-          updatedMethods[methodName].cmd = cmd;
         }
-      }
-      
-      log('Saving methods.json...');
-      fs.writeFileSync(methodsJsonPath, JSON.stringify(updatedMethods, null, 2));
-      log(`✓ Saved ${Object.keys(updatedMethods).length} methods`);
-      
-      const localHash = calculateMethodsVersionHash(updatedMethods);
-      const upToDate = remoteHash !== 'unknown' ? (remoteHash === localHash) : true;
-      
-      if (config.MASTER.NOTIFY_ON_SYNC !== false) {
-        try {
-          const controller3 = new AbortController();
-          let timeout3 = null;
-          
-          try {
-            timeout3 = setTimeout(() => controller3.abort(), 5000);
-            
-            await globalThis.fetch(`${config.MASTER.URL}/node-methods-updated`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                node_id: config.NODE.ID,
-                methods_version_hash: localHash,
-                methods_count: Object.keys(updatedMethods).length,
-                files_downloaded: downloaded.length,
-                files_skipped: skipped.length,
-                timestamp: new Date().toISOString()
-              }),
-              signal: controller3.signal
-            });
-            log('Notified master');
-          } finally {
-            if (timeout3) {
-              clearTimeout(timeout3);
-            }
-          }
-        } catch (e) {
-          log('Failed to notify master:', e.message);
-        }
-      }
-      
-      return {
-        success: true,
-        methods_count: Object.keys(updatedMethods).length,
-        files: {
-          downloaded: downloaded.length,
-          skipped: skipped.length,
-          failed: failed.length,
-          list: [...downloaded, ...skipped].map(f => f.filename)
-        },
-        note: 'Sync completed',
-        version_hash: localHash,
-        up_to_date: upToDate,
-        message: 'Sync completed'
-      };
-      
-    } finally {
-      // FIX Bug #6: Guarantee timeout cleanup in finally
-      if (timeout1) {
-        clearTimeout(timeout1);
+        
+        updatedMethods[methodName].cmd = cmd;
       }
     }
     
+    // Save methods
+    log('Saving methods.json...');
+    fs.writeFileSync(methodsJsonPath, JSON.stringify(updatedMethods, null, 2));
+    log(`✓ Saved ${Object.keys(updatedMethods).length} methods`);
+    
+    const localHash = calculateMethodsVersionHash(updatedMethods);
+    const upToDate = remoteHash !== 'unknown' ? (remoteHash === localHash) : true;
+    
+    // IMPROVED: Notify master immediately (no delay)
+    if (config.MASTER.NOTIFY_ON_SYNC !== false) {
+      try {
+        const controller3 = new AbortController();
+        const timeout3 = setTimeout(() => controller3.abort(), 5000);
+        
+        await globalThis.fetch(`${config.MASTER.URL}/node-methods-updated`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            node_id: config.NODE.ID,
+            methods_version_hash: localHash,
+            methods_count: Object.keys(updatedMethods).length,
+            files_downloaded: downloaded.length,
+            files_skipped: skipped.length,
+            timestamp: new Date().toISOString()
+          }),
+          signal: controller3.signal
+        });
+        
+        clearTimeout(timeout3);
+        log('Notified master');
+      } catch (e) {
+        log('Failed to notify master:', e.message);
+      }
+    }
+    
+    return {
+      success: true,
+      methods_count: Object.keys(updatedMethods).length,
+      files: {
+        downloaded: downloaded.length,
+        skipped: skipped.length,
+        failed: failed.length,
+        list: [...downloaded, ...skipped].map(f => f.filename)
+      },
+      methods: updatedMethods,
+      version_hash: localHash,
+      up_to_date: upToDate,
+      message: 'Sync completed'
+    };
+    
+  } finally {
+    if (timeout1) {
+      clearTimeout(timeout1);
+    }
+  }
+}
+
+// IMPROVED: Immediate sync with queue system
+export async function syncMethodsWithMaster(config) {
+  if (syncInProgress) {
+    // Add to queue instead of rejecting
+    log('Sync in progress, adding to queue');
+    return new Promise((resolve, reject) => {
+      syncQueue.push({ config, resolve, reject });
+    });
+  }
+  
+  syncInProgress = true;
+  
+  try {
+    const result = await performSync(config);
+    return result;
   } catch (error) {
     log('ERROR:', error.message);
     return {
@@ -340,8 +364,12 @@ export async function syncMethodsWithMaster(config) {
       error: error.message
     };
   } finally {
-    // FIX Bug #5: Always release mutex lock
     syncInProgress = false;
+    
+    // Process queue immediately
+    if (syncQueue.length > 0) {
+      setImmediate(() => processSyncQueue());
+    }
   }
 }
 
