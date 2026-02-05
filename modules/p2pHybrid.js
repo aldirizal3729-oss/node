@@ -27,6 +27,9 @@ class P2PHybridNode extends EventEmitter {
     this.knownPeers = new Map();
     this.peerBlacklist = new Map();
     
+    // NEW: Track referrals received
+    this.receivedReferrals = new Map();
+    
     this.messageQueue = new Map();
     
     this.methodsVersionHash = null;
@@ -55,7 +58,11 @@ class P2PHybridNode extends EventEmitter {
       filesReceived: 0,
       lastDiscovery: null,
       lastAutoConnect: null,
-      lastMethodSync: null
+      lastMethodSync: null,
+      // NEW: Referral stats
+      referralsSent: 0,
+      referralsReceived: 0,
+      connectionsViaReferral: 0
     };
     
     this.p2pConfig = {
@@ -74,7 +81,10 @@ class P2PHybridNode extends EventEmitter {
       autoConnectDelay: 10000,
       cleanupInterval: 60000,
       methodSyncInterval: 120000,
-      preferP2PSync: true
+      preferP2PSync: true,
+      // NEW: Referral config
+      maxReferralsToSend: 5,
+      referralExpiryMs: 300000
     };
     
     this.encryptionManager = null;
@@ -92,10 +102,11 @@ class P2PHybridNode extends EventEmitter {
     this.masterReachable = false;
     this.lastMasterCheck = null;
     
-    console.log('[P2P] P2P Hybrid Node initialized (FIXED VERSION)', {
+    console.log('[P2P] P2P Hybrid Node initialized (REFERRAL-ENABLED v3.1)', {
       nodeId: this.nodeId,
       enabled: this.p2pConfig.enabled,
       maxPeers: this.p2pConfig.maxPeers,
+      maxReferrals: this.p2pConfig.maxReferralsToSend,
       preferP2PSync: this.p2pConfig.preferP2PSync
     });
   }
@@ -129,6 +140,58 @@ class P2PHybridNode extends EventEmitter {
     } catch (error) {
       console.error('[P2P-METHODS] Failed to update version hash:', error.message);
     }
+  }
+  
+  // NEW METHOD: Get peer referrals to send to rejected connections
+  getPeerReferrals(excludeNodeId = null) {
+    const referrals = [];
+    
+    for (const [nodeId, peer] of this.knownPeers) {
+      if (nodeId === this.nodeId) continue;
+      if (excludeNodeId && nodeId === excludeNodeId) continue;
+      if (this.isBlacklisted(nodeId)) continue;
+      
+      if (!this.peers.has(nodeId) || peer.reachable) {
+        referrals.push({
+          nodeId: peer.nodeId,
+          ip: peer.ip,
+          port: peer.port,
+          mode: peer.mode,
+          lastSeen: peer.lastUpdate,
+          methodsCount: peer.methodsCount || 0
+        });
+      }
+      
+      if (referrals.length >= this.p2pConfig.maxReferralsToSend) {
+        break;
+      }
+    }
+    
+    if (referrals.length < 3) {
+      for (const [nodeId, peer] of this.peers) {
+        if (nodeId === this.nodeId) continue;
+        if (excludeNodeId && nodeId === excludeNodeId) continue;
+        
+        if (!referrals.find(r => r.nodeId === nodeId)) {
+          referrals.push({
+            nodeId: peer.nodeId,
+            ip: peer.ip,
+            port: peer.port,
+            mode: peer.mode,
+            lastSeen: peer.lastSeen,
+            methodsCount: peer.methodsCount || 0,
+            note: 'connected_peer'
+          });
+          
+          if (referrals.length >= this.p2pConfig.maxReferralsToSend) {
+            break;
+          }
+        }
+      }
+    }
+    
+    console.log(`[P2P-REFERRAL] Prepared ${referrals.length} peer referrals`);
+    return referrals;
   }
   
   async startP2PServer(fastifyServer) {
@@ -231,10 +294,12 @@ class P2PHybridNode extends EventEmitter {
     const remoteIp = request.headers['x-forwarded-for'] || 
                      request.socket.remoteAddress?.replace('::ffff:', '');
     const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
+    const remotePort = request.headers['x-node-port'] ? parseInt(request.headers['x-node-port'], 10) : null;
     
     console.log('[P2P-SERVER] New peer connection attempt:', {
       remoteNodeId,
       remoteIp,
+      remotePort,
       remoteMode
     });
     
@@ -256,9 +321,55 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
+    // CHANGED: Add to known peers even if we can't connect
+    if (remoteIp && remotePort) {
+      this.knownPeers.set(remoteNodeId, {
+        nodeId: remoteNodeId,
+        ip: remoteIp,
+        port: remotePort,
+        mode: remoteMode,
+        reachable: true,
+        capabilities: null,
+        methodsVersion: null,
+        methodsCount: 0,
+        lastUpdate: Date.now()
+      });
+      console.log(`[P2P-SERVER] Added ${remoteNodeId} to known peers (${this.knownPeers.size} total)`);
+    }
+    
+    // CHANGED: Send referrals when max peers reached
     if (this.peers.size >= this.p2pConfig.maxPeers) {
-      console.log('[P2P-SERVER] Rejected: Max peers reached');
-      ws.close(4003, 'Max peers reached');
+      console.log('[P2P-SERVER] Rejected: Max peers reached, sending referrals');
+      
+      const referrals = this.getPeerReferrals(remoteNodeId);
+      
+      this.stats.referralsSent++;
+      
+      try {
+        ws.send(JSON.stringify({
+          type: 'connection_rejected',
+          reason: 'max_peers_reached',
+          maxPeers: this.p2pConfig.maxPeers,
+          currentPeers: this.peers.size,
+          referrals: referrals,
+          referralCount: referrals.length,
+          nodeInfo: {
+            nodeId: this.nodeId,
+            ip: this.nodeIp,
+            port: this.nodePort
+          },
+          message: `This node is full (${this.peers.size}/${this.p2pConfig.maxPeers}). Try connecting to ${referrals.length} suggested peer(s).`
+        }));
+        
+        console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId}`);
+      } catch (error) {
+        console.error('[P2P-SERVER] Failed to send referrals:', error.message);
+      }
+      
+      setTimeout(() => {
+        ws.close(4003, 'Max peers reached - check referrals');
+      }, 500);
+      
       return;
     }
     
@@ -275,7 +386,7 @@ class P2PHybridNode extends EventEmitter {
       ws,
       nodeId: remoteNodeId,
       ip: remoteIp,
-      port: null,
+      port: remotePort,
       mode: remoteMode,
       connected: true,
       direct: true,
@@ -308,7 +419,8 @@ class P2PHybridNode extends EventEmitter {
         methodsCount: Object.keys(this.methodsConfig).length,
         relay: this.p2pConfig.relayFallback && this.masterReachable,
         fileSharing: true,
-        version: '3.0'
+        referrals: true,
+        version: '3.1'
       }
     });
     
@@ -334,13 +446,14 @@ class P2PHybridNode extends EventEmitter {
     this.emit('peer_connected', {
       nodeId: remoteNodeId,
       ip: remoteIp,
+      port: remotePort,
       mode: remoteMode,
       direct: true
     });
     
     this.processQueuedMessages(remoteNodeId);
     
-    console.log(`[P2P] Peer ${remoteNodeId} (${remoteMode}) connected successfully`);
+    console.log(`[P2P] Peer ${remoteNodeId} (${remoteMode}) connected successfully (${this.peers.size}/${this.p2pConfig.maxPeers})`);
   }
   
   handlePeerDisconnected(nodeId, code, reason) {
@@ -379,6 +492,113 @@ class P2PHybridNode extends EventEmitter {
       return parseInt(port, 10);
     }
     return port;
+  }
+  
+  // NEW METHOD: Handle connection rejection with referrals
+  handleConnectionRejected(nodeId, message) {
+    const { reason, maxPeers, currentPeers, referrals, referralCount } = message;
+    
+    console.log(`[P2P-REFERRAL] Connection to ${nodeId} rejected: ${reason}`);
+    console.log(`[P2P-REFERRAL] Node is full: ${currentPeers}/${maxPeers}`);
+    console.log(`[P2P-REFERRAL] Received ${referralCount} peer referral(s)`);
+    
+    if (!referrals || referrals.length === 0) {
+      console.log('[P2P-REFERRAL] No referrals provided');
+      return;
+    }
+    
+    this.stats.referralsReceived++;
+    
+    this.receivedReferrals.set(nodeId, {
+      referrals: referrals,
+      timestamp: Date.now(),
+      fromNode: message.nodeInfo
+    });
+    
+    for (const referral of referrals) {
+      if (referral.nodeId === this.nodeId) continue;
+      
+      const existing = this.knownPeers.get(referral.nodeId);
+      if (!existing || existing.lastUpdate < Date.now() - 60000) {
+        this.knownPeers.set(referral.nodeId, {
+          nodeId: referral.nodeId,
+          ip: referral.ip,
+          port: referral.port,
+          mode: referral.mode || 'DIRECT',
+          reachable: true,
+          capabilities: null,
+          methodsVersion: null,
+          methodsCount: referral.methodsCount || 0,
+          lastUpdate: Date.now(),
+          fromReferral: true,
+          referredBy: nodeId
+        });
+        
+        console.log(`[P2P-REFERRAL] Added peer ${referral.nodeId} (${referral.ip}:${referral.port}) to known peers`);
+      }
+    }
+    
+    if (this.p2pConfig.autoConnect && this.peers.size < this.p2pConfig.maxPeers) {
+      console.log('[P2P-REFERRAL] Attempting to connect to referral peers...');
+      
+      setTimeout(() => {
+        this.connectToReferralPeers(referrals);
+      }, 2000);
+    }
+  }
+  
+  // NEW METHOD: Connect to peers from referrals
+  async connectToReferralPeers(referrals) {
+    if (!referrals || referrals.length === 0) {
+      return;
+    }
+    
+    const availableSlots = this.p2pConfig.maxPeers - this.peers.size - this.connectionLocks.size;
+    if (availableSlots <= 0) {
+      console.log('[P2P-REFERRAL] No available slots for referral connections');
+      return;
+    }
+    
+    console.log(`[P2P-REFERRAL] Connecting to up to ${Math.min(availableSlots, referrals.length)} referral peer(s)`);
+    
+    let connected = 0;
+    
+    for (const referral of referrals) {
+      if (connected >= availableSlots) {
+        break;
+      }
+      
+      if (this.peers.has(referral.nodeId) || referral.nodeId === this.nodeId) {
+        continue;
+      }
+      
+      if (this.connectionLocks.has(referral.nodeId)) {
+        continue;
+      }
+      
+      try {
+        const result = await this.connectToPeer(referral.nodeId, {
+          ip: referral.ip,
+          port: referral.port,
+          mode: referral.mode || 'DIRECT'
+        });
+        
+        if (result.success) {
+          connected++;
+          this.stats.connectionsViaReferral++;
+          console.log(`[P2P-REFERRAL] ✓ Connected to referral peer ${referral.nodeId}`);
+        } else {
+          console.log(`[P2P-REFERRAL] ✗ Failed to connect to ${referral.nodeId}: ${result.error}`);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+      } catch (error) {
+        console.error(`[P2P-REFERRAL] Error connecting to ${referral.nodeId}:`, error.message);
+      }
+    }
+    
+    console.log(`[P2P-REFERRAL] Connected to ${connected} referral peer(s)`);
   }
   
   async connectToPeer(nodeId, peerInfo, retryAttempt = 0) {
@@ -607,6 +827,10 @@ class P2PHybridNode extends EventEmitter {
       console.log(`[P2P] Message from ${nodeId}: ${message.type}`);
       
       switch (message.type) {
+        case 'connection_rejected':
+          this.handleConnectionRejected(nodeId, message);
+          break;
+          
         case 'welcome':
           this.handleWelcomeMessage(nodeId, message);
           break;
@@ -1383,7 +1607,6 @@ class P2PHybridNode extends EventEmitter {
     
     const peer = this.peers.get(nodeId);
     if (!peer || !peer.ws || peer.ws.readyState !== WebSocket.OPEN) {
-      // Peer not actually ready — leave queue intact for next connection attempt
       console.log(`[P2P] Peer ${nodeId} not ready, keeping ${queue.length} queued message(s)`);
       return;
     }
@@ -1405,7 +1628,6 @@ class P2PHybridNode extends EventEmitter {
       }
     }
     
-    // Queue fully drained — remove it
     this.messageQueue.delete(nodeId);
     
     console.log(`[P2P] Processed queue for ${nodeId}: ${sent} sent, ${failed} failed`);
@@ -1438,14 +1660,12 @@ class P2PHybridNode extends EventEmitter {
       };
     }
 
-    // Tentukan list target peers
     let peersToUse = [];
     if (Array.isArray(targetPeerIds) && targetPeerIds.length > 0) {
       peersToUse = targetPeerIds
         .filter(id => this.peers.has(id))
         .map(id => ({ nodeId: id, peer: this.peers.get(id) }));
     } else {
-      // Default: semua peer DIRECT / REVERSE yang terkoneksi
       peersToUse = Array.from(this.peers.entries())
         .filter(([_, peer]) => peer.mode === 'DIRECT' || peer.mode === 'REVERSE')
         .map(([nodeId, peer]) => ({ nodeId, peer }));
@@ -1467,7 +1687,6 @@ class P2PHybridNode extends EventEmitter {
     let successCount = 0;
     let failedCount = 0;
 
-    // Jalankan dalam batch paralel untuk cepat tapi tidak terlalu brutal
     for (let i = 0; i < peersToUse.length; i += maxParallel) {
       const batch = peersToUse.slice(i, i + maxParallel);
 
@@ -1753,13 +1972,19 @@ class P2PHybridNode extends EventEmitter {
         !this.isBlacklisted(peer.nodeId) &&
         !(peer.ip === this.nodeIp && peer.port === this.nodePort)
       )
-      .slice(0, this.p2pConfig.maxPeers - totalConnections); 
+      .sort((a, b) => {
+        if (a.fromReferral && !b.fromReferral) return -1;
+        if (!a.fromReferral && b.fromReferral) return 1;
+        return b.lastUpdate - a.lastUpdate;
+      })
+      .slice(0, this.p2pConfig.maxPeers - totalConnections);
+      
     if (availablePeers.length === 0) {
       console.log('[P2P-AUTO] No available peers to connect');
       return;
     }
     
-    console.log(`[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers...`);
+    console.log(`[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers (${availablePeers.filter(p => p.fromReferral).length} from referrals)...`);
     this.stats.lastAutoConnect = Date.now();
     
     const maxParallel = 3;
@@ -1784,7 +2009,12 @@ class P2PHybridNode extends EventEmitter {
           try {
             const result = await this.connectToPeer(peer.nodeId, peer);
             if (result.success) {
-              console.log(`[P2P-AUTO] Connected to ${peer.nodeId} (${peer.mode})`);
+              const source = peer.fromReferral ? `referral from ${peer.referredBy}` : 'discovery';
+              console.log(`[P2P-AUTO] Connected to ${peer.nodeId} (${peer.mode}) via ${source}`);
+              
+              if (peer.fromReferral) {
+                this.stats.connectionsViaReferral++;
+              }
             } else if (!result.willRetry) {
               console.log(`[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`);
             }
@@ -1841,7 +2071,6 @@ class P2PHybridNode extends EventEmitter {
       let removedLocks = 0;
       for (const nodeId of this.connectionLocks) {
         if (!this.peers.has(nodeId)) {
-          // Lock exists but no peer materialised — connection attempt was abandoned
           this.connectionLocks.delete(nodeId);
           removedLocks++;
         }
@@ -1873,6 +2102,17 @@ class P2PHybridNode extends EventEmitter {
       }
       if (removedBlacklist > 0) {
         console.log(`[P2P-CLEANUP] Removed ${removedBlacklist} expired blacklist entry(ies)`);
+      }
+      
+      let removedReferrals = 0;
+      for (const [nodeId, referralData] of this.receivedReferrals) {
+        if (now - referralData.timestamp > this.p2pConfig.referralExpiryMs) {
+          this.receivedReferrals.delete(nodeId);
+          removedReferrals++;
+        }
+      }
+      if (removedReferrals > 0) {
+        console.log(`[P2P-CLEANUP] Removed ${removedReferrals} expired referral set(s)`);
       }
       
     }, this.p2pConfig.cleanupInterval);
@@ -1909,6 +2149,13 @@ class P2PHybridNode extends EventEmitter {
   }
   
   getStatus() {
+    const referralStats = {
+      referralsSent: this.stats.referralsSent,
+      referralsReceived: this.stats.referralsReceived,
+      connectionsViaReferral: this.stats.connectionsViaReferral,
+      storedReferrals: this.receivedReferrals.size
+    };
+    
     return {
       enabled: this.p2pConfig.enabled,
       nodeId: this.nodeId,
@@ -1925,7 +2172,8 @@ class P2PHybridNode extends EventEmitter {
         known: this.knownPeers.size,
         max: this.p2pConfig.maxPeers,
         locks: this.connectionLocks.size,
-        blacklisted: this.peerBlacklist.size
+        blacklisted: this.peerBlacklist.size,
+        fromReferrals: Array.from(this.knownPeers.values()).filter(p => p.fromReferral).length
       },
       messageQueue: {
         peers: this.messageQueue.size,
@@ -1934,6 +2182,7 @@ class P2PHybridNode extends EventEmitter {
       },
       stats: { 
         ...this.stats,
+        referralStats,
         successRate: this.stats.connectionAttempts > 0 
           ? ((this.stats.connectionSuccesses / this.stats.connectionAttempts) * 100).toFixed(2) + '%'
           : 'N/A'
@@ -1942,6 +2191,7 @@ class P2PHybridNode extends EventEmitter {
         autoConnect: this.p2pConfig.autoConnect,
         relayFallback: this.p2pConfig.relayFallback,
         maxPeers: this.p2pConfig.maxPeers,
+        maxReferrals: this.p2pConfig.maxReferralsToSend,
         discoveryInterval: this.p2pConfig.discoveryInterval,
         methodSyncInterval: this.p2pConfig.methodSyncInterval
       },
@@ -1971,7 +2221,9 @@ class P2PHybridNode extends EventEmitter {
         locked: this.connectionLocks.has(peer.nodeId),
         blacklisted: this.isBlacklisted(peer.nodeId),
         methodsVersion: peer.methodsVersion?.substring(0, 8),
-        methodsCount: peer.methodsCount
+        methodsCount: peer.methodsCount,
+        fromReferral: peer.fromReferral || false,
+        referredBy: peer.referredBy || null
       }))
     };
   }
@@ -2040,6 +2292,7 @@ class P2PHybridNode extends EventEmitter {
       this.connectionLocks.clear();
       this.messageQueue.clear();
       this.peerBlacklist.clear();
+      this.receivedReferrals.clear();
     }, 1000);
     
     this.cleanup();
