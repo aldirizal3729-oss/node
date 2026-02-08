@@ -28,24 +28,29 @@ function createProxyUpdater(config) {
       console.log(`[PROXY] Downloading from: ${sourceUrl}`);
       
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
+      const timeout = setTimeout(() => controller.abort(), 60000);
       
-      const response = await globalThis.fetch(sourceUrl, {
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      try {
+        const response = await globalThis.fetch(sourceUrl, {
+          signal: controller.signal,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        });
+        
+        clearTimeout(timeout);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
         }
-      });
-      
-      clearTimeout(timeout);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        
+        return await response.text();
+      } catch (error) {
+        clearTimeout(timeout);
+        throw error;
       }
-      
-      return await response.text();
     } catch (error) {
-      console.error(`[PROXY] Failed to download: ${error.message}`);
+      console.error(`[PROXY] Failed to download from ${sourceUrl}: ${error.message}`);
       return null;
     }
   }
@@ -84,6 +89,7 @@ function createProxyUpdater(config) {
   }
   
   async function updateProxyFile() {
+    // FIX #1: Prevent concurrent updates
     if (isRunning) {
       console.log('[PROXY] Update already running, skip');
       return { success: false, error: 'Already running' };
@@ -91,51 +97,80 @@ function createProxyUpdater(config) {
     
     try {
       isRunning = true;
-      console.log('[PROXY] Updating proxy.txt... (NO LIMIT)');
+      console.log('[PROXY] Updating proxy.txt from all sources...');
       
       const allProxies = [];
+      const sourceResults = {
+        success: 0,
+        failed: 0,
+        total: proxySources.length
+      };
       
-      // FIX: NO LIMIT - Download from ALL sources
-      for (const source of proxySources) {
+      // FIX #2: Process sources sequentially to avoid stack overflow
+      for (let i = 0; i < proxySources.length; i++) {
+        const source = proxySources[i];
+        
         try {
           const data = await downloadProxies(source);
+          
           if (data) {
             const proxies = parseProxies(data);
-            console.log(`[PROXY] Got ${proxies.length} from ${source.substring(0, 60)}...`);
+            console.log(`[PROXY] ✓ Got ${proxies.length} from source ${i + 1}/${proxySources.length}`);
             allProxies.push(...proxies);
-            
-            // NO LIMIT REMOVED!
-            // Continue to ALL sources
+            sourceResults.success++;
+          } else {
+            console.log(`[PROXY] ✗ Source ${i + 1}/${proxySources.length} failed`);
+            sourceResults.failed++;
           }
         } catch (err) {
-          console.log(`[PROXY] Source ${source} failed: ${err.message}`);
+          console.log(`[PROXY] ✗ Source ${i + 1} error: ${err.message}`);
+          sourceResults.failed++;
         }
         
-        // Small delay between sources to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // FIX #3: Add delay between sources to avoid rate limiting
+        if (i < proxySources.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
       }
       
+      // FIX #4: Deduplicate proxies efficiently
       const uniqueProxies = [...new Set(allProxies)];
       
       if (uniqueProxies.length === 0) {
-        console.log('[PROXY] No proxies found');
-        return { success: false, error: 'No proxies found' };
+        console.log('[PROXY] ✗ No proxies found from any source');
+        return { 
+          success: false, 
+          error: 'No proxies found',
+          sourceResults
+        };
       }
       
+      // FIX #5: Write to file safely
       const content = uniqueProxies.join('\n');
-      fs.writeFileSync(proxyFile, content, 'utf8');
+      try {
+        fs.writeFileSync(proxyFile, content, 'utf8');
+      } catch (writeError) {
+        console.error('[PROXY] ✗ Failed to write proxy file:', writeError.message);
+        return {
+          success: false,
+          error: `Write failed: ${writeError.message}`,
+          sourceResults
+        };
+      }
       
-      console.log(`[PROXY] ✓ Updated! ${uniqueProxies.length} proxies saved to ${proxyFile}`);
+      console.log(`[PROXY] ✓ Updated! ${uniqueProxies.length} proxies saved`);
+      console.log(`[PROXY] Sources: ${sourceResults.success} success, ${sourceResults.failed} failed`);
       
       return { 
         success: true, 
         count: uniqueProxies.length,
-        sources: proxySources.length,
+        sources: sourceResults,
         timestamp: new Date().toISOString()
       };
       
     } catch (error) {
-      console.error('[PROXY] Update failed:', error);
+      console.error('[PROXY] ✗ Update failed:', error.message);
+      console.error('[PROXY] Stack trace:', error.stack);
       return { success: false, error: error.message };
     } finally {
       isRunning = false;
@@ -147,17 +182,27 @@ function createProxyUpdater(config) {
     
     const intervalMs = intervalMinutes * 60 * 1000;
     
-    console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes (NO LIMIT)`);
+    console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes`);
     
-    updateProxyFile().then(result => {
-      if (result.success) {
-        console.log(`[PROXY] Initial: ${result.count} proxies from ${result.sources} sources`);
-      }
-    });
+    // FIX #6: Initial update with error handling
+    updateProxyFile()
+      .then(result => {
+        if (result.success) {
+          console.log(`[PROXY] Initial update: ${result.count} proxies`);
+        } else {
+          console.log(`[PROXY] Initial update failed: ${result.error}`);
+        }
+      })
+      .catch(error => {
+        console.error('[PROXY] Initial update error:', error.message);
+      });
     
+    // FIX #7: Interval with error handling
     updateInterval = setInterval(() => {
-      console.log(`[PROXY] Auto-update triggered (NO LIMIT)`);
-      updateProxyFile();
+      console.log(`[PROXY] Auto-update triggered`);
+      updateProxyFile().catch(error => {
+        console.error('[PROXY] Auto-update error:', error.message);
+      });
     }, intervalMs);
   }
   
