@@ -84,6 +84,86 @@ export function getCurrentMethodsVersionHash(methodsConfig) {
   return calculateMethodsVersionHash(methodsConfig);
 }
 
+// ============================================================================
+// CRITICAL FIX: Normalize methods to use local data directory paths
+// This prevents using peer's paths which would cause execution failures
+// ============================================================================
+export function normalizeMethodsToLocalPaths(methods, config) {
+  try {
+    if (!methods || typeof methods !== 'object') {
+      console.error('[METHOD-SYNC] Invalid methods object for normalization');
+      return {};
+    }
+    
+    const dataDir = path.join(__dirname, '..', 'lib', 'data');
+    
+    // Create data directory if it doesn't exist
+    if (!fs.existsSync(dataDir)) {
+      try {
+        fs.mkdirSync(dataDir, { recursive: true });
+        log(`Created data directory: ${dataDir}`);
+      } catch (err) {
+        log(`Warning: Could not create data directory: ${err.message}`);
+      }
+    }
+    
+    // Deep copy to avoid mutating original
+    const normalizedMethods = JSON.parse(JSON.stringify(methods));
+    
+    let totalNormalized = 0;
+    
+    for (const [methodName, methodConfig] of Object.entries(normalizedMethods)) {
+      if (!methodConfig.cmd) continue;
+      
+      let cmd = methodConfig.cmd;
+      const originalCmd = cmd;
+      
+      // Extract filenames from command
+      const files = extractPotentialFiles(cmd);
+      
+      if (files.length === 0) continue;
+      
+      for (const filename of files) {
+        const localFilePath = path.join(dataDir, filename);
+        
+        // Replace ANY path containing this filename with local path
+        // This handles cases where peer sent their own path like:
+        // "/home/peer1/lib/data/attack" -> "/home/local/lib/data/attack"
+        
+        // Pattern 1: Match quoted paths: "/any/path/to/filename"
+        const quotedPattern = new RegExp(`"[^"]*${escapeRegExp(filename)}"`, 'g');
+        cmd = cmd.replace(quotedPattern, `"${localFilePath}"`);
+        
+        // Pattern 2: Match unquoted absolute paths: /any/path/to/filename
+        const absolutePattern = new RegExp(`(^|\\s)(/[^\\s]*${escapeRegExp(filename)})(?=\\s|$)`, 'g');
+        cmd = cmd.replace(absolutePattern, `$1"${localFilePath}"`);
+        
+        // Pattern 3: Match bare filename (not preceded by /)
+        const barePattern = new RegExp(`(^|\\s)${escapeRegExp(filename)}(?=\\s|$)`, 'g');
+        cmd = cmd.replace(barePattern, `$1"${localFilePath}"`);
+      }
+      
+      // Update command if it was modified
+      if (cmd !== originalCmd) {
+        normalizedMethods[methodName].cmd = cmd;
+        totalNormalized++;
+        log(`Normalized ${methodName}: ${files.join(', ')}`);
+      }
+    }
+    
+    if (totalNormalized > 0) {
+      log(`✓ Normalized ${totalNormalized} method(s) to local paths`);
+    }
+    
+    return normalizedMethods;
+    
+  } catch (error) {
+    console.error('[METHOD-SYNC] Error normalizing methods:', error.message);
+    console.error('[METHOD-SYNC] Stack trace:', error.stack);
+    return methods || {};
+  }
+}
+
 async function processSyncQueue() {
   if (syncQueue.length === 0) return;
   
@@ -286,39 +366,21 @@ async function performSync(config) {
       }));
     }
     
-    // Update method commands
-    log('Updating method commands...');
-    const updatedMethods = JSON.parse(JSON.stringify(remoteMethods));
+    // CRITICAL FIX: Normalize methods to local paths before saving
+    log('Normalizing methods to local paths...');
+    const normalizedMethods = normalizeMethodsToLocalPaths(remoteMethods, config);
     
-    for (const [methodName, methodConfig] of Object.entries(updatedMethods)) {
-      if (methodConfig.cmd) {
-        let cmd = methodConfig.cmd;
-        const files = methodFiles[methodName] || [];
-        
-        for (const filename of files) {
-          const filePath = path.join(dataDir, filename);
-          if (fs.existsSync(filePath)) {
-            if (!cmd.includes(filePath)) {
-              const escapedFilename = escapeRegExp(filename);
-              cmd = cmd.replace(
-                new RegExp(`\\b${escapedFilename}\\b`, 'g'),
-                `"${filePath}"`
-              );
-            }
-          }
-        }
-        
-        updatedMethods[methodName].cmd = cmd;
-      }
+    if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+      throw new Error('Failed to normalize methods');
     }
     
     // Save methods
     log('Saving methods.json...');
-    fs.writeFileSync(methodsJsonPath, JSON.stringify(updatedMethods, null, 2));
-    log(`✓ Saved ${Object.keys(updatedMethods).length} methods`);
+    fs.writeFileSync(methodsJsonPath, JSON.stringify(normalizedMethods, null, 2));
+    log(`✓ Saved ${Object.keys(normalizedMethods).length} methods`);
     log(`✓ Downloaded: ${downloaded.length}, Failed: ${failed.length}, Deleted: ${orphanedFiles.length}`);
     
-    const localHash = calculateMethodsVersionHash(updatedMethods);
+    const localHash = calculateMethodsVersionHash(normalizedMethods);
     const upToDate = remoteHash !== 'unknown' ? (remoteHash === localHash) : true;
     
     // Notify master immediately
@@ -333,7 +395,7 @@ async function performSync(config) {
           body: JSON.stringify({
             node_id: config.NODE.ID,
             methods_version_hash: localHash,
-            methods_count: Object.keys(updatedMethods).length,
+            methods_count: Object.keys(normalizedMethods).length,
             files_downloaded: downloaded.length,
             files_deleted: orphanedFiles.length,
             timestamp: new Date().toISOString()
@@ -350,17 +412,17 @@ async function performSync(config) {
     
     return {
       success: true,
-      methods_count: Object.keys(updatedMethods).length,
+      methods_count: Object.keys(normalizedMethods).length,
       files: {
         downloaded: downloaded.length,
         deleted: orphanedFiles.length,
         failed: failed.length,
         list: downloaded.map(f => f.filename)
       },
-      methods: updatedMethods,
+      methods: normalizedMethods,
       version_hash: localHash,
       up_to_date: upToDate,
-      message: 'Sync completed with cleanup'
+      message: 'Sync completed with cleanup and normalization'
     };
     
   } finally {
@@ -398,6 +460,7 @@ export async function syncMethodsWithMaster(config) {
   }
 }
 
+// REFACTORED: Use normalizeMethodsToLocalPaths for consistency
 export function getMethodsWithAbsolutePaths(config) {
   try {
     const methodsJsonPath = config.SERVER.METHODS_PATH;
@@ -406,37 +469,9 @@ export function getMethodsWithAbsolutePaths(config) {
     }
     
     const methods = JSON.parse(fs.readFileSync(methodsJsonPath, 'utf8'));
-    const dataDir = path.join(__dirname, '..', 'lib', 'data');
     
-    if (!fs.existsSync(dataDir)) {
-      return methods;
-    }
-    
-    const updatedMethods = JSON.parse(JSON.stringify(methods));
-    
-    for (const [methodName, methodConfig] of Object.entries(updatedMethods)) {
-      if (methodConfig.cmd) {
-        let cmd = methodConfig.cmd;
-        const files = extractPotentialFiles(cmd);
-        
-        for (const filename of files) {
-          const filePath = path.join(dataDir, filename);
-          if (fs.existsSync(filePath)) {
-            if (!cmd.includes(filePath)) {
-              const escapedFilename = escapeRegExp(filename);
-              cmd = cmd.replace(
-                new RegExp(`\\b${escapedFilename}\\b`, 'g'),
-                `"${filePath}"`
-              );
-            }
-          }
-        }
-        
-        updatedMethods[methodName].cmd = cmd;
-      }
-    }
-    
-    return updatedMethods;
+    // Use the centralized normalization function
+    return normalizeMethodsToLocalPaths(methods, config);
     
   } catch (error) {
     console.error('Error in getMethodsWithAbsolutePaths:', error.message);

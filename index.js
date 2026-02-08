@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import config from './config/config.js';
 import * as methodSyncModule from './modules/methodSync.js';
+import { normalizeMethodsToLocalPaths } from './modules/methodSync.js';
 import createHeartbeat from './modules/heartbeat.js';
 import createReverseClient from './modules/reverseClient.js';
 import createProxyUpdater from './modules/proxyUpdater.js';
@@ -1372,9 +1373,16 @@ async function startServer() {
   console.log(`[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving and propagating IMMEDIATELY...`);
   
   try {
-    // Save to local file IMMEDIATELY
+    const normalizedMethods = normalizeMethodsToLocalPaths(data.methods, config);
+    
+    if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+      console.error('[P2P-EVENT] Failed to normalize methods before saving');
+      return;
+    }
+    
+    // Save to local file IMMEDIATELY with normalized paths
     const methodsPath = config.SERVER.METHODS_PATH;
-    fs.writeFileSync(methodsPath, JSON.stringify(data.methods, null, 2));
+    fs.writeFileSync(methodsPath, JSON.stringify(normalizedMethods, null, 2));
     console.log('[P2P-EVENT] ✓ Methods saved to local file');
     
     // Update shared config IMMEDIATELY

@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { normalizeMethodsToLocalPaths } from './methodSync.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1224,7 +1225,16 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
-    this.methodsConfig = methods;
+    // CRITICAL FIX: Normalize methods to use local paths
+    // This prevents using peer's paths which would cause execution failures
+    const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
+    
+    if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+      console.error('[P2P-METHODS] Failed to normalize methods from peer');
+      return;
+    }
+    
+    this.methodsConfig = normalizedMethods;
     this.methodsVersionHash = methodsVersion;
     this.methodsLastUpdate = Date.now();
     
@@ -1233,7 +1243,7 @@ class P2PHybridNode extends EventEmitter {
     
     this.emit('methods_updated_from_peer', {
       nodeId,
-      methods,
+      methods: normalizedMethods,  // Use normalized methods
       methodsVersion,
       methodsCount,
       source: 'request_response'
@@ -1275,8 +1285,16 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
+    // CRITICAL FIX: Normalize methods to use local paths
+    const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
+    
+    if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+      console.error('[P2P-METHODS] Failed to normalize methods from push');
+      return;
+    }
+    
     // Update immediately
-    this.methodsConfig = methods;
+    this.methodsConfig = normalizedMethods;
     this.methodsVersionHash = methodsVersion;
     this.methodsLastUpdate = Date.now();
     
@@ -1286,7 +1304,7 @@ class P2PHybridNode extends EventEmitter {
     // Emit event
     this.emit('methods_updated_from_peer', {
       nodeId,
-      methods,
+      methods: normalizedMethods,  // Use normalized methods
       methodsVersion,
       methodsCount,
       source: 'proactive_push'
