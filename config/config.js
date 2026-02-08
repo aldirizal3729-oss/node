@@ -33,7 +33,7 @@ function getStableNodeId() {
       if (macAddress) break;
     }
     
-    const serverPort = process.env.PORT || process.env.SERVER_PORT || 5032;
+    const serverPort = process.env.PORT || process.env.SERVER_PORT || 5034;
     const uniqueString = `${os.hostname()}-${macAddress || 'no-mac'}-${process.pid}-${serverPort}-${Date.now()}`;
     const nodeId = crypto
       .createHash('sha256')
@@ -163,9 +163,9 @@ const config = {
   },
   
   LOGGING: {
-    LEVEL: process.env.LOG_LEVEL || 'info',
-    ENCRYPTION_DEBUG: process.env.ENCRYPTION_DEBUG === 'true',
-    P2P_DEBUG: process.env.P2P_DEBUG === 'true',
+    LEVEL: process.env.LOG_LEVEL || 'warn',
+    ENCRYPTION_DEBUG: process.env.ENCRYPTION_DEBUG === 'false',
+    P2P_DEBUG: process.env.P2P_DEBUG === 'false',
   }
 };
 

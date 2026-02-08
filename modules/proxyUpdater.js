@@ -13,7 +13,12 @@ function createProxyUpdater(config) {
   const defaultSources = [
     'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/http/raw/all.txt',
     'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/socks4/raw/all.txt',
-    'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/socks5/raw/all.txt'
+    'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/socks5/raw/all.txt',
+    'https://raw.githubusercontent.com/elliottophellia/proxylist/refs/heads/master/results/http/global/http_checked.txt',
+    'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt',
+    'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt',
+    'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt',
+    'https://raw.githubusercontent.com/gitrecon1455/fresh-proxy-list/refs/heads/main/proxylist.txt'
   ];
   
   const proxySources = config?.PROXY?.SOURCES || defaultSources;
@@ -22,12 +27,17 @@ function createProxyUpdater(config) {
     try {
       console.log(`[PROXY] Downloading from: ${sourceUrl}`);
       
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
+      
       const response = await globalThis.fetch(sourceUrl, {
-        timeout: 30000,
+        signal: controller.signal,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
       });
+      
+      clearTimeout(timeout);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
@@ -74,36 +84,34 @@ function createProxyUpdater(config) {
   }
   
   async function updateProxyFile() {
-    // FIX Bug #1: Check isRunning before entering try block
     if (isRunning) {
       console.log('[PROXY] Update already running, skip');
       return { success: false, error: 'Already running' };
     }
     
-    // FIX Bug #1: Use try-finally to ensure cleanup
     try {
-      isRunning = true; // Set flag inside try block
-      console.log('[PROXY] Updating proxy.txt...');
+      isRunning = true;
+      console.log('[PROXY] Updating proxy.txt... (NO LIMIT)');
       
       const allProxies = [];
       
+      // FIX: NO LIMIT - Download from ALL sources
       for (const source of proxySources) {
         try {
           const data = await downloadProxies(source);
           if (data) {
             const proxies = parseProxies(data);
-            console.log(`[PROXY] Got ${proxies.length} from ${source.substring(0, 50)}...`);
+            console.log(`[PROXY] Got ${proxies.length} from ${source.substring(0, 60)}...`);
             allProxies.push(...proxies);
             
-            if (allProxies.length > 100000) {
-              console.log('[PROXY] Reached 1000+ proxies, stopping collection');
-              break;
-            }
+            // NO LIMIT REMOVED!
+            // Continue to ALL sources
           }
         } catch (err) {
           console.log(`[PROXY] Source ${source} failed: ${err.message}`);
         }
         
+        // Small delay between sources to avoid rate limiting
         await new Promise(resolve => setTimeout(resolve, 500));
       }
       
@@ -117,11 +125,12 @@ function createProxyUpdater(config) {
       const content = uniqueProxies.join('\n');
       fs.writeFileSync(proxyFile, content, 'utf8');
       
-      console.log(`[PROXY] Updated! ${uniqueProxies.length} proxies saved to ${proxyFile}`);
+      console.log(`[PROXY] ✓ Updated! ${uniqueProxies.length} proxies saved to ${proxyFile}`);
       
       return { 
         success: true, 
         count: uniqueProxies.length,
+        sources: proxySources.length,
         timestamp: new Date().toISOString()
       };
       
@@ -129,27 +138,25 @@ function createProxyUpdater(config) {
       console.error('[PROXY] Update failed:', error);
       return { success: false, error: error.message };
     } finally {
-      // FIX Bug #1: Ensure isRunning is always reset
       isRunning = false;
     }
   }
   
   function startAutoUpdate(intervalMinutes = 10) {
-    // FIX Bug #2: Always cleanup before creating new interval
     stopAutoUpdate();
     
     const intervalMs = intervalMinutes * 60 * 1000;
     
-    console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes`);
+    console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes (NO LIMIT)`);
     
     updateProxyFile().then(result => {
       if (result.success) {
-        console.log(`[PROXY] Initial: ${result.count} proxies`);
+        console.log(`[PROXY] Initial: ${result.count} proxies from ${result.sources} sources`);
       }
     });
     
     updateInterval = setInterval(() => {
-      console.log(`[PROXY] Auto-update triggered`);
+      console.log(`[PROXY] Auto-update triggered (NO LIMIT)`);
       updateProxyFile();
     }, intervalMs);
   }
@@ -170,7 +177,6 @@ function createProxyUpdater(config) {
       }
       return 0;
     } catch (error) {
-      // FIX Bug #3: Log error before returning
       console.error('[PROXY] Error getting proxy count:', error.message);
       return 0;
     }

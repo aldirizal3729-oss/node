@@ -84,7 +84,6 @@ export function getCurrentMethodsVersionHash(methodsConfig) {
   return calculateMethodsVersionHash(methodsConfig);
 }
 
-// IMPROVED: Process sync queue immediately
 async function processSyncQueue() {
   if (syncQueue.length === 0) return;
   
@@ -98,13 +97,12 @@ async function processSyncQueue() {
     reject(error);
   }
   
-  // Process next in queue immediately
   if (syncQueue.length > 0) {
     setImmediate(() => processSyncQueue());
   }
 }
 
-// IMPROVED: Main sync function with instant P2P propagation
+// FIX: Improved sync with file cleanup and forced overwrite
 async function performSync(config) {
   log('Starting method sync...');
   
@@ -115,7 +113,6 @@ async function performSync(config) {
   const methodsJsonPath = config.SERVER.METHODS_PATH;
   const dataDir = path.join(__dirname, '..', 'lib', 'data');
   
-  // Ensure directories exist
   [path.dirname(methodsJsonPath), dataDir].forEach(dir => {
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -156,7 +153,29 @@ async function performSync(config) {
     
     log(`Received ${Object.keys(remoteMethods).length} methods from master`);
     
-    // Collect files
+    // FIX #1: Get old methods to track deleted files
+    let oldMethods = {};
+    let oldFiles = new Set();
+    
+    try {
+      if (fs.existsSync(methodsJsonPath)) {
+        const oldData = fs.readFileSync(methodsJsonPath, 'utf8');
+        oldMethods = JSON.parse(oldData);
+        
+        for (const [methodName, methodConfig] of Object.entries(oldMethods)) {
+          if (methodConfig.cmd) {
+            const files = extractPotentialFiles(methodConfig.cmd);
+            files.forEach(file => oldFiles.add(file));
+          }
+        }
+        
+        log(`Found ${oldFiles.size} files in old methods`);
+      }
+    } catch (err) {
+      log(`Warning: Could not read old methods: ${err.message}`);
+    }
+    
+    // Collect new files
     log('Collecting files from methods...');
     const allFiles = new Set();
     const methodFiles = {};
@@ -176,34 +195,41 @@ async function performSync(config) {
     const fileList = Array.from(allFiles);
     log(`Found ${fileList.length} unique files to check`);
     
-    // Download files in parallel (IMPROVED: increased concurrency)
+    // FIX #2: Delete orphaned files (files in old but not in new)
+    const orphanedFiles = Array.from(oldFiles).filter(f => !allFiles.has(f));
+    if (orphanedFiles.length > 0) {
+      log(`Deleting ${orphanedFiles.length} orphaned file(s)...`);
+      
+      for (const filename of orphanedFiles) {
+        const filePath = path.join(dataDir, filename);
+        try {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            log(`✓ Deleted orphaned file: ${filename}`);
+          }
+        } catch (err) {
+          log(`⚠ Failed to delete ${filename}: ${err.message}`);
+        }
+      }
+    }
+    
+    // FIX #3: ALWAYS re-download files to ensure latest version (NO SKIP, NO LIMIT)
     const downloaded = [];
-    const skipped = [];
     const failed = [];
     
-    // Process files in batches of 5 for faster download
-    const batchSize = 5;
+    // Process files in batches of 10 for faster download
+    const batchSize = 10;
     for (let i = 0; i < fileList.length; i += batchSize) {
       const batch = fileList.slice(i, i + batchSize);
       
       await Promise.all(batch.map(async (filename) => {
         const filePath = path.join(dataDir, filename);
         
-        // Skip if file exists and has content
-        if (fs.existsSync(filePath)) {
-          const stats = fs.statSync(filePath);
-          if (stats.size > 0) {
-            log(`✓ ${filename} already exists (${stats.size} bytes)`);
-            skipped.push({ filename, size: stats.size });
-            return;
-          }
-        }
-        
         try {
           log(`Downloading ${filename}...`);
           
           const controller2 = new AbortController();
-          const timeout2 = setTimeout(() => controller2.abort(), 30000);
+          const timeout2 = setTimeout(() => controller2.abort(), 60000);
           
           try {
             const fileResponse = await globalThis.fetch(
@@ -217,6 +243,7 @@ async function performSync(config) {
               const arrayBuffer = await fileResponse.arrayBuffer();
               const fileBuffer = Buffer.from(arrayBuffer, 0, arrayBuffer.byteLength);
               
+              // ALWAYS overwrite to ensure latest version
               fs.writeFileSync(filePath, fileBuffer);
               
               // Make executable if needed
@@ -289,11 +316,12 @@ async function performSync(config) {
     log('Saving methods.json...');
     fs.writeFileSync(methodsJsonPath, JSON.stringify(updatedMethods, null, 2));
     log(`✓ Saved ${Object.keys(updatedMethods).length} methods`);
+    log(`✓ Downloaded: ${downloaded.length}, Failed: ${failed.length}, Deleted: ${orphanedFiles.length}`);
     
     const localHash = calculateMethodsVersionHash(updatedMethods);
     const upToDate = remoteHash !== 'unknown' ? (remoteHash === localHash) : true;
     
-    // IMPROVED: Notify master immediately (no delay)
+    // Notify master immediately
     if (config.MASTER.NOTIFY_ON_SYNC !== false) {
       try {
         const controller3 = new AbortController();
@@ -307,7 +335,7 @@ async function performSync(config) {
             methods_version_hash: localHash,
             methods_count: Object.keys(updatedMethods).length,
             files_downloaded: downloaded.length,
-            files_skipped: skipped.length,
+            files_deleted: orphanedFiles.length,
             timestamp: new Date().toISOString()
           }),
           signal: controller3.signal
@@ -325,14 +353,14 @@ async function performSync(config) {
       methods_count: Object.keys(updatedMethods).length,
       files: {
         downloaded: downloaded.length,
-        skipped: skipped.length,
+        deleted: orphanedFiles.length,
         failed: failed.length,
-        list: [...downloaded, ...skipped].map(f => f.filename)
+        list: downloaded.map(f => f.filename)
       },
       methods: updatedMethods,
       version_hash: localHash,
       up_to_date: upToDate,
-      message: 'Sync completed'
+      message: 'Sync completed with cleanup'
     };
     
   } finally {
@@ -342,10 +370,8 @@ async function performSync(config) {
   }
 }
 
-// IMPROVED: Immediate sync with queue system
 export async function syncMethodsWithMaster(config) {
   if (syncInProgress) {
-    // Add to queue instead of rejecting
     log('Sync in progress, adding to queue');
     return new Promise((resolve, reject) => {
       syncQueue.push({ config, resolve, reject });
@@ -366,7 +392,6 @@ export async function syncMethodsWithMaster(config) {
   } finally {
     syncInProgress = false;
     
-    // Process queue immediately
     if (syncQueue.length > 0) {
       setImmediate(() => processSyncQueue());
     }

@@ -894,6 +894,10 @@ class P2PHybridNode extends EventEmitter {
         case 'methods_response':
           this.handleMethodsResponse(nodeId, message);
           break;
+  
+        case 'methods_push':
+          this.handleMethodsPush(nodeId, message);
+          break;
           
         case 'methods_update_notification':
           this.handleMethodsUpdateNotification(nodeId, message);
@@ -1265,7 +1269,7 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
-    // Check if this is actually newer
+    // Check if newer
     if (methodsVersion === this.methodsVersionHash) {
       console.log('[P2P-METHODS] Already have this version, skipping');
       return;
@@ -1279,7 +1283,7 @@ class P2PHybridNode extends EventEmitter {
     console.log(`[P2P-METHODS] ✓ Updated methods from PROACTIVE push by ${nodeId}`);
     this.stats.methodSyncsFromPeers++;
     
-    // Emit event for local handling
+    // Emit event
     this.emit('methods_updated_from_peer', {
       nodeId,
       methods,
@@ -1288,7 +1292,7 @@ class P2PHybridNode extends EventEmitter {
       source: 'proactive_push'
     });
     
-    // IMPROVED: Propagate IMMEDIATELY to other peers
+    // Propagate to other peers IMMEDIATELY
     setImmediate(() => {
       this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
     });
@@ -1587,7 +1591,7 @@ class P2PHybridNode extends EventEmitter {
 async sendMethodsConfigToPeer(nodeId, versionHash) {
   try {
     const message = {
-      type: 'methods_push', // New message type for proactive push
+      type: 'methods_push', // Proactive push
       nodeId: this.nodeId,
       methods: this.methodsConfig,
       methodsVersion: versionHash,

