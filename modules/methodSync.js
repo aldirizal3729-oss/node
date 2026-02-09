@@ -18,12 +18,49 @@ function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Detect executable file extensions
+function isExecutableFile(filename) {
+  const executableExtensions = ['.js', '.py', '.sh', '.pl', '.rb', '.php', '.bin', ''];
+  const ext = path.extname(filename).toLowerCase();
+  return executableExtensions.includes(ext);
+}
+
+// Detect data file extensions (NOT to be normalized with full path)
+function isDataFile(filename) {
+  const dataExtensions = ['.txt', '.csv', '.json', '.xml', '.dat', '.list'];
+  const ext = path.extname(filename).toLowerCase();
+  return dataExtensions.includes(ext);
+}
+
+// FIX: Extract files and categorize them
 function extractPotentialFiles(text) {
-  if (!text || typeof text !== 'string') return [];
+  if (!text || typeof text !== 'string') return { executables: [], dataFiles: [] };
   
-  const files = new Set();
+  const executables = new Set();
+  const dataFiles = new Set();
+  
+  // Pattern 1: Extract quoted paths (supports full paths)
+  const quotedPattern = /["']([^"'\s]+\.[a-zA-Z0-9]+)["']/g;
+  let match;
+  while ((match = quotedPattern.exec(text)) !== null) {
+    const filePath = match[1];
+    const fileName = path.basename(filePath);
+    
+    // Skip parameter placeholders and system commands
+    if (fileName.includes('{') || isSystemCommand(fileName)) {
+      continue;
+    }
+    
+    // Categorize file
+    if (isExecutableFile(fileName)) {
+      executables.add(fileName);
+    } else if (isDataFile(fileName)) {
+      dataFiles.add(fileName);
+    }
+  }
+  
+  // Pattern 2: Extract unquoted filenames (backward compatibility)
   const words = text.split(/\s+/);
-  
   for (const word of words) {
     let cleanWord = word
       .replace(/^["']|["']$/g, '')
@@ -40,18 +77,23 @@ function extractPotentialFiles(text) {
       continue;
     }
     
+    // Only extract filename from unquoted words (no path separators)
     if (!cleanWord.includes('/') && !cleanWord.includes('\\')) {
       const fileName = path.basename(cleanWord);
-      if (fileName && fileName.length >= 2) {
-        const wordPattern = new RegExp(`(^|\\s)${escapeRegExp(word)}($|\\s)`);
-        if (wordPattern.test(text)) {
-          files.add(fileName);
+      if (fileName && fileName.length >= 2 && fileName.includes('.')) {
+        if (isExecutableFile(fileName)) {
+          executables.add(fileName);
+        } else if (isDataFile(fileName)) {
+          dataFiles.add(fileName);
         }
       }
     }
   }
   
-  return Array.from(files);
+  return {
+    executables: Array.from(executables),
+    dataFiles: Array.from(dataFiles)
+  };
 }
 
 function isSystemCommand(cmd) {
@@ -84,10 +126,7 @@ export function getCurrentMethodsVersionHash(methodsConfig) {
   return calculateMethodsVersionHash(methodsConfig);
 }
 
-// ============================================================================
-// CRITICAL FIX: Normalize methods to use local data directory paths
-// This prevents using peer's paths which would cause execution failures
-// ============================================================================
+// CRITICAL FIX: Only normalize executable paths, keep data files as filename only
 export function normalizeMethodsToLocalPaths(methods, config) {
   try {
     if (!methods || typeof methods !== 'object') {
@@ -118,41 +157,81 @@ export function normalizeMethodsToLocalPaths(methods, config) {
       let cmd = methodConfig.cmd;
       const originalCmd = cmd;
       
-      // Extract filenames from command
-      const files = extractPotentialFiles(cmd);
+      // Extract files from command
+      const { executables, dataFiles } = extractPotentialFiles(cmd);
       
-      if (files.length === 0) continue;
+      if (executables.length === 0 && dataFiles.length === 0) continue;
       
-      for (const filename of files) {
+      log(`Processing ${methodName}:`);
+      log(`  Executables: ${executables.join(', ') || 'none'}`);
+      log(`  Data files: ${dataFiles.join(', ') || 'none'}`);
+      
+      // STEP 1: Normalize EXECUTABLE files with FULL PATH
+      for (const filename of executables) {
         const localFilePath = path.join(dataDir, filename);
         
-        // Replace ANY path containing this filename with local path
-        // This handles cases where peer sent their own path like:
-        // "/home/peer1/lib/data/attack" -> "/home/local/lib/data/attack"
+        // Replace ALL occurrences with full local path
         
-        // Pattern 1: Match quoted paths: "/any/path/to/filename"
-        const quotedPattern = new RegExp(`"[^"]*${escapeRegExp(filename)}"`, 'g');
-        cmd = cmd.replace(quotedPattern, `"${localFilePath}"`);
+        // Pattern 1: Quoted full paths - "/any/path/script.js"
+        const quotedFullPathPattern = new RegExp(`"[^"]*/${escapeRegExp(filename)}"`, 'g');
+        cmd = cmd.replace(quotedFullPathPattern, `"${localFilePath}"`);
         
-        // Pattern 2: Match unquoted absolute paths: /any/path/to/filename
-        const absolutePattern = new RegExp(`(^|\\s)(/[^\\s]*${escapeRegExp(filename)})(?=\\s|$)`, 'g');
-        cmd = cmd.replace(absolutePattern, `$1"${localFilePath}"`);
+        // Pattern 2: Single-quoted full paths - '/any/path/script.js'
+        const singleQuotedFullPathPattern = new RegExp(`'[^']*/${escapeRegExp(filename)}'`, 'g');
+        cmd = cmd.replace(singleQuotedFullPathPattern, `"${localFilePath}"`);
         
-        // Pattern 3: Match bare filename (not preceded by /)
-        const barePattern = new RegExp(`(^|\\s)${escapeRegExp(filename)}(?=\\s|$)`, 'g');
-        cmd = cmd.replace(barePattern, `$1"${localFilePath}"`);
+        // Pattern 3: Quoted filename only - "script.js"
+        const quotedFilenamePattern = new RegExp(`"${escapeRegExp(filename)}"`, 'g');
+        cmd = cmd.replace(quotedFilenamePattern, `"${localFilePath}"`);
+        
+        // Pattern 4: Single-quoted filename only - 'script.js'
+        const singleQuotedFilenamePattern = new RegExp(`'${escapeRegExp(filename)}'`, 'g');
+        cmd = cmd.replace(singleQuotedFilenamePattern, `"${localFilePath}"`);
+        
+        // Pattern 5: Unquoted absolute paths - /any/path/script.js
+        const unquotedAbsolutePattern = new RegExp(`(^|\\s)(/[^\\s]*${escapeRegExp(filename)})(?=\\s|$)`, 'g');
+        cmd = cmd.replace(unquotedAbsolutePattern, `$1"${localFilePath}"`);
+        
+        log(`  ✓ Normalized executable: ${filename} → ${localFilePath}`);
+      }
+      
+      // STEP 2: Normalize DATA files to FILENAME ONLY (remove paths)
+      for (const filename of dataFiles) {
+        // Remove ANY path prefix, keep only filename
+        
+        // Pattern 1: Quoted full paths - "/any/path/proxy.txt" → proxy.txt
+        const quotedFullPathPattern = new RegExp(`"[^"]*/${escapeRegExp(filename)}"`, 'g');
+        cmd = cmd.replace(quotedFullPathPattern, filename); // NO QUOTES!
+        
+        // Pattern 2: Single-quoted full paths - '/any/path/proxy.txt' → proxy.txt
+        const singleQuotedFullPathPattern = new RegExp(`'[^']*/${escapeRegExp(filename)}'`, 'g');
+        cmd = cmd.replace(singleQuotedFullPathPattern, filename); // NO QUOTES!
+        
+        // Pattern 3: Quoted filename - "proxy.txt" → proxy.txt
+        const quotedFilenamePattern = new RegExp(`"${escapeRegExp(filename)}"`, 'g');
+        cmd = cmd.replace(quotedFilenamePattern, filename); // NO QUOTES!
+        
+        // Pattern 4: Single-quoted filename - 'proxy.txt' → proxy.txt
+        const singleQuotedFilenamePattern = new RegExp(`'${escapeRegExp(filename)}'`, 'g');
+        cmd = cmd.replace(singleQuotedFilenamePattern, filename); // NO QUOTES!
+        
+        log(`  ✓ Kept data file as filename: ${filename}`);
       }
       
       // Update command if it was modified
       if (cmd !== originalCmd) {
         normalizedMethods[methodName].cmd = cmd;
         totalNormalized++;
-        log(`Normalized ${methodName}: ${files.join(', ')}`);
+        log(`  ✓ Normalized ${methodName}`);
+        log(`    FROM: ${originalCmd}`);
+        log(`    TO:   ${cmd}`);
       }
     }
     
     if (totalNormalized > 0) {
-      log(`✓ Normalized ${totalNormalized} method(s) to local paths`);
+      log(`✓ Normalized ${totalNormalized} method(s)`);
+    } else {
+      log(`No methods required normalization`);
     }
     
     return normalizedMethods;
@@ -182,7 +261,6 @@ async function processSyncQueue() {
   }
 }
 
-// FIX: Improved sync with file cleanup and forced overwrite
 async function performSync(config) {
   log('Starting method sync...');
   
@@ -233,7 +311,7 @@ async function performSync(config) {
     
     log(`Received ${Object.keys(remoteMethods).length} methods from master`);
     
-    // FIX #1: Get old methods to track deleted files
+    // Get old methods to track deleted files
     let oldMethods = {};
     let oldFiles = new Set();
     
@@ -244,8 +322,8 @@ async function performSync(config) {
         
         for (const [methodName, methodConfig] of Object.entries(oldMethods)) {
           if (methodConfig.cmd) {
-            const files = extractPotentialFiles(methodConfig.cmd);
-            files.forEach(file => oldFiles.add(file));
+            const { executables, dataFiles } = extractPotentialFiles(methodConfig.cmd);
+            [...executables, ...dataFiles].forEach(file => oldFiles.add(file));
           }
         }
         
@@ -258,24 +336,23 @@ async function performSync(config) {
     // Collect new files
     log('Collecting files from methods...');
     const allFiles = new Set();
-    const methodFiles = {};
     
     for (const [methodName, methodConfig] of Object.entries(remoteMethods)) {
       if (methodConfig.cmd) {
-        const files = extractPotentialFiles(methodConfig.cmd);
-        methodFiles[methodName] = files;
-        files.forEach(file => allFiles.add(file));
+        const { executables, dataFiles } = extractPotentialFiles(methodConfig.cmd);
+        const allMethodFiles = [...executables, ...dataFiles];
+        allMethodFiles.forEach(file => allFiles.add(file));
         
-        if (files.length > 0) {
-          log(`  ${methodName}: ${files.join(', ')}`);
+        if (allMethodFiles.length > 0) {
+          log(`  ${methodName}: ${allMethodFiles.join(', ')}`);
         }
       }
     }
     
     const fileList = Array.from(allFiles);
-    log(`Found ${fileList.length} unique files to check`);
+    log(`Found ${fileList.length} unique files to download`);
     
-    // FIX #2: Delete orphaned files (files in old but not in new)
+    // Delete orphaned files
     const orphanedFiles = Array.from(oldFiles).filter(f => !allFiles.has(f));
     if (orphanedFiles.length > 0) {
       log(`Deleting ${orphanedFiles.length} orphaned file(s)...`);
@@ -293,11 +370,10 @@ async function performSync(config) {
       }
     }
     
-    // FIX #3: ALWAYS re-download files to ensure latest version (NO SKIP, NO LIMIT)
+    // Download all files
     const downloaded = [];
     const failed = [];
     
-    // Process files in batches of 10 for faster download
     const batchSize = 10;
     for (let i = 0; i < fileList.length; i += batchSize) {
       const batch = fileList.slice(i, i + batchSize);
@@ -323,17 +399,10 @@ async function performSync(config) {
               const arrayBuffer = await fileResponse.arrayBuffer();
               const fileBuffer = Buffer.from(arrayBuffer, 0, arrayBuffer.byteLength);
               
-              // ALWAYS overwrite to ensure latest version
               fs.writeFileSync(filePath, fileBuffer);
               
               // Make executable if needed
-              if (
-                !filename.includes('.') || 
-                filename.endsWith('.sh') || 
-                filename.endsWith('.py') ||
-                filename.endsWith('.pl') ||
-                filename.endsWith('.rb')
-              ) {
+              if (isExecutableFile(filename)) {
                 try {
                   fs.chmodSync(filePath, '755');
                   log(`✓ Made ${filename} executable`);
@@ -366,7 +435,7 @@ async function performSync(config) {
       }));
     }
     
-    // CRITICAL FIX: Normalize methods to local paths before saving
+    // Normalize methods to local paths
     log('Normalizing methods to local paths...');
     const normalizedMethods = normalizeMethodsToLocalPaths(remoteMethods, config);
     
@@ -383,7 +452,7 @@ async function performSync(config) {
     const localHash = calculateMethodsVersionHash(normalizedMethods);
     const upToDate = remoteHash !== 'unknown' ? (remoteHash === localHash) : true;
     
-    // Notify master immediately
+    // Notify master
     if (config.MASTER.NOTIFY_ON_SYNC !== false) {
       try {
         const controller3 = new AbortController();
@@ -460,7 +529,6 @@ export async function syncMethodsWithMaster(config) {
   }
 }
 
-// REFACTORED: Use normalizeMethodsToLocalPaths for consistency
 export function getMethodsWithAbsolutePaths(config) {
   try {
     const methodsJsonPath = config.SERVER.METHODS_PATH;
@@ -469,8 +537,6 @@ export function getMethodsWithAbsolutePaths(config) {
     }
     
     const methods = JSON.parse(fs.readFileSync(methodsJsonPath, 'utf8'));
-    
-    // Use the centralized normalization function
     return normalizeMethodsToLocalPaths(methods, config);
     
   } catch (error) {

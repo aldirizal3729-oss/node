@@ -291,171 +291,179 @@ class P2PHybridNode extends EventEmitter {
   }
   
   handleIncomingPeerConnection(ws, request) {
-    const remoteNodeId = request.headers['x-node-id'];
-    const remoteIp = request.headers['x-forwarded-for'] || 
-                     request.socket.remoteAddress?.replace('::ffff:', '');
-    const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
-    const remotePort = request.headers['x-node-port'] ? parseInt(request.headers['x-node-port'], 10) : null;
-    
-    console.log('[P2P-SERVER] New peer connection attempt:', {
-      remoteNodeId,
-      remoteIp,
-      remotePort,
-      remoteMode
-    });
-    
-    if (!remoteNodeId) {
-      console.log('[P2P-SERVER] Rejected: Missing node ID');
-      ws.close(4000, 'Missing node ID');
-      return;
-    }
-    
-    if (remoteNodeId === this.nodeId) {
-      console.log('[P2P-SERVER] Rejected: Self-connection attempt');
-      ws.close(4001, 'Cannot connect to self');
-      return;
-    }
-    
-    if (this.isBlacklisted(remoteNodeId)) {
-      console.log('[P2P-SERVER] Rejected: Blacklisted');
-      ws.close(4002, 'Blacklisted');
-      return;
-    }
-    
-    // CHANGED: Add to known peers even if we can't connect
-    if (remoteIp && remotePort) {
-      this.knownPeers.set(remoteNodeId, {
-        nodeId: remoteNodeId,
-        ip: remoteIp,
-        port: remotePort,
-        mode: remoteMode,
-        reachable: true,
-        capabilities: null,
-        methodsVersion: null,
-        methodsCount: 0,
-        lastUpdate: Date.now()
-      });
-      console.log(`[P2P-SERVER] Added ${remoteNodeId} to known peers (${this.knownPeers.size} total)`);
-    }
-    
-    // CHANGED: Send referrals when max peers reached
-    if (this.peers.size >= this.p2pConfig.maxPeers) {
-      console.log('[P2P-SERVER] Rejected: Max peers reached, sending referrals');
-      
-      const referrals = this.getPeerReferrals(remoteNodeId);
-      
-      this.stats.referralsSent++;
-      
-      try {
-        ws.send(JSON.stringify({
-          type: 'connection_rejected',
-          reason: 'max_peers_reached',
-          maxPeers: this.p2pConfig.maxPeers,
-          currentPeers: this.peers.size,
-          referrals: referrals,
-          referralCount: referrals.length,
-          nodeInfo: {
-            nodeId: this.nodeId,
-            ip: this.nodeIp,
-            port: this.nodePort
-          },
-          message: `This node is full (${this.peers.size}/${this.p2pConfig.maxPeers}). Try connecting to ${referrals.length} suggested peer(s).`
-        }));
-        
-        console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId}`);
-      } catch (error) {
-        console.error('[P2P-SERVER] Failed to send referrals:', error.message);
-      }
-      
-      setTimeout(() => {
-        ws.close(4003, 'Max peers reached - check referrals');
-      }, 500);
-      
-      return;
-    }
-    
-    if (this.peers.has(remoteNodeId)) {
-      console.log('[P2P-SERVER] Peer already connected, replacing old connection');
-      const oldPeer = this.peers.get(remoteNodeId);
-      try {
-        oldPeer.ws.close();
-      } catch (e) {}
-      this.peers.delete(remoteNodeId);
-    }
-    
-    const peerInfo = {
-      ws,
+  const remoteNodeId = request.headers['x-node-id'];
+  const remoteIp = request.headers['x-forwarded-for'] || 
+                   request.socket.remoteAddress?.replace('::ffff:', '');
+  const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
+  const remotePort = request.headers['x-node-port'] ? parseInt(request.headers['x-node-port'], 10) : null;
+  
+  console.log('[P2P-SERVER] New peer connection attempt:', {
+    remoteNodeId,
+    remoteIp,
+    remotePort,
+    remoteMode
+  });
+  
+  if (!remoteNodeId) {
+    console.log('[P2P-SERVER] Rejected: Missing node ID');
+    ws.close(4000, 'Missing node ID');
+    return;
+  }
+  
+  if (remoteNodeId === this.nodeId) {
+    console.log('[P2P-SERVER] Rejected: Self-connection attempt');
+    ws.close(4001, 'Cannot connect to self');
+    return;
+  }
+  
+  // FIX: Hanya tolak jika IP DAN PORT sama dengan node ini
+  // Mengizinkan koneksi dari IP sama dengan port berbeda
+  if (remoteIp === this.nodeIp && remotePort === this.nodePort) {
+    console.log('[P2P-SERVER] Rejected: Same IP and port as self');
+    ws.close(4001, 'Cannot connect to self (same IP:port)');
+    return;
+  }
+  
+  if (this.isBlacklisted(remoteNodeId)) {
+    console.log('[P2P-SERVER] Rejected: Blacklisted');
+    ws.close(4002, 'Blacklisted');
+    return;
+  }
+  
+  // CHANGED: Add to known peers even if we can't connect
+  if (remoteIp && remotePort) {
+    this.knownPeers.set(remoteNodeId, {
       nodeId: remoteNodeId,
       ip: remoteIp,
       port: remotePort,
       mode: remoteMode,
-      connected: true,
-      direct: true,
-      lastSeen: Date.now(),
-      lastHeartbeat: Date.now(),
-      messagesReceived: 0,
-      messagesSent: 0,
-      connectedAt: Date.now(),
+      reachable: true,
       capabilities: null,
       methodsVersion: null,
-      methodsCount: 0
-    };
-    
-    this.peers.set(remoteNodeId, peerInfo);
-    this.connectionLocks.delete(remoteNodeId);
-    this.stats.directConnections++;
-    this.stats.connectionSuccesses++;
-    
-    this.sendToPeer(remoteNodeId, {
-      type: 'welcome',
-      nodeId: this.nodeId,
-      ip: this.nodeIp,
-      port: this.nodePort,
-      mode: this.nodeMode,
-      timestamp: Date.now(),
-      capabilities: {
-        encryption: !!this.encryptionManager,
-        methods: Object.keys(this.methodsConfig),
-        methodsVersion: this.methodsVersionHash,
-        methodsCount: Object.keys(this.methodsConfig).length,
-        relay: this.p2pConfig.relayFallback && this.masterReachable,
-        fileSharing: true,
-        referrals: true,
-        version: '3.1'
-      }
+      methodsCount: 0,
+      lastUpdate: Date.now()
     });
-    
-    ws.on('message', (data) => {
-      this.handlePeerMessage(remoteNodeId, data);
-    });
-    
-    ws.on('close', (code, reason) => {
-      console.log(`[P2P] Peer ${remoteNodeId} disconnected (code: ${code})`);
-      this.handlePeerDisconnected(remoteNodeId, code, reason);
-    });
-    
-    ws.on('error', (error) => {
-      console.error(`[P2P] Peer ${remoteNodeId} error:`, error.message);
-    });
-    
-    ws.on('pong', () => {
-      if (this.peers.has(remoteNodeId)) {
-        this.peers.get(remoteNodeId).lastSeen = Date.now();
-      }
-    });
-    
-    this.emit('peer_connected', {
-      nodeId: remoteNodeId,
-      ip: remoteIp,
-      port: remotePort,
-      mode: remoteMode,
-      direct: true
-    });
-    
-    this.processQueuedMessages(remoteNodeId);
-    
-    console.log(`[P2P] Peer ${remoteNodeId} (${remoteMode}) connected successfully (${this.peers.size}/${this.p2pConfig.maxPeers})`);
+    console.log(`[P2P-SERVER] Added ${remoteNodeId} (${remoteIp}:${remotePort}) to known peers (${this.knownPeers.size} total)`);
   }
+  
+  // CHANGED: Send referrals when max peers reached
+  if (this.peers.size >= this.p2pConfig.maxPeers) {
+    console.log('[P2P-SERVER] Rejected: Max peers reached, sending referrals');
+    
+    const referrals = this.getPeerReferrals(remoteNodeId);
+    
+    this.stats.referralsSent++;
+    
+    try {
+      ws.send(JSON.stringify({
+        type: 'connection_rejected',
+        reason: 'max_peers_reached',
+        maxPeers: this.p2pConfig.maxPeers,
+        currentPeers: this.peers.size,
+        referrals: referrals,
+        referralCount: referrals.length,
+        nodeInfo: {
+          nodeId: this.nodeId,
+          ip: this.nodeIp,
+          port: this.nodePort
+        },
+        message: `This node is full (${this.peers.size}/${this.p2pConfig.maxPeers}). Try connecting to ${referrals.length} suggested peer(s).`
+      }));
+      
+      console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId}`);
+    } catch (error) {
+      console.error('[P2P-SERVER] Failed to send referrals:', error.message);
+    }
+    
+    setTimeout(() => {
+      ws.close(4003, 'Max peers reached - check referrals');
+    }, 500);
+    
+    return;
+  }
+  
+  if (this.peers.has(remoteNodeId)) {
+    console.log('[P2P-SERVER] Peer already connected, replacing old connection');
+    const oldPeer = this.peers.get(remoteNodeId);
+    try {
+      oldPeer.ws.close();
+    } catch (e) {}
+    this.peers.delete(remoteNodeId);
+  }
+  
+  const peerInfo = {
+    ws,
+    nodeId: remoteNodeId,
+    ip: remoteIp,
+    port: remotePort,
+    mode: remoteMode,
+    connected: true,
+    direct: true,
+    lastSeen: Date.now(),
+    lastHeartbeat: Date.now(),
+    messagesReceived: 0,
+    messagesSent: 0,
+    connectedAt: Date.now(),
+    capabilities: null,
+    methodsVersion: null,
+    methodsCount: 0
+  };
+  
+  this.peers.set(remoteNodeId, peerInfo);
+  this.connectionLocks.delete(remoteNodeId);
+  this.stats.directConnections++;
+  this.stats.connectionSuccesses++;
+  
+  this.sendToPeer(remoteNodeId, {
+    type: 'welcome',
+    nodeId: this.nodeId,
+    ip: this.nodeIp,
+    port: this.nodePort,
+    mode: this.nodeMode,
+    timestamp: Date.now(),
+    capabilities: {
+      encryption: !!this.encryptionManager,
+      methods: Object.keys(this.methodsConfig),
+      methodsVersion: this.methodsVersionHash,
+      methodsCount: Object.keys(this.methodsConfig).length,
+      relay: this.p2pConfig.relayFallback && this.masterReachable,
+      fileSharing: true,
+      referrals: true,
+      version: '3.1'
+    }
+  });
+  
+  ws.on('message', (data) => {
+    this.handlePeerMessage(remoteNodeId, data);
+  });
+  
+  ws.on('close', (code, reason) => {
+    console.log(`[P2P] Peer ${remoteNodeId} disconnected (code: ${code})`);
+    this.handlePeerDisconnected(remoteNodeId, code, reason);
+  });
+  
+  ws.on('error', (error) => {
+    console.error(`[P2P] Peer ${remoteNodeId} error:`, error.message);
+  });
+  
+  ws.on('pong', () => {
+    if (this.peers.has(remoteNodeId)) {
+      this.peers.get(remoteNodeId).lastSeen = Date.now();
+    }
+  });
+  
+  this.emit('peer_connected', {
+    nodeId: remoteNodeId,
+    ip: remoteIp,
+    port: remotePort,
+    mode: remoteMode,
+    direct: true
+  });
+  
+  this.processQueuedMessages(remoteNodeId);
+  
+  console.log(`[P2P] Peer ${remoteNodeId} (${remoteMode}) at ${remoteIp}:${remotePort} connected successfully (${this.peers.size}/${this.p2pConfig.maxPeers})`);
+}
   
   handlePeerDisconnected(nodeId, code, reason) {
     this.peers.delete(nodeId);
@@ -603,215 +611,217 @@ class P2PHybridNode extends EventEmitter {
   }
   
   async connectToPeer(nodeId, peerInfo, retryAttempt = 0) {
-    if (nodeId === this.nodeId) {
-      return { success: false, error: 'Cannot connect to self' };
-    }
+  if (nodeId === this.nodeId) {
+    return { success: false, error: 'Cannot connect to self' };
+  }
+  
+  const normalizedPort = this.normalizePort(peerInfo.port);
+  
+  // FIX: Hanya tolak jika IP DAN PORT sama dengan node ini
+  // Mengizinkan koneksi ke IP sama dengan port berbeda
+  if (peerInfo.ip === this.nodeIp && normalizedPort === this.nodePort) {
+    return { success: false, error: 'Cannot connect to self (same IP:port)' };
+  }
+  
+  if (this.peers.has(nodeId)) {
+    return { success: true, existing: true };
+  }
+  
+  if (this.isBlacklisted(nodeId)) {
+    return { success: false, error: 'Peer is blacklisted' };
+  }
+  
+  if (this.connectionLocks.has(nodeId)) {
+    return { success: false, error: 'Connection already in progress' };
+  }
+  
+  const totalConnections = this.peers.size + this.connectionLocks.size;
+  if (totalConnections >= this.p2pConfig.maxPeers) {
+    return { success: false, error: 'Max peers reached (including pending)' };
+  }
+  
+  if (retryAttempt >= this.p2pConfig.maxConnectionAttempts) {
+    this.blacklistPeer(nodeId, `Max connection attempts (${retryAttempt}) reached`);
+    return { success: false, error: 'Max attempts reached' };
+  }
+  
+  if (!peerInfo.ip || !normalizedPort) {
+    return { success: false, error: 'Missing peer IP or port' };
+  }
+  
+  this.connectionLocks.add(nodeId);
+  this.stats.connectionAttempts++;
+  
+  try {
+    const wsUrl = `ws://${peerInfo.ip}:${normalizedPort}/p2p`;
     
-    const normalizedPort = this.normalizePort(peerInfo.port);
+    console.log(`[P2P] Connecting to peer ${nodeId} at ${wsUrl} (attempt ${retryAttempt + 1}/${this.p2pConfig.maxConnectionAttempts})`);
     
-    if (peerInfo.ip === this.nodeIp && normalizedPort === this.nodePort) {
-      return { success: false, error: 'Cannot connect to self (same IP:port)' };
-    }
+    const ws = new WebSocket(wsUrl, {
+      headers: {
+        'X-Node-ID': this.nodeId,
+        'X-Node-IP': this.nodeIp || 'unknown',
+        'X-Node-Port': this.nodePort.toString(),
+        'X-Node-Mode': this.nodeMode
+      },
+      handshakeTimeout: this.p2pConfig.connectionTimeout
+    });
     
-    if (this.peers.has(nodeId)) {
-      return { success: true, existing: true };
-    }
-    
-    if (this.isBlacklisted(nodeId)) {
-      return { success: false, error: 'Peer is blacklisted' };
-    }
-    
-    if (this.connectionLocks.has(nodeId)) {
-      return { success: false, error: 'Connection already in progress' };
-    }
-    
-    const totalConnections = this.peers.size + this.connectionLocks.size;
-    if (totalConnections >= this.p2pConfig.maxPeers) {
-      return { success: false, error: 'Max peers reached (including pending)' };
-    }
-    
-    if (retryAttempt >= this.p2pConfig.maxConnectionAttempts) {
-      this.blacklistPeer(nodeId, `Max connection attempts (${retryAttempt}) reached`);
-      return { success: false, error: 'Max attempts reached' };
-    }
-    
-    if (!peerInfo.ip || !normalizedPort) {
-      return { success: false, error: 'Missing peer IP or port' };
-    }
-    
-    this.connectionLocks.add(nodeId);
-    this.stats.connectionAttempts++;
-    
-    try {
-      const wsUrl = `ws://${peerInfo.ip}:${normalizedPort}/p2p`;
+    return new Promise((resolve) => {
+      let resolved = false;
       
-      console.log(`[P2P] Connecting to peer ${nodeId} at ${wsUrl} (attempt ${retryAttempt + 1}/${this.p2pConfig.maxConnectionAttempts})`);
-      
-      const ws = new WebSocket(wsUrl, {
-        headers: {
-          'X-Node-ID': this.nodeId,
-          'X-Node-IP': this.nodeIp || 'unknown',
-          'X-Node-Port': this.nodePort.toString(),
-          'X-Node-Mode': this.nodeMode
-        },
-        handshakeTimeout: this.p2pConfig.connectionTimeout
-      });
-      
-      return new Promise((resolve) => {
-        let resolved = false;
+      const cleanup = (success, result) => {
+        if (resolved) return;
+        resolved = true;
         
-        const cleanup = (success, result) => {
-          if (resolved) return;
-          resolved = true;
-          
-          if (!success) {
-            this.connectionLocks.delete(nodeId);
-          }
-          
-          if (timeoutHandle) {
-            clearTimeout(timeoutHandle);
-            timeoutHandle = null;
-          }
-          
-          resolve(result);
-        };
+        if (!success) {
+          this.connectionLocks.delete(nodeId);
+        }
         
-        let timeoutHandle = setTimeout(() => {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+        }
+        
+        resolve(result);
+      };
+      
+      let timeoutHandle = setTimeout(() => {
+        try {
+          ws.terminate(); 
+        } catch (e) {
+        }
+        
+        this.stats.connectionFailures++;
+        
+        if (this.peers.has(nodeId)) {
+          cleanup(false, { success: true, existing: true });
+          return;
+        }
+        
+        const totalNow = this.peers.size + this.connectionLocks.size - 1; 
+        if (totalNow >= this.p2pConfig.maxPeers) {
+          cleanup(false, { success: false, error: 'Max peers reached' });
+          return;
+        }
+        
+        if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
+          const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
+          console.log(`[P2P] Connection timeout, retrying in ${backoff}ms...`);
+          cleanup(false, { success: false, error: 'Connection timeout', willRetry: true });
+          
+          setTimeout(() => {
+            this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+          }, backoff);
+        } else {
+          cleanup(false, { success: false, error: 'Connection timeout' });
+        }
+      }, this.p2pConfig.connectionTimeout);
+      
+      ws.on('open', () => {
+        if (this.peers.size >= this.p2pConfig.maxPeers) {
+          console.log(`[P2P] Max peers reached during connection to ${nodeId}, closing`);
           try {
-            ws.terminate(); 
+            ws.close(4003, 'Max peers reached');
           } catch (e) {
           }
-          
-          this.stats.connectionFailures++;
-          
-          if (this.peers.has(nodeId)) {
-            cleanup(false, { success: true, existing: true });
-            return;
-          }
-          
-          const totalNow = this.peers.size + this.connectionLocks.size - 1; 
-          if (totalNow >= this.p2pConfig.maxPeers) {
-            cleanup(false, { success: false, error: 'Max peers reached' });
-            return;
-          }
-          
-          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
-            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
-            console.log(`[P2P] Connection timeout, retrying in ${backoff}ms...`);
-            cleanup(false, { success: false, error: 'Connection timeout', willRetry: true });
-            
-            setTimeout(() => {
-              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
-            }, backoff);
-          } else {
-            cleanup(false, { success: false, error: 'Connection timeout' });
-          }
-        }, this.p2pConfig.connectionTimeout);
+          cleanup(false, { success: false, error: 'Max peers reached' });
+          return;
+        }
         
-        ws.on('open', () => {
-          if (this.peers.size >= this.p2pConfig.maxPeers) {
-            console.log(`[P2P] Max peers reached during connection to ${nodeId}, closing`);
-            try {
-              ws.close(4003, 'Max peers reached');
-            } catch (e) {
-            }
-            cleanup(false, { success: false, error: 'Max peers reached' });
-            return;
-          }
-          
-          const peer = {
-            ws,
-            nodeId,
-            ip: peerInfo.ip,
-            port: normalizedPort,
-            mode: peerInfo.mode || 'DIRECT',
-            connected: true,
-            direct: true,
-            lastSeen: Date.now(),
-            lastHeartbeat: Date.now(),
-            messagesReceived: 0,
-            messagesSent: 0,
-            connectedAt: Date.now(),
-            capabilities: peerInfo.capabilities || null,
-            methodsVersion: peerInfo.methodsVersion || null,
-            methodsCount: peerInfo.methodsCount || 0
-          };
-          
-          this.peers.set(nodeId, peer);
-          this.connectionLocks.delete(nodeId);
-          this.stats.directConnections++;
-          this.stats.connectionSuccesses++;
-          
-          ws.on('message', (data) => {
-            this.handlePeerMessage(nodeId, data);
-          });
-          
-          ws.on('close', (code, reason) => {
-            console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
-            this.handlePeerDisconnected(nodeId, code, reason);
-          });
-          
-          ws.on('error', (error) => {
-            console.error(`[P2P] Peer ${nodeId} error:`, error.message);
-          });
-          
-          ws.on('pong', () => {
-            if (this.peers.has(nodeId)) {
-              this.peers.get(nodeId).lastSeen = Date.now();
-            }
-          });
-          
-          this.emit('peer_connected', {
-            nodeId,
-            ip: peerInfo.ip,
-            port: normalizedPort,
-            mode: peerInfo.mode || 'DIRECT',
-            direct: true
-          });
-          
-          this.processQueuedMessages(nodeId);
-          
-          console.log(`[P2P] Connected to peer ${nodeId} (${peerInfo.mode || 'DIRECT'}) successfully`);
-          cleanup(true, { success: true, direct: true });
+        const peer = {
+          ws,
+          nodeId,
+          ip: peerInfo.ip,
+          port: normalizedPort,
+          mode: peerInfo.mode || 'DIRECT',
+          connected: true,
+          direct: true,
+          lastSeen: Date.now(),
+          lastHeartbeat: Date.now(),
+          messagesReceived: 0,
+          messagesSent: 0,
+          connectedAt: Date.now(),
+          capabilities: peerInfo.capabilities || null,
+          methodsVersion: peerInfo.methodsVersion || null,
+          methodsCount: peerInfo.methodsCount || 0
+        };
+        
+        this.peers.set(nodeId, peer);
+        this.connectionLocks.delete(nodeId);
+        this.stats.directConnections++;
+        this.stats.connectionSuccesses++;
+        
+        ws.on('message', (data) => {
+          this.handlePeerMessage(nodeId, data);
+        });
+        
+        ws.on('close', (code, reason) => {
+          console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
+          this.handlePeerDisconnected(nodeId, code, reason);
         });
         
         ws.on('error', (error) => {
-          this.stats.connectionFailures++;
-          
-          console.log(`[P2P] Failed to connect to ${nodeId}: ${error.message}`);
-          
+          console.error(`[P2P] Peer ${nodeId} error:`, error.message);
+        });
+        
+        ws.on('pong', () => {
           if (this.peers.has(nodeId)) {
-            cleanup(false, { success: true, existing: true });
-            return;
-          }
-          
-          const totalNow = this.peers.size + this.connectionLocks.size - 1;
-          if (totalNow >= this.p2pConfig.maxPeers) {
-            cleanup(false, { success: false, error: 'Max peers reached' });
-            return;
-          }
-          
-          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
-            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
-            console.log(`[P2P] Retrying connection in ${backoff}ms...`);
-            cleanup(false, { success: false, error: error.message, willRetry: true });
-            
-            setTimeout(() => {
-              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
-            }, backoff);
-          } else {
-            cleanup(false, { success: false, error: error.message });
+            this.peers.get(nodeId).lastSeen = Date.now();
           }
         });
+        
+        this.emit('peer_connected', {
+          nodeId,
+          ip: peerInfo.ip,
+          port: normalizedPort,
+          mode: peerInfo.mode || 'DIRECT',
+          direct: true
+        });
+        
+        this.processQueuedMessages(nodeId);
+        
+        console.log(`[P2P] Connected to peer ${nodeId} at ${peerInfo.ip}:${normalizedPort} (${peerInfo.mode || 'DIRECT'}) successfully`);
+        cleanup(true, { success: true, direct: true });
       });
       
-    } catch (error) {
-      this.connectionLocks.delete(nodeId);
-      this.stats.connectionFailures++;
-      console.error(`[P2P] Connection error to ${nodeId}:`, error.message);
-      return { success: false, error: error.message };
-    }
+      ws.on('error', (error) => {
+        this.stats.connectionFailures++;
+        
+        console.log(`[P2P] Failed to connect to ${nodeId}: ${error.message}`);
+        
+        if (this.peers.has(nodeId)) {
+          cleanup(false, { success: true, existing: true });
+          return;
+        }
+        
+        const totalNow = this.peers.size + this.connectionLocks.size - 1;
+        if (totalNow >= this.p2pConfig.maxPeers) {
+          cleanup(false, { success: false, error: 'Max peers reached' });
+          return;
+        }
+        
+        if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
+          const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
+          console.log(`[P2P] Retrying connection in ${backoff}ms...`);
+          cleanup(false, { success: false, error: error.message, willRetry: true });
+          
+          setTimeout(() => {
+            this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+          }, backoff);
+        } else {
+          cleanup(false, { success: false, error: error.message });
+        }
+      });
+    });
+    
+  } catch (error) {
+    this.connectionLocks.delete(nodeId);
+    this.stats.connectionFailures++;
+    console.error(`[P2P] Connection error to ${nodeId}:`, error.message);
+    return { success: false, error: error.message };
   }
+}
   
   handlePeerMessage(nodeId, data) {
     try {
@@ -2095,82 +2105,89 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
     }, this.p2pConfig.autoConnectDelay);
   }
   
-  async autoConnectToPeers() {
-    if (this.isShuttingDown) {
-      return;
+  
+async autoConnectToPeers() {
+  if (this.isShuttingDown) {
+    return;
+  }
+  
+  const totalConnections = this.peers.size + this.connectionLocks.size;
+  if (totalConnections >= this.p2pConfig.maxPeers) {
+    console.log(`[P2P-AUTO] Max peers reached (${totalConnections}/${this.p2pConfig.maxPeers}), skipping auto-connect`);
+    return;
+  }
+  
+  const availablePeers = Array.from(this.knownPeers.values())
+    .filter(peer => {
+      // Tidak connect ke diri sendiri berdasarkan node ID
+      if (peer.nodeId === this.nodeId) return false;
+      
+      // Tidak connect jika IP DAN PORT sama
+      if (peer.ip === this.nodeIp && peer.port === this.nodePort) return false;
+      
+      // Filter lainnya
+      return (peer.mode === 'DIRECT' || peer.mode === 'REVERSE') &&
+             !this.peers.has(peer.nodeId) &&
+             !this.connectionLocks.has(peer.nodeId) &&  
+             !this.isBlacklisted(peer.nodeId);
+    })
+    .sort((a, b) => {
+      if (a.fromReferral && !b.fromReferral) return -1;
+      if (!a.fromReferral && b.fromReferral) return 1;
+      return b.lastUpdate - a.lastUpdate;
+    })
+    .slice(0, this.p2pConfig.maxPeers - totalConnections);
+    
+  if (availablePeers.length === 0) {
+    console.log('[P2P-AUTO] No available peers to connect');
+    return;
+  }
+  
+  console.log(`[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers (${availablePeers.filter(p => p.fromReferral).length} from referrals)...`);
+  this.stats.lastAutoConnect = Date.now();
+  
+  const maxParallel = 3;
+  for (let i = 0; i < availablePeers.length; i += maxParallel) {
+    if (this.isShuttingDown) break;
+    
+    const currentTotal = this.peers.size + this.connectionLocks.size;
+    if (currentTotal >= this.p2pConfig.maxPeers) {
+      console.log(`[P2P-AUTO] Max peers reached mid-batch, stopping`);
+      break;
     }
     
-    const totalConnections = this.peers.size + this.connectionLocks.size;
-    if (totalConnections >= this.p2pConfig.maxPeers) {
-      console.log(`[P2P-AUTO] Max peers reached (${totalConnections}/${this.p2pConfig.maxPeers}), skipping auto-connect`);
-      return;
-    }
+    const batch = availablePeers.slice(i, i + maxParallel);
     
-    const availablePeers = Array.from(this.knownPeers.values())
-      .filter(peer => 
-        (peer.mode === 'DIRECT' || peer.mode === 'REVERSE') &&
-        !this.peers.has(peer.nodeId) &&
-        !this.connectionLocks.has(peer.nodeId) &&  
-        !this.isBlacklisted(peer.nodeId) &&
-        !(peer.ip === this.nodeIp && peer.port === this.nodePort)
-      )
-      .sort((a, b) => {
-        if (a.fromReferral && !b.fromReferral) return -1;
-        if (!a.fromReferral && b.fromReferral) return 1;
-        return b.lastUpdate - a.lastUpdate;
-      })
-      .slice(0, this.p2pConfig.maxPeers - totalConnections);
-      
-    if (availablePeers.length === 0) {
-      console.log('[P2P-AUTO] No available peers to connect');
-      return;
-    }
-    
-    console.log(`[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers (${availablePeers.filter(p => p.fromReferral).length} from referrals)...`);
-    this.stats.lastAutoConnect = Date.now();
-    
-    const maxParallel = 3;
-    for (let i = 0; i < availablePeers.length; i += maxParallel) {
-      if (this.isShuttingDown) break;
-      
-      const currentTotal = this.peers.size + this.connectionLocks.size;
-      if (currentTotal >= this.p2pConfig.maxPeers) {
-        console.log(`[P2P-AUTO] Max peers reached mid-batch, stopping`);
-        break;
-      }
-      
-      const batch = availablePeers.slice(i, i + maxParallel);
-      
-      await Promise.all(
-        batch.map(async peer => {
-          const checkTotal = this.peers.size + this.connectionLocks.size;
-          if (checkTotal >= this.p2pConfig.maxPeers) {
-            return;
-          }
-          
-          try {
-            const result = await this.connectToPeer(peer.nodeId, peer);
-            if (result.success) {
-              const source = peer.fromReferral ? `referral from ${peer.referredBy}` : 'discovery';
-              console.log(`[P2P-AUTO] Connected to ${peer.nodeId} (${peer.mode}) via ${source}`);
-              
-              if (peer.fromReferral) {
-                this.stats.connectionsViaReferral++;
-              }
-            } else if (!result.willRetry) {
-              console.log(`[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`);
+    await Promise.all(
+      batch.map(async peer => {
+        const checkTotal = this.peers.size + this.connectionLocks.size;
+        if (checkTotal >= this.p2pConfig.maxPeers) {
+          return;
+        }
+        
+        try {
+          const result = await this.connectToPeer(peer.nodeId, peer);
+          if (result.success) {
+            const source = peer.fromReferral ? `referral from ${peer.referredBy}` : 'discovery';
+            console.log(`[P2P-AUTO] Connected to ${peer.nodeId} at ${peer.ip}:${peer.port} (${peer.mode}) via ${source}`);
+            
+            if (peer.fromReferral) {
+              this.stats.connectionsViaReferral++;
             }
-          } catch (error) {
-            console.error(`[P2P-AUTO] Error connecting to ${peer.nodeId}:`, error.message);
+          } else if (!result.willRetry) {
+            console.log(`[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`);
           }
-        })
-      );
-      
-      if (i + maxParallel < availablePeers.length) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
+        } catch (error) {
+          console.error(`[P2P-AUTO] Error connecting to ${peer.nodeId}:`, error.message);
+        }
+      })
+    );
+    
+    if (i + maxParallel < availablePeers.length) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
+}
   
   startPeerCleanup() {
     if (this.peerCleanupInterval) {
