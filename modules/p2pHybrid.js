@@ -98,6 +98,7 @@ class P2PHybridNode extends EventEmitter {
     
     this.isShuttingDown = false;
     
+    // Map<key, {eventName, handler}>
     this.requestHandlers = new Map();
     
     this.masterReachable = false;
@@ -200,6 +201,11 @@ class P2PHybridNode extends EventEmitter {
       console.log('[P2P] P2P is disabled');
       return false;
     }
+
+    if (this.isServerReady && this.wss) {
+      console.log('[P2P-SERVER] P2P server already started, skipping re-init');
+      return true;
+    }
     
     try {
       this.wss = new WebSocketServer({ 
@@ -218,6 +224,8 @@ class P2PHybridNode extends EventEmitter {
             this.wss.handleUpgrade(request, socket, head, (ws) => {
               this.wss.emit('connection', ws, request);
             });
+          } else {
+            socket.destroy();
           }
         } catch (error) {
           console.error('[P2P-SERVER] Upgrade error:', error.message);
@@ -291,181 +299,194 @@ class P2PHybridNode extends EventEmitter {
   }
   
   handleIncomingPeerConnection(ws, request) {
-  const remoteNodeId = request.headers['x-node-id'];
-  const remoteIp = request.headers['x-forwarded-for'] || 
-                   request.socket.remoteAddress?.replace('::ffff:', '');
-  const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
-  const remotePort = request.headers['x-node-port'] ? parseInt(request.headers['x-node-port'], 10) : null;
+    const remoteNodeId = request.headers['x-node-id'];
+    const remoteIpRaw = request.headers['x-forwarded-for'] || 
+                   request.socket.remoteAddress;
+    const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
+    const remotePortHeader = request.headers['x-node-port'];
+    const remotePort = remotePortHeader ? parseInt(remotePortHeader, 10) : null;
+
+    const remoteIp = typeof remoteIpRaw === 'string'
+      ? remoteIpRaw.replace('::ffff:', '')
+      : remoteIpRaw;
   
-  console.log('[P2P-SERVER] New peer connection attempt:', {
-    remoteNodeId,
-    remoteIp,
-    remotePort,
-    remoteMode
-  });
+    console.log('[P2P-SERVER] New peer connection attempt:', {
+      remoteNodeId,
+      remoteIp,
+      remotePort,
+      remoteMode
+    });
   
-  if (!remoteNodeId) {
-    console.log('[P2P-SERVER] Rejected: Missing node ID');
-    ws.close(4000, 'Missing node ID');
-    return;
-  }
+    if (!remoteNodeId) {
+      console.log('[P2P-SERVER] Rejected: Missing node ID');
+      ws.close(4000, 'Missing node ID');
+      return;
+    }
   
-  if (remoteNodeId === this.nodeId) {
-    console.log('[P2P-SERVER] Rejected: Self-connection attempt');
-    ws.close(4001, 'Cannot connect to self');
-    return;
-  }
+    if (remoteNodeId === this.nodeId) {
+      console.log('[P2P-SERVER] Rejected: Self-connection attempt');
+      ws.close(4001, 'Cannot connect to self');
+      return;
+    }
   
-  // FIX: Hanya tolak jika IP DAN PORT sama dengan node ini
-  // Mengizinkan koneksi dari IP sama dengan port berbeda
-  if (remoteIp === this.nodeIp && remotePort === this.nodePort) {
-    console.log('[P2P-SERVER] Rejected: Same IP and port as self');
-    ws.close(4001, 'Cannot connect to self (same IP:port)');
-    return;
-  }
+    // Tolak hanya jika IP DAN PORT sama dengan node ini
+    if (remoteIp === this.nodeIp && remotePort === this.nodePort) {
+      console.log('[P2P-SERVER] Rejected: Same IP and port as self');
+      ws.close(4001, 'Cannot connect to self (same IP:port)');
+      return;
+    }
   
-  if (this.isBlacklisted(remoteNodeId)) {
-    console.log('[P2P-SERVER] Rejected: Blacklisted');
-    ws.close(4002, 'Blacklisted');
-    return;
-  }
+    if (this.isBlacklisted(remoteNodeId)) {
+      console.log('[P2P-SERVER] Rejected: Blacklisted');
+      ws.close(4002, 'Blacklisted');
+      return;
+    }
   
-  // CHANGED: Add to known peers even if we can't connect
-  if (remoteIp && remotePort) {
-    this.knownPeers.set(remoteNodeId, {
+    // Add to known peers even if we can't connect
+    if (remoteIp && remotePort) {
+      this.knownPeers.set(remoteNodeId, {
+        nodeId: remoteNodeId,
+        ip: remoteIp,
+        port: remotePort,
+        mode: remoteMode,
+        reachable: true,
+        capabilities: null,
+        methodsVersion: null,
+        methodsCount: 0,
+        lastUpdate: Date.now()
+      });
+      console.log(`[P2P-SERVER] Added ${remoteNodeId} (${remoteIp}:${remotePort}) to known peers (${this.knownPeers.size} total)`);
+    }
+  
+    // Jika full, kirim referrals dan tolak
+    if (this.peers.size >= this.p2pConfig.maxPeers) {
+      console.log('[P2P-SERVER] Rejected: Max peers reached, sending referrals');
+      
+      const referrals = this.getPeerReferrals(remoteNodeId);
+      
+      this.stats.referralsSent++;
+      
+      try {
+        ws.send(JSON.stringify({
+          type: 'connection_rejected',
+          reason: 'max_peers_reached',
+          maxPeers: this.p2pConfig.maxPeers,
+          currentPeers: this.peers.size,
+          referrals: referrals,
+          referralCount: referrals.length,
+          nodeInfo: {
+            nodeId: this.nodeId,
+            ip: this.nodeIp,
+            port: this.nodePort
+          },
+          message: `This node is full (${this.peers.size}/${this.p2pConfig.maxPeers}). Try connecting to ${referrals.length} suggested peer(s).`
+        }));
+        
+        console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId}`);
+      } catch (error) {
+        console.error('[P2P-SERVER] Failed to send referrals:', error.message);
+      }
+      
+      setTimeout(() => {
+        ws.close(4003, 'Max peers reached - check referrals');
+      }, 500);
+      
+      return;
+    }
+  
+    if (this.peers.has(remoteNodeId)) {
+      console.log('[P2P-SERVER] Peer already connected, replacing old connection');
+      const oldPeer = this.peers.get(remoteNodeId);
+      try {
+        oldPeer.ws.close();
+      } catch (e) {}
+      this.peers.delete(remoteNodeId);
+    }
+  
+    const now = Date.now();
+    const peerInfo = {
+      ws,
       nodeId: remoteNodeId,
       ip: remoteIp,
       port: remotePort,
       mode: remoteMode,
-      reachable: true,
+      connected: true,
+      direct: true,
+      lastSeen: now,
+      lastHeartbeat: now,
+      messagesReceived: 0,
+      messagesSent: 0,
+      connectedAt: now,
       capabilities: null,
       methodsVersion: null,
-      methodsCount: 0,
-      lastUpdate: Date.now()
+      methodsCount: 0
+    };
+  
+    this.peers.set(remoteNodeId, peerInfo);
+    this.connectionLocks.delete(remoteNodeId);
+    this.stats.directConnections++;
+    this.stats.connectionSuccesses++;
+  
+    this.sendToPeer(remoteNodeId, {
+      type: 'welcome',
+      nodeId: this.nodeId,
+      ip: this.nodeIp,
+      port: this.nodePort,
+      mode: this.nodeMode,
+      timestamp: Date.now(),
+      capabilities: {
+        encryption: !!this.encryptionManager,
+        methods: Object.keys(this.methodsConfig),
+        methodsVersion: this.methodsVersionHash,
+        methodsCount: Object.keys(this.methodsConfig).length,
+        relay: this.p2pConfig.relayFallback && this.masterReachable,
+        fileSharing: true,
+        referrals: true,
+        version: '3.1'
+      }
     });
-    console.log(`[P2P-SERVER] Added ${remoteNodeId} (${remoteIp}:${remotePort}) to known peers (${this.knownPeers.size} total)`);
+  
+    ws.on('message', (data) => {
+      this.handlePeerMessage(remoteNodeId, data);
+    });
+  
+    ws.on('close', (code, reason) => {
+      console.log(`[P2P] Peer ${remoteNodeId} disconnected (code: ${code})`);
+      this.handlePeerDisconnected(remoteNodeId, code, reason);
+    });
+  
+    ws.on('error', (error) => {
+      console.error(`[P2P] Peer ${remoteNodeId} error:`, error.message);
+    });
+  
+    ws.on('pong', () => {
+      if (this.peers.has(remoteNodeId)) {
+        this.peers.get(remoteNodeId).lastSeen = Date.now();
+      }
+    });
+  
+    this.emit('peer_connected', {
+      nodeId: remoteNodeId,
+      ip: remoteIp,
+      port: remotePort,
+      mode: remoteMode,
+      direct: true
+    });
+  
+    this.processQueuedMessages(remoteNodeId);
+  
+    console.log(
+      `[P2P] Peer ${remoteNodeId} (${remoteMode}) at ${remoteIp}:${remotePort} connected successfully (` +
+      `${this.peers.size}/${this.p2pConfig.maxPeers})`
+    );
   }
-  
-  // CHANGED: Send referrals when max peers reached
-  if (this.peers.size >= this.p2pConfig.maxPeers) {
-    console.log('[P2P-SERVER] Rejected: Max peers reached, sending referrals');
-    
-    const referrals = this.getPeerReferrals(remoteNodeId);
-    
-    this.stats.referralsSent++;
-    
-    try {
-      ws.send(JSON.stringify({
-        type: 'connection_rejected',
-        reason: 'max_peers_reached',
-        maxPeers: this.p2pConfig.maxPeers,
-        currentPeers: this.peers.size,
-        referrals: referrals,
-        referralCount: referrals.length,
-        nodeInfo: {
-          nodeId: this.nodeId,
-          ip: this.nodeIp,
-          port: this.nodePort
-        },
-        message: `This node is full (${this.peers.size}/${this.p2pConfig.maxPeers}). Try connecting to ${referrals.length} suggested peer(s).`
-      }));
-      
-      console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId}`);
-    } catch (error) {
-      console.error('[P2P-SERVER] Failed to send referrals:', error.message);
-    }
-    
-    setTimeout(() => {
-      ws.close(4003, 'Max peers reached - check referrals');
-    }, 500);
-    
-    return;
-  }
-  
-  if (this.peers.has(remoteNodeId)) {
-    console.log('[P2P-SERVER] Peer already connected, replacing old connection');
-    const oldPeer = this.peers.get(remoteNodeId);
-    try {
-      oldPeer.ws.close();
-    } catch (e) {}
-    this.peers.delete(remoteNodeId);
-  }
-  
-  const peerInfo = {
-    ws,
-    nodeId: remoteNodeId,
-    ip: remoteIp,
-    port: remotePort,
-    mode: remoteMode,
-    connected: true,
-    direct: true,
-    lastSeen: Date.now(),
-    lastHeartbeat: Date.now(),
-    messagesReceived: 0,
-    messagesSent: 0,
-    connectedAt: Date.now(),
-    capabilities: null,
-    methodsVersion: null,
-    methodsCount: 0
-  };
-  
-  this.peers.set(remoteNodeId, peerInfo);
-  this.connectionLocks.delete(remoteNodeId);
-  this.stats.directConnections++;
-  this.stats.connectionSuccesses++;
-  
-  this.sendToPeer(remoteNodeId, {
-    type: 'welcome',
-    nodeId: this.nodeId,
-    ip: this.nodeIp,
-    port: this.nodePort,
-    mode: this.nodeMode,
-    timestamp: Date.now(),
-    capabilities: {
-      encryption: !!this.encryptionManager,
-      methods: Object.keys(this.methodsConfig),
-      methodsVersion: this.methodsVersionHash,
-      methodsCount: Object.keys(this.methodsConfig).length,
-      relay: this.p2pConfig.relayFallback && this.masterReachable,
-      fileSharing: true,
-      referrals: true,
-      version: '3.1'
-    }
-  });
-  
-  ws.on('message', (data) => {
-    this.handlePeerMessage(remoteNodeId, data);
-  });
-  
-  ws.on('close', (code, reason) => {
-    console.log(`[P2P] Peer ${remoteNodeId} disconnected (code: ${code})`);
-    this.handlePeerDisconnected(remoteNodeId, code, reason);
-  });
-  
-  ws.on('error', (error) => {
-    console.error(`[P2P] Peer ${remoteNodeId} error:`, error.message);
-  });
-  
-  ws.on('pong', () => {
-    if (this.peers.has(remoteNodeId)) {
-      this.peers.get(remoteNodeId).lastSeen = Date.now();
-    }
-  });
-  
-  this.emit('peer_connected', {
-    nodeId: remoteNodeId,
-    ip: remoteIp,
-    port: remotePort,
-    mode: remoteMode,
-    direct: true
-  });
-  
-  this.processQueuedMessages(remoteNodeId);
-  
-  console.log(`[P2P] Peer ${remoteNodeId} (${remoteMode}) at ${remoteIp}:${remotePort} connected successfully (${this.peers.size}/${this.p2pConfig.maxPeers})`);
-}
   
   handlePeerDisconnected(nodeId, code, reason) {
+    if (!this.peers.has(nodeId) && !this.connectionLocks.has(nodeId)) {
+      // Sudah dibersihkan sebelumnya
+      return;
+    }
+
     this.peers.delete(nodeId);
     this.connectionLocks.delete(nodeId);
     
@@ -493,14 +514,19 @@ class P2PHybridNode extends EventEmitter {
   blacklistPeer(nodeId, reason, duration = null) {
     const until = Date.now() + (duration || this.p2pConfig.blacklistDuration);
     this.peerBlacklist.set(nodeId, { reason, until });
-    console.log(`[P2P] Blacklisted peer ${nodeId} for ${Math.round((until - Date.now())/1000)}s: ${reason}`);
+    console.log(
+      `[P2P] Blacklisted peer ${nodeId} for ${Math.round((until - Date.now())/1000)}s: ${reason}`
+    );
   }
   
   normalizePort(port) {
     if (typeof port === 'string') {
-      return parseInt(port, 10);
+      const parsed = parseInt(port, 10);
+      if (Number.isNaN(parsed)) return null;
+      return parsed;
     }
-    return port;
+    if (typeof port === 'number') return port;
+    return null;
   }
   
   // NEW METHOD: Handle connection rejection with referrals
@@ -532,7 +558,7 @@ class P2PHybridNode extends EventEmitter {
         this.knownPeers.set(referral.nodeId, {
           nodeId: referral.nodeId,
           ip: referral.ip,
-          port: referral.port,
+          port: this.normalizePort(referral.port),
           mode: referral.mode || 'DIRECT',
           reachable: true,
           capabilities: null,
@@ -543,7 +569,9 @@ class P2PHybridNode extends EventEmitter {
           referredBy: nodeId
         });
         
-        console.log(`[P2P-REFERRAL] Added peer ${referral.nodeId} (${referral.ip}:${referral.port}) to known peers`);
+        console.log(
+          `[P2P-REFERRAL] Added peer ${referral.nodeId} (${referral.ip}:${referral.port}) to known peers`
+        );
       }
     }
     
@@ -568,7 +596,9 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
     
-    console.log(`[P2P-REFERRAL] Connecting to up to ${Math.min(availableSlots, referrals.length)} referral peer(s)`);
+    console.log(
+      `[P2P-REFERRAL] Connecting to up to ${Math.min(availableSlots, referrals.length)} referral peer(s)`
+    );
     
     let connected = 0;
     
@@ -589,7 +619,8 @@ class P2PHybridNode extends EventEmitter {
         const result = await this.connectToPeer(referral.nodeId, {
           ip: referral.ip,
           port: referral.port,
-          mode: referral.mode || 'DIRECT'
+          mode: referral.mode || 'DIRECT',
+          methodsCount: referral.methodsCount || 0
         });
         
         if (result.success) {
@@ -597,13 +628,18 @@ class P2PHybridNode extends EventEmitter {
           this.stats.connectionsViaReferral++;
           console.log(`[P2P-REFERRAL] ✓ Connected to referral peer ${referral.nodeId}`);
         } else {
-          console.log(`[P2P-REFERRAL] ✗ Failed to connect to ${referral.nodeId}: ${result.error}`);
+          console.log(
+            `[P2P-REFERRAL] ✗ Failed to connect to ${referral.nodeId}: ${result.error}`
+          );
         }
         
         await new Promise(resolve => setTimeout(resolve, 1000));
         
       } catch (error) {
-        console.error(`[P2P-REFERRAL] Error connecting to ${referral.nodeId}:`, error.message);
+        console.error(
+          `[P2P-REFERRAL] Error connecting to ${referral.nodeId}:`,
+          error.message
+        );
       }
     }
     
@@ -611,217 +647,224 @@ class P2PHybridNode extends EventEmitter {
   }
   
   async connectToPeer(nodeId, peerInfo, retryAttempt = 0) {
-  if (nodeId === this.nodeId) {
-    return { success: false, error: 'Cannot connect to self' };
-  }
-  
-  const normalizedPort = this.normalizePort(peerInfo.port);
-  
-  // FIX: Hanya tolak jika IP DAN PORT sama dengan node ini
-  // Mengizinkan koneksi ke IP sama dengan port berbeda
-  if (peerInfo.ip === this.nodeIp && normalizedPort === this.nodePort) {
-    return { success: false, error: 'Cannot connect to self (same IP:port)' };
-  }
-  
-  if (this.peers.has(nodeId)) {
-    return { success: true, existing: true };
-  }
-  
-  if (this.isBlacklisted(nodeId)) {
-    return { success: false, error: 'Peer is blacklisted' };
-  }
-  
-  if (this.connectionLocks.has(nodeId)) {
-    return { success: false, error: 'Connection already in progress' };
-  }
-  
-  const totalConnections = this.peers.size + this.connectionLocks.size;
-  if (totalConnections >= this.p2pConfig.maxPeers) {
-    return { success: false, error: 'Max peers reached (including pending)' };
-  }
-  
-  if (retryAttempt >= this.p2pConfig.maxConnectionAttempts) {
-    this.blacklistPeer(nodeId, `Max connection attempts (${retryAttempt}) reached`);
-    return { success: false, error: 'Max attempts reached' };
-  }
-  
-  if (!peerInfo.ip || !normalizedPort) {
-    return { success: false, error: 'Missing peer IP or port' };
-  }
-  
-  this.connectionLocks.add(nodeId);
-  this.stats.connectionAttempts++;
-  
-  try {
-    const wsUrl = `ws://${peerInfo.ip}:${normalizedPort}/p2p`;
+    if (nodeId === this.nodeId) {
+      return { success: false, error: 'Cannot connect to self' };
+    }
     
-    console.log(`[P2P] Connecting to peer ${nodeId} at ${wsUrl} (attempt ${retryAttempt + 1}/${this.p2pConfig.maxConnectionAttempts})`);
+    const normalizedPort = this.normalizePort(peerInfo.port);
     
-    const ws = new WebSocket(wsUrl, {
-      headers: {
-        'X-Node-ID': this.nodeId,
-        'X-Node-IP': this.nodeIp || 'unknown',
-        'X-Node-Port': this.nodePort.toString(),
-        'X-Node-Mode': this.nodeMode
-      },
-      handshakeTimeout: this.p2pConfig.connectionTimeout
-    });
+    // Tolak jika IP DAN PORT sama dengan node ini
+    if (peerInfo.ip === this.nodeIp && normalizedPort === this.nodePort) {
+      return { success: false, error: 'Cannot connect to self (same IP:port)' };
+    }
     
-    return new Promise((resolve) => {
-      let resolved = false;
+    if (this.peers.has(nodeId)) {
+      return { success: true, existing: true };
+    }
+    
+    if (this.isBlacklisted(nodeId)) {
+      return { success: false, error: 'Peer is blacklisted' };
+    }
+    
+    if (this.connectionLocks.has(nodeId)) {
+      return { success: false, error: 'Connection already in progress' };
+    }
+    
+    const totalConnections = this.peers.size + this.connectionLocks.size;
+    if (totalConnections >= this.p2pConfig.maxPeers) {
+      return { success: false, error: 'Max peers reached (including pending)' };
+    }
+    
+    if (retryAttempt >= this.p2pConfig.maxConnectionAttempts) {
+      this.blacklistPeer(nodeId, `Max connection attempts (${retryAttempt}) reached`);
+      return { success: false, error: 'Max attempts reached' };
+    }
+    
+    if (!peerInfo.ip || !normalizedPort) {
+      return { success: false, error: 'Missing peer IP or port' };
+    }
+    
+    this.connectionLocks.add(nodeId);
+    this.stats.connectionAttempts++;
+    
+    try {
+      const wsUrl = `ws://${peerInfo.ip}:${normalizedPort}/p2p`;
       
-      const cleanup = (success, result) => {
-        if (resolved) return;
-        resolved = true;
-        
-        if (!success) {
-          this.connectionLocks.delete(nodeId);
-        }
-        
-        if (timeoutHandle) {
-          clearTimeout(timeoutHandle);
-          timeoutHandle = null;
-        }
-        
-        resolve(result);
-      };
+      console.log(
+        `[P2P] Connecting to peer ${nodeId} at ${wsUrl} ` +
+        `(attempt ${retryAttempt + 1}/${this.p2pConfig.maxConnectionAttempts})`
+      );
       
-      let timeoutHandle = setTimeout(() => {
-        try {
-          ws.terminate(); 
-        } catch (e) {
-        }
-        
-        this.stats.connectionFailures++;
-        
-        if (this.peers.has(nodeId)) {
-          cleanup(false, { success: true, existing: true });
-          return;
-        }
-        
-        const totalNow = this.peers.size + this.connectionLocks.size - 1; 
-        if (totalNow >= this.p2pConfig.maxPeers) {
-          cleanup(false, { success: false, error: 'Max peers reached' });
-          return;
-        }
-        
-        if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
-          const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
-          console.log(`[P2P] Connection timeout, retrying in ${backoff}ms...`);
-          cleanup(false, { success: false, error: 'Connection timeout', willRetry: true });
-          
-          setTimeout(() => {
-            this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
-          }, backoff);
-        } else {
-          cleanup(false, { success: false, error: 'Connection timeout' });
-        }
-      }, this.p2pConfig.connectionTimeout);
+      const ws = new WebSocket(wsUrl, {
+        headers: {
+          'X-Node-ID': this.nodeId,
+          'X-Node-IP': this.nodeIp || 'unknown',
+          'X-Node-Port': this.nodePort.toString(),
+          'X-Node-Mode': this.nodeMode
+        },
+        handshakeTimeout: this.p2pConfig.connectionTimeout
+      });
       
-      ws.on('open', () => {
-        if (this.peers.size >= this.p2pConfig.maxPeers) {
-          console.log(`[P2P] Max peers reached during connection to ${nodeId}, closing`);
-          try {
-            ws.close(4003, 'Max peers reached');
-          } catch (e) {
+      return new Promise((resolve) => {
+        let resolved = false;
+        let timeoutHandle = null;
+        
+        const finish = (result, keepLock) => {
+          if (resolved) return;
+          resolved = true;
+
+          if (!keepLock) {
+            this.connectionLocks.delete(nodeId);
           }
-          cleanup(false, { success: false, error: 'Max peers reached' });
-          return;
-        }
-        
-        const peer = {
-          ws,
-          nodeId,
-          ip: peerInfo.ip,
-          port: normalizedPort,
-          mode: peerInfo.mode || 'DIRECT',
-          connected: true,
-          direct: true,
-          lastSeen: Date.now(),
-          lastHeartbeat: Date.now(),
-          messagesReceived: 0,
-          messagesSent: 0,
-          connectedAt: Date.now(),
-          capabilities: peerInfo.capabilities || null,
-          methodsVersion: peerInfo.methodsVersion || null,
-          methodsCount: peerInfo.methodsCount || 0
+
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+            timeoutHandle = null;
+          }
+
+          resolve(result);
         };
         
-        this.peers.set(nodeId, peer);
-        this.connectionLocks.delete(nodeId);
-        this.stats.directConnections++;
-        this.stats.connectionSuccesses++;
+        timeoutHandle = setTimeout(() => {
+          try {
+            ws.terminate(); 
+          } catch (e) {}
+          
+          this.stats.connectionFailures++;
+          
+          if (this.peers.has(nodeId)) {
+            // sudah berhasil terhubung
+            finish({ success: true, existing: true }, true);
+            return;
+          }
+          
+          const totalNow = this.peers.size + this.connectionLocks.size - 1; 
+          if (totalNow >= this.p2pConfig.maxPeers) {
+            finish({ success: false, error: 'Max peers reached' }, false);
+            return;
+          }
+          
+          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
+            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
+            console.log(`[P2P] Connection timeout, retrying in ${backoff}ms...`);
+            finish({ success: false, error: 'Connection timeout', willRetry: true }, false);
+            
+            setTimeout(() => {
+              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+            }, backoff);
+          } else {
+            finish({ success: false, error: 'Connection timeout' }, false);
+          }
+        }, this.p2pConfig.connectionTimeout);
         
-        ws.on('message', (data) => {
-          this.handlePeerMessage(nodeId, data);
-        });
-        
-        ws.on('close', (code, reason) => {
-          console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
-          this.handlePeerDisconnected(nodeId, code, reason);
+        ws.on('open', () => {
+          if (this.peers.size >= this.p2pConfig.maxPeers) {
+            console.log(`[P2P] Max peers reached during connection to ${nodeId}, closing`);
+            try {
+              ws.close(4003, 'Max peers reached');
+            } catch (e) {}
+            finish({ success: false, error: 'Max peers reached' }, false);
+            return;
+          }
+          
+          const now = Date.now();
+          const peer = {
+            ws,
+            nodeId,
+            ip: peerInfo.ip,
+            port: normalizedPort,
+            mode: peerInfo.mode || 'DIRECT',
+            connected: true,
+            direct: true,
+            lastSeen: now,
+            lastHeartbeat: now,
+            messagesReceived: 0,
+            messagesSent: 0,
+            connectedAt: now,
+            capabilities: peerInfo.capabilities || null,
+            methodsVersion: peerInfo.methodsVersion || null,
+            methodsCount: peerInfo.methodsCount || 0
+          };
+          
+          this.peers.set(nodeId, peer);
+          this.connectionLocks.delete(nodeId);
+          this.stats.directConnections++;
+          this.stats.connectionSuccesses++;
+          
+          ws.on('message', (data) => {
+            this.handlePeerMessage(nodeId, data);
+          });
+          
+          ws.on('close', (code, reason) => {
+            console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
+            this.handlePeerDisconnected(nodeId, code, reason);
+          });
+          
+          ws.on('error', (error) => {
+            console.error(`[P2P] Peer ${nodeId} error:`, error.message);
+          });
+          
+          ws.on('pong', () => {
+            if (this.peers.has(nodeId)) {
+              this.peers.get(nodeId).lastSeen = Date.now();
+            }
+          });
+          
+          this.emit('peer_connected', {
+            nodeId,
+            ip: peerInfo.ip,
+            port: normalizedPort,
+            mode: peerInfo.mode || 'DIRECT',
+            direct: true
+          });
+          
+          this.processQueuedMessages(nodeId);
+          
+          console.log(
+            `[P2P] Connected to peer ${nodeId} at ${peerInfo.ip}:${normalizedPort} `
+            + `(${peerInfo.mode || 'DIRECT'}) successfully`
+          );
+          finish({ success: true, direct: true }, true);
         });
         
         ws.on('error', (error) => {
-          console.error(`[P2P] Peer ${nodeId} error:`, error.message);
-        });
-        
-        ws.on('pong', () => {
+          this.stats.connectionFailures++;
+          
+          console.log(`[P2P] Failed to connect to ${nodeId}: ${error.message}`);
+          
           if (this.peers.has(nodeId)) {
-            this.peers.get(nodeId).lastSeen = Date.now();
+            // koneksi sudah ada
+            finish({ success: true, existing: true }, true);
+            return;
+          }
+          
+          const totalNow = this.peers.size + this.connectionLocks.size - 1;
+          if (totalNow >= this.p2pConfig.maxPeers) {
+            finish({ success: false, error: 'Max peers reached' }, false);
+            return;
+          }
+          
+          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
+            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
+            console.log(`[P2P] Retrying connection in ${backoff}ms...`);
+            finish({ success: false, error: error.message, willRetry: true }, false);
+            
+            setTimeout(() => {
+              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+            }, backoff);
+          } else {
+            finish({ success: false, error: error.message }, false);
           }
         });
-        
-        this.emit('peer_connected', {
-          nodeId,
-          ip: peerInfo.ip,
-          port: normalizedPort,
-          mode: peerInfo.mode || 'DIRECT',
-          direct: true
-        });
-        
-        this.processQueuedMessages(nodeId);
-        
-        console.log(`[P2P] Connected to peer ${nodeId} at ${peerInfo.ip}:${normalizedPort} (${peerInfo.mode || 'DIRECT'}) successfully`);
-        cleanup(true, { success: true, direct: true });
       });
       
-      ws.on('error', (error) => {
-        this.stats.connectionFailures++;
-        
-        console.log(`[P2P] Failed to connect to ${nodeId}: ${error.message}`);
-        
-        if (this.peers.has(nodeId)) {
-          cleanup(false, { success: true, existing: true });
-          return;
-        }
-        
-        const totalNow = this.peers.size + this.connectionLocks.size - 1;
-        if (totalNow >= this.p2pConfig.maxPeers) {
-          cleanup(false, { success: false, error: 'Max peers reached' });
-          return;
-        }
-        
-        if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
-          const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
-          console.log(`[P2P] Retrying connection in ${backoff}ms...`);
-          cleanup(false, { success: false, error: error.message, willRetry: true });
-          
-          setTimeout(() => {
-            this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
-          }, backoff);
-        } else {
-          cleanup(false, { success: false, error: error.message });
-        }
-      });
-    });
-    
-  } catch (error) {
-    this.connectionLocks.delete(nodeId);
-    this.stats.connectionFailures++;
-    console.error(`[P2P] Connection error to ${nodeId}:`, error.message);
-    return { success: false, error: error.message };
+    } catch (error) {
+      this.connectionLocks.delete(nodeId);
+      this.stats.connectionFailures++;
+      console.error(`[P2P] Connection error to ${nodeId}:`, error.message);
+      return { success: false, error: error.message };
+    }
   }
-}
   
   handlePeerMessage(nodeId, data) {
     try {
@@ -965,7 +1008,9 @@ class P2PHybridNode extends EventEmitter {
       
       if (this.p2pConfig.preferP2PSync && peer.methodsVersion && 
           peer.methodsVersion !== this.methodsVersionHash) {
-        console.log(`[P2P-METHODS] Peer ${nodeId} has different methods version, checking...`);
+        console.log(
+          `[P2P-METHODS] Peer ${nodeId} has different methods version, checking...`
+        );
         setTimeout(() => this.requestMethodsVersionFromPeer(nodeId), 1000);
       }
     }
@@ -1173,7 +1218,10 @@ class P2PHybridNode extends EventEmitter {
   handleMethodsVersionResponse(nodeId, message) {
     const { requestId, methodsVersion, methodsCount, lastUpdate } = message;
     
-    console.log(`[P2P-METHODS] Peer ${nodeId} has methods version ${methodsVersion?.substring(0, 8)}, count: ${methodsCount}`);
+    console.log(
+      `[P2P-METHODS] Peer ${nodeId} has methods version ${methodsVersion?.substring(0, 8)}, ` +
+      `count: ${methodsCount}`
+    );
     
     if (this.peers.has(nodeId)) {
       const peer = this.peers.get(nodeId);
@@ -1217,156 +1265,161 @@ class P2PHybridNode extends EventEmitter {
   }
   
   async handleMethodsResponse(nodeId, message) {
-  const { requestId, methods, methodsVersion, methodsCount } = message;
+    const { requestId, methods, methodsVersion, methodsCount } = message;
   
-  console.log(`[P2P-METHODS] Received methods from peer ${nodeId}: ${methodsCount} methods`);
+    console.log(
+      `[P2P-METHODS] Received methods from peer ${nodeId}: ${methodsCount} methods`
+    );
   
-  if (!methods || typeof methods !== 'object') {
-    console.error('[P2P-METHODS] Invalid methods received from peer');
-    return;
-  }
-  
-  try {
-    const normalized = JSON.stringify(methods, Object.keys(methods).sort());
-    const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
-    
-    if (calculatedHash !== methodsVersion) {
-      console.error('[P2P-METHODS] Methods version mismatch, rejecting');
+    if (!methods || typeof methods !== 'object') {
+      console.error('[P2P-METHODS] Invalid methods received from peer');
       return;
     }
-    
-    // CRITICAL FIX: Normalize methods to use local paths
-    // This prevents using peer's paths which would cause execution failures
-    const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
-    
-    if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
-      console.error('[P2P-METHODS] Failed to normalize methods from peer');
-      return;
+  
+    try {
+      const normalized = JSON.stringify(methods, Object.keys(methods).sort());
+      const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
+      
+      if (calculatedHash !== methodsVersion) {
+        console.error('[P2P-METHODS] Methods version mismatch, rejecting');
+        return;
+      }
+      
+      // CRITICAL FIX: Normalize methods to use local paths
+      const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
+      
+      if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+        console.error('[P2P-METHODS] Failed to normalize methods from peer');
+        return;
+      }
+      
+      this.methodsConfig = normalizedMethods;
+      this.methodsVersionHash = methodsVersion;
+      this.methodsLastUpdate = Date.now();
+      
+      console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
+      this.stats.methodSyncsFromPeers++;
+      
+      this.emit('methods_response', {
+        nodeId,
+        requestId,
+        methods: normalizedMethods,
+        methodsVersion,
+        methodsCount
+      });
+
+      this.emit('methods_updated_from_peer', {
+        nodeId,
+        methods: normalizedMethods,
+        methodsVersion,
+        methodsCount,
+        source: 'request_response'
+      });
+      
+      // Propagate IMMEDIATELY
+      setImmediate(() => {
+        this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
+      });
+      
+    } catch (error) {
+      console.error('[P2P-METHODS] Error processing methods from peer:', error.message);
     }
-    
-    this.methodsConfig = normalizedMethods;
-    this.methodsVersionHash = methodsVersion;
-    this.methodsLastUpdate = Date.now();
-    
-    console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
-    this.stats.methodSyncsFromPeers++;
-    
-    this.emit('methods_updated_from_peer', {
-      nodeId,
-      methods: normalizedMethods,  // Use normalized methods
-      methodsVersion,
-      methodsCount,
-      source: 'request_response'
-    });
-    
-    // IMPROVED: Propagate IMMEDIATELY to other peers (no setTimeout)
-    setImmediate(() => {
-      this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
-    });
-    
-  } catch (error) {
-    console.error('[P2P-METHODS] Error processing methods from peer:', error.message);
   }
-}
   
   handleMethodsPush(nodeId, message) {
-  const { methods, methodsVersion, methodsCount } = message;
+    const { methods, methodsVersion, methodsCount } = message;
   
-  console.log(`[P2P-METHODS] Received PROACTIVE methods push from ${nodeId}: ${methodsCount} methods`);
+    console.log(
+      `[P2P-METHODS] Received PROACTIVE methods push from ${nodeId}: ${methodsCount} methods`
+    );
   
-  if (!methods || typeof methods !== 'object') {
-    console.error('[P2P-METHODS] Invalid methods in push');
-    return;
+    if (!methods || typeof methods !== 'object') {
+      console.error('[P2P-METHODS] Invalid methods in push');
+      return;
+    }
+  
+    try {
+      const normalized = JSON.stringify(methods, Object.keys(methods).sort());
+      const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
+      
+      if (calculatedHash !== methodsVersion) {
+        console.error('[P2P-METHODS] Methods version mismatch in push, rejecting');
+        return;
+      }
+      
+      if (methodsVersion === this.methodsVersionHash) {
+        console.log('[P2P-METHODS] Already have this version, skipping');
+        return;
+      }
+      
+      // Normalize methods to use local paths
+      const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
+      
+      if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+        console.error('[P2P-METHODS] Failed to normalize methods from push');
+        return;
+      }
+      
+      this.methodsConfig = normalizedMethods;
+      this.methodsVersionHash = methodsVersion;
+      this.methodsLastUpdate = Date.now();
+      
+      console.log(`[P2P-METHODS] ✓ Updated methods from PROACTIVE push by ${nodeId}`);
+      this.stats.methodSyncsFromPeers++;
+      
+      this.emit('methods_updated_from_peer', {
+        nodeId,
+        methods: normalizedMethods,
+        methodsVersion,
+        methodsCount,
+        source: 'proactive_push'
+      });
+      
+      // Propagate to other peers IMMEDIATELY
+      setImmediate(() => {
+        this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
+      });
+      
+    } catch (error) {
+      console.error('[P2P-METHODS] Error processing methods push:', error.message);
+    }
   }
-  
-  try {
-    // Verify hash
-    const normalized = JSON.stringify(methods, Object.keys(methods).sort());
-    const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
-    
-    if (calculatedHash !== methodsVersion) {
-      console.error('[P2P-METHODS] Methods version mismatch in push, rejecting');
-      return;
-    }
-    
-    // Check if newer
-    if (methodsVersion === this.methodsVersionHash) {
-      console.log('[P2P-METHODS] Already have this version, skipping');
-      return;
-    }
-    
-    // CRITICAL FIX: Normalize methods to use local paths
-    const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
-    
-    if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
-      console.error('[P2P-METHODS] Failed to normalize methods from push');
-      return;
-    }
-    
-    // Update immediately
-    this.methodsConfig = normalizedMethods;
-    this.methodsVersionHash = methodsVersion;
-    this.methodsLastUpdate = Date.now();
-    
-    console.log(`[P2P-METHODS] ✓ Updated methods from PROACTIVE push by ${nodeId}`);
-    this.stats.methodSyncsFromPeers++;
-    
-    // Emit event
-    this.emit('methods_updated_from_peer', {
-      nodeId,
-      methods: normalizedMethods,  // Use normalized methods
-      methodsVersion,
-      methodsCount,
-      source: 'proactive_push'
-    });
-    
-    // Propagate to other peers IMMEDIATELY
-    setImmediate(() => {
-      this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
-    });
-    
-  } catch (error) {
-    console.error('[P2P-METHODS] Error processing methods push:', error.message);
-  }
-}
   
   handleMethodsUpdateNotification(nodeId, message) {
-  const { methodsVersion, methodsCount, sourceNodeId } = message;
+    const { methodsVersion, methodsCount, sourceNodeId } = message;
   
-  console.log(`[P2P-METHODS] Update notification from ${nodeId}: version ${methodsVersion?.substring(0, 8)}`);
+    console.log(
+      `[P2P-METHODS] Update notification from ${nodeId}: version ${methodsVersion?.substring(0, 8)}`
+    );
   
-  // Check if we're already processing this version
-  if (this.methodUpdatePropagationLock.has(methodsVersion)) {
-    console.log('[P2P-METHODS] Already processing this update, skipping');
-    return;
+    if (this.methodUpdatePropagationLock.has(methodsVersion)) {
+      console.log('[P2P-METHODS] Already processing this update, skipping');
+      return;
+    }
+  
+    this.methodUpdatePropagationLock.add(methodsVersion);
+  
+    setTimeout(() => {
+      this.methodUpdatePropagationLock.delete(methodsVersion);
+    }, 30000);
+  
+    if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
+      console.log(`[P2P-METHODS] New version detected, requesting from ${nodeId}...`);
+      
+      this.requestMethodsFromPeer(nodeId).then(result => {
+        if (result && result.success !== false) {
+          console.log('[P2P-METHODS] ✓ Successfully synced from peer');
+          
+          const propagated = this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
+          console.log(
+            `[P2P-METHODS] ✓ Propagated to ${propagated} peer(s) immediately`
+          );
+        }
+      }).catch(error => {
+        console.error('[P2P-METHODS] Failed to sync from peer:', error.message);
+      });
+    }
   }
-  
-  // Lock this version to prevent duplicate processing
-  this.methodUpdatePropagationLock.add(methodsVersion);
-  
-  // Clear lock after 30 seconds
-  setTimeout(() => {
-    this.methodUpdatePropagationLock.delete(methodsVersion);
-  }, 30000);
-  
-  // Check if we need this update
-  if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
-    console.log(`[P2P-METHODS] New version detected, requesting from ${nodeId}...`);
-    
-    // IMPROVED: Request immediately without delay
-    this.requestMethodsFromPeer(nodeId).then(result => {
-      if (result && result.success !== false) {
-        console.log('[P2P-METHODS] ✓ Successfully synced from peer');
-        
-        // IMPROVED: Propagate to other peers IMMEDIATELY (no setTimeout)
-        const propagated = this.propagateMethodsUpdateImmediate(nodeId, methodsVersion);
-        console.log(`[P2P-METHODS] ✓ Propagated to ${propagated} peer(s) immediately`);
-      }
-    }).catch(error => {
-      console.error('[P2P-METHODS] Failed to sync from peer:', error.message);
-    });
-  }
-}
   
   handleFileRequest(nodeId, message) {
     const { requestId, filename } = message;
@@ -1438,13 +1491,14 @@ class P2PHybridNode extends EventEmitter {
     
     return new Promise((resolve) => {
       let timeoutId = null;
-      let handlerKey = `methods_version_response_${requestId}`;
+      const handlerKey = `methods_version_response_${requestId}`;
+      const eventName = 'methods_version_response';
       
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
         if (this.requestHandlers.has(handlerKey)) {
-          const handler = this.requestHandlers.get(handlerKey);
-          this.removeListener('methods_version_response', handler);
+          const { handler } = this.requestHandlers.get(handlerKey);
+          this.removeListener(eventName, handler);
           this.requestHandlers.delete(handlerKey);
         }
       };
@@ -1456,8 +1510,8 @@ class P2PHybridNode extends EventEmitter {
         }
       };
       
-      this.requestHandlers.set(handlerKey, handler);
-      this.on('methods_version_response', handler);
+      this.requestHandlers.set(handlerKey, { eventName, handler });
+      this.on(eventName, handler);
       
       timeoutId = setTimeout(() => {
         cleanup();
@@ -1482,13 +1536,14 @@ class P2PHybridNode extends EventEmitter {
     
     return new Promise((resolve) => {
       let timeoutId = null;
-      let handlerKey = `methods_response_${requestId}`;
+      const handlerKey = `methods_response_${requestId}`;
+      const eventName = 'methods_response';
       
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
         if (this.requestHandlers.has(handlerKey)) {
-          const handler = this.requestHandlers.get(handlerKey);
-          this.removeListener('methods_response', handler);
+          const { handler } = this.requestHandlers.get(handlerKey);
+          this.removeListener(eventName, handler);
           this.requestHandlers.delete(handlerKey);
         }
       };
@@ -1500,8 +1555,8 @@ class P2PHybridNode extends EventEmitter {
         }
       };
       
-      this.requestHandlers.set(handlerKey, handler);
-      this.on('methods_response', handler);
+      this.requestHandlers.set(handlerKey, { eventName, handler });
+      this.on(eventName, handler);
       
       timeoutId = setTimeout(() => {
         cleanup();
@@ -1526,13 +1581,14 @@ class P2PHybridNode extends EventEmitter {
     
     return new Promise((resolve) => {
       let timeoutId = null;
-      let handlerKey = `file_received_${requestId}`;
+      const handlerKey = `file_received_${requestId}`;
+      const eventName = 'file_received';
       
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
         if (this.requestHandlers.has(handlerKey)) {
-          const handler = this.requestHandlers.get(handlerKey);
-          this.removeListener('file_received', handler);
+          const { handler } = this.requestHandlers.get(handlerKey);
+          this.removeListener(eventName, handler);
           this.requestHandlers.delete(handlerKey);
         }
       };
@@ -1544,8 +1600,8 @@ class P2PHybridNode extends EventEmitter {
         }
       };
       
-      this.requestHandlers.set(handlerKey, handler);
-      this.on('file_received', handler);
+      this.requestHandlers.set(handlerKey, { eventName, handler });
+      this.on(eventName, handler);
       
       timeoutId = setTimeout(() => {
         cleanup();
@@ -1567,79 +1623,79 @@ class P2PHybridNode extends EventEmitter {
   }
   
   propagateMethodsUpdateImmediate(excludeNodeId = null, versionHash = null) {
-  const version = versionHash || this.methodsVersionHash;
-  
-  console.log('[P2P-METHODS] Propagating methods update IMMEDIATELY to all peers');
-  
-  let notified = 0;
-  const notificationPromises = [];
-  
-  for (const [nodeId, peer] of this.peers) {
-    if (excludeNodeId && nodeId === excludeNodeId) {
-      continue;
-    }
+    const version = versionHash || this.methodsVersionHash;
     
-    // Only notify if peer has different version
-    if (peer.methodsVersion !== version) {
+    console.log('[P2P-METHODS] Propagating methods update IMMEDIATELY to all peers');
+    
+    let notified = 0;
+    const notificationPromises = [];
+    
+    for (const [nodeId, peer] of this.peers) {
+      if (excludeNodeId && nodeId === excludeNodeId) {
+        continue;
+      }
+      
+      if (peer.methodsVersion === version) {
+        continue;
+      }
+
       const notification = {
         type: 'methods_update_notification',
         methodsVersion: version,
         methodsCount: Object.keys(this.methodsConfig).length,
         sourceNodeId: excludeNodeId || this.nodeId,
         timestamp: Date.now(),
-        urgent: true // Flag for immediate processing
+        urgent: true
       };
       
-      // Send immediately and track promise
       const sent = this.sendToPeer(nodeId, notification);
       
       if (sent) {
         notified++;
         console.log(`[P2P-METHODS] ✓ Notified ${nodeId} immediately`);
         
-        // Also proactively send the full methods config
-        // This eliminates the need for the peer to request it
         notificationPromises.push(
           this.sendMethodsConfigToPeer(nodeId, version)
         );
       }
     }
+    
+    Promise.all(notificationPromises).then(() => {
+      console.log(`[P2P-METHODS] ✓ Completed propagation to ${notified} peer(s)`);
+    }).catch(error => {
+      console.error('[P2P-METHODS] Error in propagation:', error.message);
+    });
+    
+    return notified;
   }
-  
-  // Wait for all propagations to complete
-  Promise.all(notificationPromises).then(() => {
-    console.log(`[P2P-METHODS] ✓ Completed propagation to ${notified} peer(s)`);
-  }).catch(error => {
-    console.error('[P2P-METHODS] Error in propagation:', error.message);
-  });
-  
-  return notified;
-}
 
-async sendMethodsConfigToPeer(nodeId, versionHash) {
-  try {
-    const message = {
-      type: 'methods_push', // Proactive push
-      nodeId: this.nodeId,
-      methods: this.methodsConfig,
-      methodsVersion: versionHash,
-      methodsCount: Object.keys(this.methodsConfig).length,
-      timestamp: Date.now()
-    };
-    
-    const sent = this.sendToPeer(nodeId, message);
-    
-    if (sent) {
-      console.log(`[P2P-METHODS] ✓ Pushed full config to ${nodeId}`);
-      this.stats.filesShared++;
+  async sendMethodsConfigToPeer(nodeId, versionHash) {
+    try {
+      const message = {
+        type: 'methods_push',
+        nodeId: this.nodeId,
+        methods: this.methodsConfig,
+        methodsVersion: versionHash,
+        methodsCount: Object.keys(this.methodsConfig).length,
+        timestamp: Date.now()
+      };
+      
+      const sent = this.sendToPeer(nodeId, message);
+      
+      if (sent) {
+        console.log(`[P2P-METHODS] ✓ Pushed full config to ${nodeId}`);
+        this.stats.filesShared++;
+      }
+      
+      return sent;
+    } catch (error) {
+      console.error(
+        `[P2P-METHODS] Failed to push config to ${nodeId}:`,
+        error.message
+      );
+      return false;
     }
-    
-    return sent;
-  } catch (error) {
-    console.error(`[P2P-METHODS] Failed to push config to ${nodeId}:`, error.message);
-    return false;
   }
-}
   
   async syncMethodsFromPeers() {
     if (this.peers.size === 0) {
@@ -1660,9 +1716,14 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
     }
     
     if (bestPeer) {
-      console.log(`[P2P-METHODS] Found peer ${bestPeer} with ${maxMethods} methods, syncing...`);
+      console.log(
+        `[P2P-METHODS] Found peer ${bestPeer} with ${maxMethods} methods, syncing...`
+      );
       const result = await this.requestMethodsFromPeer(bestPeer);
-      return result;
+      if (result && result.success !== false) {
+        return { success: true, fromPeer: bestPeer };
+      }
+      return { success: false, error: result?.error || 'Sync failed' };
     } else {
       console.log('[P2P-METHODS] All peers have same or fewer methods');
       return { success: false, error: 'No peer with newer methods' };
@@ -1674,7 +1735,9 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
       clearInterval(this.methodSyncInterval);
     }
     
-    console.log(`[P2P-METHODS] Starting method sync checker every ${this.p2pConfig.methodSyncInterval}ms`);
+    console.log(
+      `[P2P-METHODS] Starting method sync checker every ${this.p2pConfig.methodSyncInterval}ms`
+    );
     
     this.methodSyncInterval = setInterval(async () => {
       if (this.isShuttingDown || !this.p2pConfig.preferP2PSync) return;
@@ -1713,7 +1776,9 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
         this.stats.messagesSent++;
         return true;
       } else {
-        console.log(`[P2P] Peer ${nodeId} WebSocket not open, queuing message`);
+        console.log(
+          `[P2P] Peer ${nodeId} WebSocket not open (state: ${peer.ws.readyState}), queuing message`
+        );
         return this.queueMessage(nodeId, message);
       }
     } catch (error) {
@@ -1759,11 +1824,15 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
     
     const peer = this.peers.get(nodeId);
     if (!peer || !peer.ws || peer.ws.readyState !== WebSocket.OPEN) {
-      console.log(`[P2P] Peer ${nodeId} not ready, keeping ${queue.length} queued message(s)`);
+      console.log(
+        `[P2P] Peer ${nodeId} not ready, keeping ${queue.length} queued message(s)`
+      );
       return;
     }
     
-    console.log(`[P2P] Processing ${queue.length} queued messages for ${nodeId}`);
+    console.log(
+      `[P2P] Processing ${queue.length} queued messages for ${nodeId}`
+    );
     
     let sent = 0;
     let failed = 0;
@@ -1775,14 +1844,19 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
         this.stats.messagesSent++;
         sent++;
       } catch (error) {
-        console.error(`[P2P] Failed to flush queued message to ${nodeId}:`, error.message);
+        console.error(
+          `[P2P] Failed to flush queued message to ${nodeId}:`,
+          error.message
+        );
         failed++;
       }
     }
     
     this.messageQueue.delete(nodeId);
     
-    console.log(`[P2P] Processed queue for ${nodeId}: ${sent} sent, ${failed} failed`);
+    console.log(
+      `[P2P] Processed queue for ${nodeId}: ${sent} sent, ${failed} failed`
+    );
   }
   
   broadcastToPeers(message, excludeNodeId = null) {
@@ -1833,7 +1907,9 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
       };
     }
 
-    console.log(`[P2P-ATTACK-BROADCAST] Broadcasting attack to ${peersToUse.length} peer(s)`);
+    console.log(
+      `[P2P-ATTACK-BROADCAST] Broadcasting attack to ${peersToUse.length} peer(s)`
+    );
 
     const results = [];
     let successCount = 0;
@@ -1858,7 +1934,10 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
             };
           } catch (err) {
             failedCount++;
-            console.error(`[P2P-ATTACK-BROADCAST] Error requesting attack from ${nodeId}:`, err.message);
+            console.error(
+              `[P2P-ATTACK-BROADCAST] Error requesting attack from ${nodeId}:`,
+              err.message
+            );
             return {
               nodeId,
               success: false,
@@ -1892,7 +1971,8 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
     
     return new Promise((resolve) => {
       let timeoutId = null;
-      let handlerKey = `attack_response_${requestId}`;
+      const handlerKey = `attack_response_${requestId}`;
+      const eventName = 'attack_response';
       
       const cleanup = () => {
         if (timeoutId) {
@@ -1900,8 +1980,8 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
           timeoutId = null;
         }
         if (this.requestHandlers.has(handlerKey)) {
-          const handler = this.requestHandlers.get(handlerKey);
-          this.removeListener('attack_response', handler);
+          const { handler } = this.requestHandlers.get(handlerKey);
+          this.removeListener(eventName, handler);
           this.requestHandlers.delete(handlerKey);
         }
       };
@@ -1913,8 +1993,8 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
         }
       };
       
-      this.requestHandlers.set(handlerKey, handler);
-      this.on('attack_response', handler);
+      this.requestHandlers.set(handlerKey, { eventName, handler });
+      this.on(eventName, handler);
       
       timeoutId = setTimeout(() => {
         cleanup();
@@ -1942,13 +2022,14 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
     
     return new Promise((resolve) => {
       let timeoutId = null;
-      let handlerKey = `status_response_${requestId}`;
+      const handlerKey = `status_response_${requestId}`;
+      const eventName = 'status_response';
       
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
         if (this.requestHandlers.has(handlerKey)) {
-          const handler = this.requestHandlers.get(handlerKey);
-          this.removeListener('status_response', handler);
+          const { handler } = this.requestHandlers.get(handlerKey);
+          this.removeListener(eventName, handler);
           this.requestHandlers.delete(handlerKey);
         }
       };
@@ -1960,8 +2041,8 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
         }
       };
       
-      this.requestHandlers.set(handlerKey, handler);
-      this.on('status_response', handler);
+      this.requestHandlers.set(handlerKey, { eventName, handler });
+      this.on(eventName, handler);
       
       timeoutId = setTimeout(() => {
         cleanup();
@@ -1985,20 +2066,21 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
       return { success: false, error: 'Relay disabled' };
     }
     
-    for (const [nodeId, peer] of this.peers) {
+    for (const [nodeId] of this.peers) {
       if (nodeId === targetNodeId) continue;
       
       const relayId = crypto.randomBytes(8).toString('hex');
       
       return new Promise((resolve) => {
         let timeoutId = null;
-        let handlerKey = `relay_response_${relayId}`;
+        const handlerKey = `relay_response_${relayId}`;
+        const eventName = 'relay_response';
         
         const cleanup = () => {
           if (timeoutId) clearTimeout(timeoutId);
           if (this.requestHandlers.has(handlerKey)) {
-            const handler = this.requestHandlers.get(handlerKey);
-            this.removeListener('relay_response', handler);
+            const { handler } = this.requestHandlers.get(handlerKey);
+            this.removeListener(eventName, handler);
             this.requestHandlers.delete(handlerKey);
           }
         };
@@ -2010,8 +2092,8 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
           }
         };
         
-        this.requestHandlers.set(handlerKey, handler);
-        this.on('relay_response', handler);
+        this.requestHandlers.set(handlerKey, { eventName, handler });
+        this.on(eventName, handler);
         
         timeoutId = setTimeout(() => {
           cleanup();
@@ -2035,7 +2117,9 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
       clearInterval(this.discoveryInterval);
     }
     
-    console.log(`[P2P-DISCOVERY] Starting peer discovery every ${this.p2pConfig.discoveryInterval}ms`);
+    console.log(
+      `[P2P-DISCOVERY] Starting peer discovery every ${this.p2pConfig.discoveryInterval}ms`
+    );
     
     setTimeout(() => this.discoverPeers(), 5000);
     
@@ -2094,7 +2178,9 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
       clearInterval(this.autoConnectInterval);
     }
     
-    console.log(`[P2P-AUTO] Starting auto-connector every ${this.p2pConfig.autoConnectDelay}ms`);
+    console.log(
+      `[P2P-AUTO] Starting auto-connector every ${this.p2pConfig.autoConnectDelay}ms`
+    );
     
     setTimeout(() => this.autoConnectToPeers(), this.p2pConfig.autoConnectDelay);
     
@@ -2105,89 +2191,97 @@ async sendMethodsConfigToPeer(nodeId, versionHash) {
     }, this.p2pConfig.autoConnectDelay);
   }
   
-  
-async autoConnectToPeers() {
-  if (this.isShuttingDown) {
-    return;
-  }
-  
-  const totalConnections = this.peers.size + this.connectionLocks.size;
-  if (totalConnections >= this.p2pConfig.maxPeers) {
-    console.log(`[P2P-AUTO] Max peers reached (${totalConnections}/${this.p2pConfig.maxPeers}), skipping auto-connect`);
-    return;
-  }
-  
-  const availablePeers = Array.from(this.knownPeers.values())
-    .filter(peer => {
-      // Tidak connect ke diri sendiri berdasarkan node ID
-      if (peer.nodeId === this.nodeId) return false;
-      
-      // Tidak connect jika IP DAN PORT sama
-      if (peer.ip === this.nodeIp && peer.port === this.nodePort) return false;
-      
-      // Filter lainnya
-      return (peer.mode === 'DIRECT' || peer.mode === 'REVERSE') &&
-             !this.peers.has(peer.nodeId) &&
-             !this.connectionLocks.has(peer.nodeId) &&  
-             !this.isBlacklisted(peer.nodeId);
-    })
-    .sort((a, b) => {
-      if (a.fromReferral && !b.fromReferral) return -1;
-      if (!a.fromReferral && b.fromReferral) return 1;
-      return b.lastUpdate - a.lastUpdate;
-    })
-    .slice(0, this.p2pConfig.maxPeers - totalConnections);
-    
-  if (availablePeers.length === 0) {
-    console.log('[P2P-AUTO] No available peers to connect');
-    return;
-  }
-  
-  console.log(`[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers (${availablePeers.filter(p => p.fromReferral).length} from referrals)...`);
-  this.stats.lastAutoConnect = Date.now();
-  
-  const maxParallel = 3;
-  for (let i = 0; i < availablePeers.length; i += maxParallel) {
-    if (this.isShuttingDown) break;
-    
-    const currentTotal = this.peers.size + this.connectionLocks.size;
-    if (currentTotal >= this.p2pConfig.maxPeers) {
-      console.log(`[P2P-AUTO] Max peers reached mid-batch, stopping`);
-      break;
+  async autoConnectToPeers() {
+    if (this.isShuttingDown) {
+      return;
     }
     
-    const batch = availablePeers.slice(i, i + maxParallel);
+    const totalConnections = this.peers.size + this.connectionLocks.size;
+    if (totalConnections >= this.p2pConfig.maxPeers) {
+      console.log(
+        `[P2P-AUTO] Max peers reached (${totalConnections}/${this.p2pConfig.maxPeers}), skipping auto-connect`
+      );
+      return;
+    }
     
-    await Promise.all(
-      batch.map(async peer => {
-        const checkTotal = this.peers.size + this.connectionLocks.size;
-        if (checkTotal >= this.p2pConfig.maxPeers) {
-          return;
-        }
+    const availablePeers = Array.from(this.knownPeers.values())
+      .filter(peer => {
+        if (peer.nodeId === this.nodeId) return false;
+        if (peer.ip === this.nodeIp && peer.port === this.nodePort) return false;
         
-        try {
-          const result = await this.connectToPeer(peer.nodeId, peer);
-          if (result.success) {
-            const source = peer.fromReferral ? `referral from ${peer.referredBy}` : 'discovery';
-            console.log(`[P2P-AUTO] Connected to ${peer.nodeId} at ${peer.ip}:${peer.port} (${peer.mode}) via ${source}`);
-            
-            if (peer.fromReferral) {
-              this.stats.connectionsViaReferral++;
-            }
-          } else if (!result.willRetry) {
-            console.log(`[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`);
-          }
-        } catch (error) {
-          console.error(`[P2P-AUTO] Error connecting to ${peer.nodeId}:`, error.message);
-        }
+        return (peer.mode === 'DIRECT' || peer.mode === 'REVERSE') &&
+               !this.peers.has(peer.nodeId) &&
+               !this.connectionLocks.has(peer.nodeId) &&  
+               !this.isBlacklisted(peer.nodeId);
       })
-    );
+      .sort((a, b) => {
+        if (a.fromReferral && !b.fromReferral) return -1;
+        if (!a.fromReferral && b.fromReferral) return 1;
+        return b.lastUpdate - a.lastUpdate;
+      })
+      .slice(0, this.p2pConfig.maxPeers - totalConnections);
+      
+    if (availablePeers.length === 0) {
+      console.log('[P2P-AUTO] No available peers to connect');
+      return;
+    }
     
-    if (i + maxParallel < availablePeers.length) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
+    console.log(
+      `[P2P-AUTO] Auto-connecting to ${availablePeers.length} peers ` +
+      `(${availablePeers.filter(p => p.fromReferral).length} from referrals)...`
+    );
+    this.stats.lastAutoConnect = Date.now();
+    
+    const maxParallel = 3;
+    for (let i = 0; i < availablePeers.length; i += maxParallel) {
+      if (this.isShuttingDown) break;
+      
+      const currentTotal = this.peers.size + this.connectionLocks.size;
+      if (currentTotal >= this.p2pConfig.maxPeers) {
+        console.log('[P2P-AUTO] Max peers reached mid-batch, stopping');
+        break;
+      }
+      
+      const batch = availablePeers.slice(i, i + maxParallel);
+      
+      await Promise.all(
+        batch.map(async peer => {
+          const checkTotal = this.peers.size + this.connectionLocks.size;
+          if (checkTotal >= this.p2pConfig.maxPeers) {
+            return;
+          }
+          
+          try {
+            const result = await this.connectToPeer(peer.nodeId, peer);
+            if (result.success) {
+              const source = peer.fromReferral ? `referral from ${peer.referredBy}` : 'discovery';
+              console.log(
+                `[P2P-AUTO] Connected to ${peer.nodeId} at ${peer.ip}:${peer.port} ` +
+                `(${peer.mode}) via ${source}`
+              );
+              
+              if (peer.fromReferral) {
+                this.stats.connectionsViaReferral++;
+              }
+            } else if (!result.willRetry) {
+              console.log(
+                `[P2P-AUTO] Failed to connect to ${peer.nodeId}: ${result.error}`
+              );
+            }
+          } catch (error) {
+            console.error(
+              `[P2P-AUTO] Error connecting to ${peer.nodeId}:`,
+              error.message
+            );
+          }
+        })
+      );
+      
+      if (i + maxParallel < availablePeers.length) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
     }
   }
-}
   
   startPeerCleanup() {
     if (this.peerCleanupInterval) {
@@ -2304,7 +2398,9 @@ async autoConnectToPeers() {
       
     }, this.p2pConfig.heartbeatInterval);
     
-    console.log(`[P2P-HEARTBEAT] Peer heartbeat started (${this.p2pConfig.heartbeatInterval}ms)`);
+    console.log(
+      `[P2P-HEARTBEAT] Peer heartbeat started (${this.p2pConfig.heartbeatInterval}ms)`
+    );
   }
   
   getStatus() {
@@ -2422,9 +2518,10 @@ async autoConnectToPeers() {
       this.methodSyncInterval = null;
     }
     
-    for (const [key, handler] of this.requestHandlers) {
-      const eventType = key.split('_').slice(0, -1).join('_') + '_response';
-      this.removeListener(eventType, handler);
+    // Bersihkan semua requestHandlers secara benar
+    for (const [key, value] of this.requestHandlers) {
+      const { eventName, handler } = value;
+      this.removeListener(eventName, handler);
     }
     this.requestHandlers.clear();
     
