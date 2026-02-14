@@ -1,14 +1,23 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { promisify } from 'util';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const writeFileAtomic = promisify(fs.writeFile);
+const renameAtomic = promisify(fs.rename);
+const unlinkAtomic = promisify(fs.unlink);
+
 function createProxyUpdater(config) {
-  let updateInterval = null;
+  // FIX #44: Use lock object with timestamp
+  let updateLock = null;
+  const lockTimeout = 300000; // 5 minutes max lock time
   let isRunning = false;
+  
   const proxyFile = path.join(__dirname, '..', 'proxy.txt');
+  const tempFile = path.join(__dirname, '..', 'proxy.txt.tmp');
   
   const defaultSources = [
     'https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/refs/heads/main/http/raw/all.txt',
@@ -22,6 +31,92 @@ function createProxyUpdater(config) {
   ];
   
   const proxySources = config?.PROXY?.SOURCES || defaultSources;
+  
+  // FIX #44: Acquire lock with timeout check
+  function acquireLock() {
+    const now = Date.now();
+    
+    if (updateLock) {
+      const lockAge = now - updateLock;
+      if (lockAge < lockTimeout) {
+        return false; // Lock still valid
+      } else {
+        console.log(`[PROXY] Stale lock detected (${Math.round(lockAge/1000)}s old), clearing`);
+        updateLock = null;
+      }
+    }
+    
+    updateLock = now;
+    return true;
+  }
+  
+  function releaseLock() {
+    updateLock = null;
+  }
+  
+  // FIX #47: Validate proxy IP address
+  function isValidProxyIP(ip) {
+    const parts = ip.split('.');
+    
+    if (parts.length !== 4) return false;
+    
+    for (const part of parts) {
+      const num = parseInt(part, 10);
+      if (isNaN(num) || num < 0 || num > 255) return false;
+    }
+    
+    // Reject private/reserved IP ranges
+    const first = parseInt(parts[0], 10);
+    const second = parseInt(parts[1], 10);
+    
+    // 0.0.0.0/8 - Current network
+    if (first === 0) return false;
+    
+    // 10.0.0.0/8 - Private network
+    if (first === 10) return false;
+    
+    // 127.0.0.0/8 - Loopback
+    if (first === 127) return false;
+    
+    // 169.254.0.0/16 - Link-local
+    if (first === 169 && second === 254) return false;
+    
+    // 172.16.0.0/12 - Private network
+    if (first === 172 && second >= 16 && second <= 31) return false;
+    
+    // 192.168.0.0/16 - Private network
+    if (first === 192 && second === 168) return false;
+    
+    // 224.0.0.0/4 - Multicast
+    if (first >= 224 && first <= 239) return false;
+    
+    // 240.0.0.0/4 - Reserved
+    if (first >= 240) return false;
+    
+    return true;
+  }
+  
+  // FIX #47: Improved proxy validation
+  function isValidProxy(ip, port) {
+    // Validate IP
+    if (!isValidProxyIP(ip)) {
+      return false;
+    }
+    
+    // Validate port
+    const portNum = parseInt(port, 10);
+    if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      return false;
+    }
+    
+    // Reject common non-proxy ports
+    const bannedPorts = [22, 23, 25,443, 465, 587, 993, 995];
+    if (bannedPorts.includes(portNum)) {
+      return false;
+    }
+    
+    return true;
+  }
   
   async function downloadProxies(sourceUrl) {
     try {
@@ -44,7 +139,23 @@ function createProxyUpdater(config) {
           throw new Error(`HTTP ${response.status}`);
         }
         
-        return await response.text();
+        // FIX #45: Stream response in chunks to avoid memory spike
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let result = '';
+        let chunk;
+        
+        while (!(chunk = await reader.read()).done) {
+          result += decoder.decode(chunk.value, { stream: true });
+          
+          // FIX #45: Limit max size to prevent memory issues
+          if (result.length > 10 * 1024 * 1024) { // 10MB max
+            console.log('[PROXY] Response too large, truncating');
+            break;
+          }
+        }
+        
+        return result;
       } catch (error) {
         clearTimeout(timeout);
         throw error;
@@ -55,44 +166,54 @@ function createProxyUpdater(config) {
     }
   }
   
+  // FIX #45: Process proxies in streaming fashion
   function parseProxies(proxyText) {
     if (!proxyText) return [];
     
     const proxies = new Set();
+    let validCount = 0;
+    let invalidCount = 0;
     
+    // FIX #45: Process line by line to avoid large array allocation
     const lines = proxyText.split('\n');
-    for (let line of lines) {
-      line = line.trim();
+    
+    for (let i = 0; i < lines.length; i++) {
+      let line = lines[i].trim();
       
       if (!line || line.startsWith('#') || line.startsWith('//')) continue;
       
+      // Extract IP:PORT pattern
       const match = line.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})/);
       if (match) {
         const ip = match[1];
         const port = match[2];
         
-        const ipValid = ip.split('.').every(part => {
-          const num = parseInt(part);
-          return num >= 0 && num <= 255;
-        });
-        
-        const portNum = parseInt(port);
-        const portValid = portNum >= 1 && portNum <= 65535;
-        
-        if (ipValid && portValid) {
+        // FIX #47: Use improved validation
+        if (isValidProxy(ip, port)) {
           proxies.add(`${ip}:${port}`);
+          validCount++;
+        } else {
+          invalidCount++;
         }
       }
+      
+      // FIX #45: Periodically clear processed lines to free memory
+      if (i % 1000 === 0 && i > 0) {
+        lines.splice(0, i);
+        i = 0;
+      }
     }
+    
+    console.log(`[PROXY] Parsed: ${validCount} valid, ${invalidCount} invalid`);
     
     return Array.from(proxies);
   }
   
   async function updateProxyFile() {
-    // FIX #1: Prevent concurrent updates
-    if (isRunning) {
-      console.log('[PROXY] Update already running, skip');
-      return { success: false, error: 'Already running' };
+    // FIX #44: Proper lock acquisition
+    if (!acquireLock()) {
+      console.log('[PROXY] Update already running (locked), skip');
+      return { success: false, error: 'Update in progress' };
     }
     
     try {
@@ -106,7 +227,7 @@ function createProxyUpdater(config) {
         total: proxySources.length
       };
       
-      // FIX #2: Process sources sequentially to avoid stack overflow
+      // FIX #45: Process sources sequentially with memory management
       for (let i = 0; i < proxySources.length; i++) {
         const source = proxySources[i];
         
@@ -116,7 +237,13 @@ function createProxyUpdater(config) {
           if (data) {
             const proxies = parseProxies(data);
             console.log(`[PROXY] ✓ Got ${proxies.length} from source ${i + 1}/${proxySources.length}`);
-            allProxies.push(...proxies);
+            
+            // FIX #45: Add in batches to avoid huge array concat
+            for (let j = 0; j < proxies.length; j += 1000) {
+              const batch = proxies.slice(j, j + 1000);
+              allProxies.push(...batch);
+            }
+            
             sourceResults.success++;
           } else {
             console.log(`[PROXY] ✗ Source ${i + 1}/${proxySources.length} failed`);
@@ -127,17 +254,27 @@ function createProxyUpdater(config) {
           sourceResults.failed++;
         }
         
-        // FIX #3: Add delay between sources to avoid rate limiting
+        // Delay between sources to avoid rate limiting
         if (i < proxySources.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 1000));
         }
+        
+        // FIX #45: Force garbage collection hint after each source
+        if (global.gc && i % 3 === 0) {
+          global.gc();
+        }
       }
       
-      // FIX #4: Deduplicate proxies efficiently
+      // FIX #45: Deduplicate efficiently using Set
+      console.log('[PROXY] Deduplicating proxies...');
       const uniqueProxies = [...new Set(allProxies)];
+      
+      // Clear original array to free memory
+      allProxies.length = 0;
       
       if (uniqueProxies.length === 0) {
         console.log('[PROXY] ✗ No proxies found from any source');
+        releaseLock();
         return { 
           success: false, 
           error: 'No proxies found',
@@ -145,12 +282,41 @@ function createProxyUpdater(config) {
         };
       }
       
-      // FIX #5: Write to file safely
+      // FIX #46: Write to temp file first, then atomic rename
       const content = uniqueProxies.join('\n');
+      
       try {
-        fs.writeFileSync(proxyFile, content, 'utf8');
+        // Write to temporary file
+        await writeFileAtomic(tempFile, content, 'utf8');
+        console.log('[PROXY] ✓ Wrote to temporary file');
+        
+        // Verify temp file
+        if (!fs.existsSync(tempFile)) {
+          throw new Error('Temp file not created');
+        }
+        
+        const tempStats = fs.statSync(tempFile);
+        if (tempStats.size === 0) {
+          throw new Error('Temp file is empty');
+        }
+        
+        // Atomic rename (replaces old file)
+        await renameAtomic(tempFile, proxyFile);
+        console.log('[PROXY] ✓ Atomically replaced proxy file');
+        
       } catch (writeError) {
         console.error('[PROXY] ✗ Failed to write proxy file:', writeError.message);
+        
+        // Cleanup temp file if it exists
+        try {
+          if (fs.existsSync(tempFile)) {
+            await unlinkAtomic(tempFile);
+          }
+        } catch (cleanupErr) {
+          console.error('[PROXY] Failed to cleanup temp file:', cleanupErr.message);
+        }
+        
+        releaseLock();
         return {
           success: false,
           error: `Write failed: ${writeError.message}`,
@@ -161,6 +327,7 @@ function createProxyUpdater(config) {
       console.log(`[PROXY] ✓ Updated! ${uniqueProxies.length} proxies saved`);
       console.log(`[PROXY] Sources: ${sourceResults.success} success, ${sourceResults.failed} failed`);
       
+      releaseLock();
       return { 
         success: true, 
         count: uniqueProxies.length,
@@ -171,11 +338,14 @@ function createProxyUpdater(config) {
     } catch (error) {
       console.error('[PROXY] ✗ Update failed:', error.message);
       console.error('[PROXY] Stack trace:', error.stack);
+      releaseLock();
       return { success: false, error: error.message };
     } finally {
       isRunning = false;
     }
   }
+  
+  let updateInterval = null;
   
   function startAutoUpdate(intervalMinutes = 10) {
     stopAutoUpdate();
@@ -184,7 +354,7 @@ function createProxyUpdater(config) {
     
     console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes`);
     
-    // FIX #6: Initial update with error handling
+    // Initial update with error handling
     updateProxyFile()
       .then(result => {
         if (result.success) {
@@ -197,7 +367,7 @@ function createProxyUpdater(config) {
         console.error('[PROXY] Initial update error:', error.message);
       });
     
-    // FIX #7: Interval with error handling
+    // Interval with error handling
     updateInterval = setInterval(() => {
       console.log(`[PROXY] Auto-update triggered`);
       updateProxyFile().catch(error => {
@@ -247,6 +417,46 @@ function createProxyUpdater(config) {
     return await updateProxyFile();
   }
   
+  // Get update status
+  function getUpdateStatus() {
+    return {
+      running: isRunning,
+      locked: updateLock !== null,
+      lockAge: updateLock ? Date.now() - updateLock : null,
+      autoUpdateEnabled: updateInterval !== null,
+      proxyCount: getProxyCount(),
+      proxyFileExists: fs.existsSync(proxyFile),
+      tempFileExists: fs.existsSync(tempFile)
+    };
+  }
+  
+  // Force unlock (use with caution)
+  function forceUnlock() {
+    if (updateLock) {
+      const lockAge = Date.now() - updateLock;
+      console.log(`[PROXY] Force unlocking (lock age: ${Math.round(lockAge/1000)}s)`);
+      releaseLock();
+      isRunning = false;
+      return true;
+    }
+    return false;
+  }
+  
+  // Cleanup temp files
+  function cleanupTempFiles() {
+    try {
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+        console.log('[PROXY] Cleaned up temp file');
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error('[PROXY] Failed to cleanup temp file:', error.message);
+      return false;
+    }
+  }
+  
   return {
     updateProxyFile,
     startAutoUpdate,
@@ -254,7 +464,11 @@ function createProxyUpdater(config) {
     manualUpdate,
     getProxyCount,
     getProxyList,
-    isUpdating: () => isRunning
+    getUpdateStatus,
+    forceUnlock,
+    cleanupTempFiles,
+    isUpdating: () => isRunning,
+    isLocked: () => updateLock !== null
   };
 }
 
