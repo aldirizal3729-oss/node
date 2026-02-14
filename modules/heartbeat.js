@@ -8,7 +8,7 @@ const execPromise = promisify(exec);
 async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
+
   try {
     const response = await globalThis.fetch(url, {
       ...options,
@@ -26,14 +26,14 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
 }
 
 async function createHeartbeat(config, executor, methodsConfig) {
-  if (!config || !config.NODE || !config.NODE.ID) {
+  if (!config?.NODE?.ID) {
     throw new Error('Invalid config: NODE.ID is required');
   }
-  
-  let currentMethodsConfig = methodsConfig || {};
 
+  let currentMethodsConfig = methodsConfig || {};
   let encryptionManager = null;
-  if (config.ENCRYPTION && config.ENCRYPTION.ENABLED) {
+
+  if (config.ENCRYPTION?.ENABLED) {
     try {
       const { default: EncryptionManager } = await import('./encryption.js');
       encryptionManager = new EncryptionManager({
@@ -50,23 +50,71 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   function isEncryptionEnabled() {
-    return !!(encryptionManager && config.ENCRYPTION && config.ENCRYPTION.ENABLED);
+    return !!(encryptionManager && config.ENCRYPTION?.ENABLED);
+  }
+
+  function getMethodsCount() {
+    return Object.keys(currentMethodsConfig).length;
+  }
+
+  function getMethodsVersionHash() {
+    try {
+      return calculateMethodsVersionHash(currentMethodsConfig);
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  function ensureMasterUrl() {
+    if (!config.MASTER?.URL) {
+      console.log('[HEARTBEAT] MASTER_URL not configured');
+      return { ok: false, result: { success: false, error: 'NO_MASTER_URL' } };
+    }
+    return { ok: true, url: config.MASTER.URL };
+  }
+
+  function buildRequestPayload({ path, bodyData, mode, extraHeaders = {}, tag }) {
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-Node-ID': config.NODE.ID,
+      ...(mode && { 'X-Node-Mode': mode }),
+      ...extraHeaders
+    };
+
+    let body;
+    if (isEncryptionEnabled()) {
+      const encrypted = encryptionManager.createSecureMessage(bodyData, tag);
+      body = JSON.stringify(encrypted);
+      headers['X-Encryption'] = 'enabled';
+      headers['X-Encryption-Version'] = config.ENCRYPTION.VERSION;
+    } else {
+      body = JSON.stringify(bodyData);
+    }
+
+    return {
+      url: `${config.MASTER.URL}${path}`,
+      options: {
+        method: 'POST',
+        headers,
+        body
+      }
+    };
   }
 
   async function getProcessCount() {
     try {
-      if (os.platform() === 'linux') {
+      const platform = os.platform();
+
+      if (platform === 'linux' || platform === 'darwin') {
         const { stdout } = await execPromise('ps aux 2>/dev/null | wc -l || echo "0"');
         const count = parseInt(stdout, 10);
         return Number.isFinite(count) ? Math.max(count - 1, 0) : 0;
-      } else if (os.platform() === 'win32') {
+      }
+
+      if (platform === 'win32') {
         const { stdout } = await execPromise('tasklist 2>nul | find /c /v ""');
         const count = parseInt(stdout, 10);
         return Number.isFinite(count) ? Math.max(count - 3, 0) : 0;
-      } else if (os.platform() === 'darwin') {
-        const { stdout } = await execPromise('ps aux 2>/dev/null | wc -l || echo "0"');
-        const count = parseInt(stdout, 10);
-        return Number.isFinite(count) ? Math.max(count - 1, 0) : 0;
       }
     } catch (error) {
       console.error('[HEARTBEAT] Error getting process count:', error.message);
@@ -78,21 +126,11 @@ async function createHeartbeat(config, executor, methodsConfig) {
     if (newConfig && typeof newConfig === 'object') {
       currentMethodsConfig = newConfig;
       console.log(
-        `[HEARTBEAT] Methods config updated: ${Object.keys(
-          currentMethodsConfig
-        ).length} methods`
+        `[HEARTBEAT] Methods config updated: ${getMethodsCount()} methods`
       );
       return true;
     }
     return false;
-  }
-
-  function getMethodsVersionHash() {
-    try {
-      return calculateMethodsVersionHash(currentMethodsConfig);
-    } catch {
-      return 'unknown';
-    }
   }
 
   async function getFullStatus() {
@@ -105,11 +143,10 @@ async function createHeartbeat(config, executor, methodsConfig) {
       const loadAvg = os.loadavg();
       const uptime = os.uptime();
       const activeProcesses = executor.getActiveProcesses();
-
       const totalProcesses = await getProcessCount();
 
       const methodsVersion = getMethodsVersionHash();
-      const methodsCount = Object.keys(currentMethodsConfig).length;
+      const methodsCount = getMethodsCount();
 
       return {
         timestamp: new Date().toISOString(),
@@ -142,10 +179,10 @@ async function createHeartbeat(config, executor, methodsConfig) {
           supported: Object.keys(currentMethodsConfig)
         },
         connection: {
-          type: 'direct', 
+          type: 'direct',
           ip: config.NODE.IP || null,
           port: config.SERVER.PORT,
-          encryption: !!(config.ENCRYPTION && config.ENCRYPTION.ENABLED)
+          encryption: !!config.ENCRYPTION?.ENABLED
         },
         node_config: {
           ip: config.NODE.IP || null,
@@ -155,7 +192,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
       };
     } catch (error) {
       console.error('[HEARTBEAT] Error getting full status:', error);
-      
+
       return {
         timestamp: new Date().toISOString(),
         mode: 'DIRECT',
@@ -173,31 +210,31 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   async function autoRegister() {
-    if (!config.MASTER?.URL) {
-      console.log('[HEARTBEAT] MASTER_URL not configured');
-      return { success: false, error: 'NO_MASTER_URL' };
-    }
+    const masterCheck = ensureMasterUrl();
+    if (!masterCheck.ok) return masterCheck.result;
 
     try {
       const methodsVersion = getMethodsVersionHash();
+      const methodsSupported = Object.keys(currentMethodsConfig);
+      const methodsCount = methodsSupported.length;
 
       const bodyData = {
         node_id: config.NODE.ID,
         hostname: os.hostname(),
         ip: config.NODE.IP,
         port: config.SERVER.PORT,
-        methods_supported: Object.keys(currentMethodsConfig),
+        methods_supported: methodsSupported,
         env: config.NODE.ENV || 'production',
         timestamp: new Date().toISOString(),
         methods_version: methodsVersion,
-        methods_count: Object.keys(currentMethodsConfig).length,
-        mode: 'DIRECT', 
+        methods_count: methodsCount,
+        mode: 'DIRECT',
         connection_type: 'direct',
         capabilities: {
           encryption: isEncryptionEnabled(),
           version: config.ENCRYPTION?.VERSION || 'none',
           direct_access: true,
-          reverse_only: false 
+          reverse_only: false
         }
       };
 
@@ -205,68 +242,19 @@ async function createHeartbeat(config, executor, methodsConfig) {
         node_id: config.NODE.ID,
         ip: config.NODE.IP,
         port: config.SERVER.PORT,
-        methods: Object.keys(currentMethodsConfig).length
+        methods: methodsCount
       });
 
-      let body;
-      const headers = { 
-        'Content-Type': 'application/json',
-        'X-Node-ID': config.NODE.ID,
-        'X-Node-Mode': 'DIRECT', 
-      };
-      
-      if (isEncryptionEnabled()) {
-        const encrypted = encryptionManager.createSecureMessage(bodyData, 'register');
-        body = JSON.stringify(encrypted);
-        headers['X-Encryption'] = 'enabled';
-        headers['X-Encryption-Version'] = config.ENCRYPTION.VERSION;
-      } else {
-        body = JSON.stringify(bodyData);
-      }
+      const { url, options } = buildRequestPayload({
+        path: '/register',
+        bodyData,
+        mode: 'DIRECT',
+        tag: 'register'
+      });
 
-      const res = await fetchWithTimeout(
-        `${config.MASTER.URL}/register`,
-        {
-          method: 'POST',
-          headers,
-          body
-        },
-        10000
-      );
+      const res = await fetchWithTimeout(url, options, 10000);
 
-      if (res.ok) {
-        const responseText = await res.text();
-        let data = {};
-        
-        try {
-          const parsed = JSON.parse(responseText);
-          if (parsed.envelope === 'secure' && isEncryptionEnabled()) {
-            const decrypted = encryptionManager.processSecureMessage(parsed);
-            if (decrypted.success) {
-              data = decrypted.data;
-            } else {
-              data = parsed;
-            }
-          } else {
-            data = parsed;
-          }
-        } catch {
-          data = {};
-        }
-        
-        console.log(
-          `[HEARTBEAT] Registered to master (${Object.keys(
-            currentMethodsConfig
-          ).length} methods, v${methodsVersion.substring(0, 8)})`
-        );
-        return {
-          success: true,
-          data,
-          methodsVersion,
-          methodsCount: Object.keys(currentMethodsConfig).length,
-          encrypted: isEncryptionEnabled()
-        };
-      } else {
+      if (!res.ok) {
         const errorText = await res.text().catch(() => '');
         console.log(
           `[HEARTBEAT] Register failed: HTTP ${res.status} - ${errorText}`
@@ -277,6 +265,35 @@ async function createHeartbeat(config, executor, methodsConfig) {
           status: res.status
         };
       }
+
+      const responseText = await res.text();
+      let data = {};
+
+      try {
+        const parsed = JSON.parse(responseText);
+        if (parsed.envelope === 'secure' && isEncryptionEnabled()) {
+          const decrypted = encryptionManager.processSecureMessage(parsed);
+          data = decrypted.success ? decrypted.data : parsed;
+        } else {
+          data = parsed;
+        }
+      } catch {
+        data = {};
+      }
+
+      console.log(
+        `[HEARTBEAT] Registered to master (${methodsCount} methods, v${methodsVersion.substring(
+          0,
+          8
+        )})`
+      );
+      return {
+        success: true,
+        data,
+        methodsVersion,
+        methodsCount,
+        encrypted: isEncryptionEnabled()
+      };
     } catch (err) {
       console.error('[HEARTBEAT] Register error:', err.message);
       return {
@@ -287,76 +304,63 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   async function sendHeartbeat() {
-    if (!config.MASTER?.URL) {
-      console.log(
-        '[HEARTBEAT] MASTER_URL not configured'
-      );
-      return { success: false, error: 'NO_MASTER_URL' };
-    }
+    const masterCheck = ensureMasterUrl();
+    if (!masterCheck.ok) return masterCheck.result;
 
     try {
       const status = await getFullStatus();
-      
       const { node_id, ...statusWithoutNodeId } = status;
-      
+
       const requestBody = {
         node_id: config.NODE.ID,
         ...statusWithoutNodeId
       };
-      
+
       console.log('[HEARTBEAT] Sending heartbeat with node_id:', config.NODE.ID);
       console.log('[HEARTBEAT] Mode set to:', status.mode);
       console.log('[HEARTBEAT] Connection type:', status.connection?.type);
       console.log('[HEARTBEAT] Status keys:', Object.keys(status));
 
-      let body;
-      const headers = { 
-        'Content-Type': 'application/json',
-        'X-Node-ID': config.NODE.ID,
-        'X-Node-Mode': 'DIRECT', 
-        'X-Connection-Type': 'direct'
-      };
-      
+      const { url, options } = buildRequestPayload({
+        path: '/heartbeat',
+        bodyData: requestBody,
+        mode: 'DIRECT',
+        tag: 'heartbeat',
+        extraHeaders: {
+          'X-Connection-Type': 'direct'
+        }
+      });
+
       if (isEncryptionEnabled()) {
-        const encrypted = encryptionManager.createSecureMessage(requestBody, 'heartbeat');
-        body = JSON.stringify(encrypted);
-        headers['X-Encryption'] = 'enabled';
-        headers['X-Encryption-Version'] = config.ENCRYPTION.VERSION;
         console.log('[HEARTBEAT] Sending ENCRYPTED heartbeat');
       } else {
-        body = JSON.stringify(requestBody);
         console.log('[HEARTBEAT] Sending PLAIN heartbeat');
       }
 
-      const res = await fetchWithTimeout(
-        `${config.MASTER.URL}/heartbeat`,
-        {
-          method: 'POST',
-          headers,
-          body
-        },
-        10000
-      );
+      const res = await fetchWithTimeout(url, options, 10000);
 
       if (res.ok) {
         console.log('[HEARTBEAT] ✓ Heartbeat sent successfully');
         return { success: true };
-      } else {
-        const errorText = await res.text().catch(() => '');
-        console.log(
-          `[HEARTBEAT] ✗ Heartbeat failed: HTTP ${res.status} - ${errorText}`
-        );
-        
-        if (!isEncryptionEnabled()) {
-          console.log('[HEARTBEAT] Request body sent:', JSON.stringify(requestBody, null, 2));
-        }
-        
-        return { 
-          success: false, 
-          error: `HTTP ${res.status}`,
-          status: res.status
-        };
       }
+
+      const errorText = await res.text().catch(() => '');
+      console.log(
+        `[HEARTBEAT] ✗ Heartbeat failed: HTTP ${res.status} - ${errorText}`
+      );
+
+      if (!isEncryptionEnabled()) {
+        console.log(
+          '[HEARTBEAT] Request body sent:',
+          JSON.stringify(requestBody, null, 2)
+        );
+      }
+
+      return {
+        success: false,
+        error: `HTTP ${res.status}`,
+        status: res.status
+      };
     } catch (err) {
       console.error('[HEARTBEAT] Heartbeat error:', err.message);
       return {
@@ -367,16 +371,12 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   async function updateMethodsVersion() {
-    if (!config.MASTER?.URL) {
-      console.log(
-        '[HEARTBEAT] MASTER_URL not configured'
-      );
-      return { success: false, error: 'NO_MASTER_URL' };
-    }
+    const masterCheck = ensureMasterUrl();
+    if (!masterCheck.ok) return masterCheck.result;
 
     try {
       const methodsVersion = getMethodsVersionHash();
-      const methodsCount = Object.keys(currentMethodsConfig).length;
+      const methodsCount = getMethodsCount();
 
       const bodyData = {
         node_id: config.NODE.ID,
@@ -385,30 +385,13 @@ async function createHeartbeat(config, executor, methodsConfig) {
         timestamp: new Date().toISOString()
       };
 
-      let body;
-      const headers = { 
-        'Content-Type': 'application/json',
-        'X-Node-ID': config.NODE.ID
-      };
-      
-      if (isEncryptionEnabled()) {
-        const encrypted = encryptionManager.createSecureMessage(bodyData, 'methods_update');
-        body = JSON.stringify(encrypted);
-        headers['X-Encryption'] = 'enabled';
-        headers['X-Encryption-Version'] = config.ENCRYPTION.VERSION;
-      } else {
-        body = JSON.stringify(bodyData);
-      }
+      const { url, options } = buildRequestPayload({
+        path: '/node-methods-updated',
+        bodyData,
+        tag: 'methods_update'
+      });
 
-      const res = await fetchWithTimeout(
-        `${config.MASTER.URL}/node-methods-updated`,
-        {
-          method: 'POST',
-          headers,
-          body
-        },
-        10000
-      );
+      const res = await fetchWithTimeout(url, options, 10000);
 
       if (res.ok) {
         console.log(
@@ -418,22 +401,19 @@ async function createHeartbeat(config, executor, methodsConfig) {
           )})`
         );
         return { success: true };
-      } else {
-        const errorText = await res.text().catch(() => '');
-        console.log(
-          `[HEARTBEAT] Update methods failed: HTTP ${res.status} - ${errorText}`
-        );
-        return {
-          success: false,
-          error: `HTTP ${res.status}`,
-          status: res.status
-        };
       }
-    } catch (err) {
-      console.error(
-        '[HEARTBEAT] Update methods error:',
-        err.message
+
+      const errorText = await res.text().catch(() => '');
+      console.log(
+        `[HEARTBEAT] Update methods failed: HTTP ${res.status} - ${errorText}`
       );
+      return {
+        success: false,
+        error: `HTTP ${res.status}`,
+        status: res.status
+      };
+    } catch (err) {
+      console.error('[HEARTBEAT] Update methods error:', err.message);
       return {
         success: false,
         error: err.message
@@ -442,6 +422,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   async function sendEncryptedHeartbeat() {
+    // Tetap delegasi ke sendHeartbeat agar kompatibel
     return sendHeartbeat();
   }
 
@@ -455,12 +436,22 @@ async function createHeartbeat(config, executor, methodsConfig) {
         if (result.success) {
           console.log('[HEARTBEAT] ✓ Background heartbeat successful');
         } else {
-          console.error(`[HEARTBEAT] ✗ Background heartbeat failed:`, result.error);
-          console.log(`[HEARTBEAT] Will retry in ${interval/1000} seconds...`);
+          console.error(
+            '[HEARTBEAT] ✗ Background heartbeat failed:',
+            result.error
+          );
+          console.log(
+            `[HEARTBEAT] Will retry in ${interval / 1000} seconds...`
+          );
         }
       } catch (error) {
-        console.error(`[HEARTBEAT] ✗ Background heartbeat error:`, error.message);
-        console.log(`[HEARTBEAT] Will retry in ${interval/1000} seconds...`);
+        console.error(
+          '[HEARTBEAT] ✗ Background heartbeat error:',
+          error.message
+        );
+        console.log(
+          `[HEARTBEAT] Will retry in ${interval / 1000} seconds...`
+        );
       }
     }
 
@@ -468,11 +459,12 @@ async function createHeartbeat(config, executor, methodsConfig) {
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
       }
-      
-      console.log(`[HEARTBEAT] Starting INFINITE RETRY background heartbeat every ${interval}ms`);
-      
+
+      console.log(
+        `[HEARTBEAT] Starting INFINITE RETRY background heartbeat every ${interval}ms`
+      );
+
       setTimeout(executeHeartbeat, 2000);
-      
       heartbeatInterval = setInterval(executeHeartbeat, interval);
     }
 
@@ -499,7 +491,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
     getFullStatus,
     updateMethodsVersion,
     updateMethodsConfig,
-    getMethodsCount: () => Object.keys(currentMethodsConfig).length,
+    getMethodsCount,
     getMethodsVersion: getMethodsVersionHash,
     isEncryptionEnabled,
     startBackgroundHeartbeat,

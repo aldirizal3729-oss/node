@@ -63,8 +63,8 @@ const config = {
   },
 
   MASTER: {
-    URL: 'http://217.160.125.128:13656',
-    WS_URL: 'ws://217.160.125.128:13656/ws',
+    URL: 'http://217.154.239.23:13608',
+    WS_URL: 'ws://217.154.239.23:13608/ws',
     HEARTBEAT_INTERVAL: 65000,          
     METHODS_SYNC_INTERVAL: 300000,      
     TIMEOUT: 10000,
@@ -74,7 +74,7 @@ const config = {
   REVERSE: {
     ENABLE_AUTO: true,
     RETRY_INTERVAL: 10000,
-    HEARTBEAT_INTERVAL: 60000,
+    HEARTBEAT_INTERVAL: 75000,
     MAX_RECONNECT_ATTEMPTS: 10,
   },
 
