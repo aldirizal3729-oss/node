@@ -110,7 +110,7 @@ function createProxyUpdater(config) {
     }
     
     // Reject common non-proxy ports
-    const bannedPorts = [22, 23, 25,443, 465, 587, 993, 995];
+    const bannedPorts = [22, 23, 25, 443, 465, 587, 993, 995];
     if (bannedPorts.includes(portNum)) {
       return false;
     }
@@ -346,29 +346,62 @@ function createProxyUpdater(config) {
   }
   
   let updateInterval = null;
-  
-  function startAutoUpdate(intervalMinutes = 10) {
+
+  /**
+   * Start periodic proxy auto-update.
+   *
+   * @param {number} intervalMinutes - Update interval in minutes.
+   * @param {object|null} executor   - Optional executor instance. When provided,
+   *                                   the update is skipped if there are active
+   *                                   attack processes running to ensure stability.
+   */
+  function startAutoUpdate(intervalMinutes = 10, executor = null) {
     stopAutoUpdate();
     
     const intervalMs = intervalMinutes * 60 * 1000;
+
+    // Helper: check whether an attack is currently in progress
+    function attackInProgress() {
+      if (!executor) return false;
+      try {
+        return executor.getActiveProcessesCount() > 0;
+      } catch {
+        return false;
+      }
+    }
     
-    console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes`);
+    console.log(`[PROXY] Auto-update every ${intervalMinutes} minutes (attack-guard: ${executor ? 'enabled' : 'disabled'})`);
     
     // Initial update with error handling
-    updateProxyFile()
-      .then(result => {
-        if (result.success) {
-          console.log(`[PROXY] Initial update: ${result.count} proxies`);
-        } else {
-          console.log(`[PROXY] Initial update failed: ${result.error}`);
-        }
-      })
-      .catch(error => {
-        console.error('[PROXY] Initial update error:', error.message);
-      });
+    if (attackInProgress()) {
+      console.log('[PROXY] ⚠ Initial update skipped — attack in progress. Will retry at next interval.');
+    } else {
+      updateProxyFile()
+        .then(result => {
+          if (result.success) {
+            console.log(`[PROXY] Initial update: ${result.count} proxies`);
+          } else {
+            console.log(`[PROXY] Initial update failed: ${result.error}`);
+          }
+        })
+        .catch(error => {
+          console.error('[PROXY] Initial update error:', error.message);
+        });
+    }
     
-    // Interval with error handling
+    // Interval with error handling and attack guard
     updateInterval = setInterval(() => {
+      // ── ATTACK GUARD ──────────────────────────────────────────────────────
+      if (attackInProgress()) {
+        const activeCount = executor.getActiveProcessesCount();
+        console.log(
+          `[PROXY] ⚠ Auto-update skipped — ${activeCount} active attack process(es) running. ` +
+          `Will retry in ${intervalMinutes} minute(s).`
+        );
+        return;
+      }
+      // ──────────────────────────────────────────────────────────────────────
+
       console.log(`[PROXY] Auto-update triggered`);
       updateProxyFile().catch(error => {
         console.error('[PROXY] Auto-update error:', error.message);

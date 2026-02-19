@@ -64,6 +64,23 @@ let isRegistered = false;
 let isReachable = false;
 
 // ======================
+// ATTACK IN PROGRESS CHECK
+// ======================
+/**
+ * Returns true if there are currently active attack processes running.
+ * Used to defer proxy updates and methods sync during active attacks
+ * to ensure stability.
+ */
+function isAttackInProgress() {
+  try {
+    const count = executor.getActiveProcessesCount();
+    return count > 0;
+  } catch {
+    return false;
+  }
+}
+
+// ======================
 // SHARED DATA
 // ======================
 const sharedData = {
@@ -506,6 +523,17 @@ async function determineNetworkMode() {
 // METHODS SYNC (P2P + MASTER)
 // ======================
 async function syncMethods() {
+  // ── ATTACK GUARD ──────────────────────────────────────────────────────────
+  if (isAttackInProgress()) {
+    const activeCount = executor.getActiveProcessesCount();
+    console.log(
+      `[SYNC] ⚠ Skipped — ${activeCount} active attack process(es) running. ` +
+      `Sync will resume after attack completes.`
+    );
+    return { success: false, skipped: true, reason: 'attack_in_progress', activeProcesses: activeCount };
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   try {
     // Prefer P2P sync jika ada peers
     if (
@@ -842,7 +870,9 @@ fastify.get('/health', async (request, reply) => {
     ip: config.NODE.IP || 'unknown',
     port: config.SERVER.PORT,
     p2p_enabled: config.P2P?.ENABLED || false,
-    p2p_peers: p2pNode ? p2pNode.peers.size : 0
+    p2p_peers: p2pNode ? p2pNode.peers.size : 0,
+    active_processes: executor.getActiveProcessesCount(),
+    attack_in_progress: isAttackInProgress()
   });
 });
 
@@ -893,6 +923,7 @@ fastify.post('/p2p/sync-methods', async (request, reply) => {
     });
   }
 
+  // Allow manual sync via API even during attack (operator decision)
   const result = await p2pNode.syncMethodsFromPeers();
 
   reply.send({
@@ -1072,6 +1103,10 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
                   '[POST-REGISTRATION] ✓ P2P node updated with latest methods'
                 );
               }
+            } else if (syncResult?.skipped) {
+              console.log(
+                '[POST-REGISTRATION] ⚠ Initial methods sync skipped (attack in progress), will retry periodically'
+              );
             } else {
               console.log(
                 '[POST-REGISTRATION] ⚠ Initial methods sync failed or up-to-date, will retry periodically'
@@ -1100,7 +1135,7 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
 
             const interval =
               config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
-            proxyUpdater.startAutoUpdate(interval);
+            proxyUpdater.startAutoUpdate(interval, executor);
             console.log(
               `[POST-REGISTRATION] ✓ Proxy auto-update started (every ${interval} minutes)`
             );
@@ -1316,7 +1351,7 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
             setTimeout(() => {
               const interval =
                 config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
-              proxyUpdater.startAutoUpdate(interval);
+              proxyUpdater.startAutoUpdate(interval, executor);
               console.log(
                 '[POST-REGISTRATION] ✓ Proxy auto-update started'
               );
@@ -1444,6 +1479,17 @@ function startPeriodicP2PSync(methodsSyncInterval) {
       console.log('[PERIODIC-SYNC] Skipped - not registered');
       return;
     }
+
+    // ── ATTACK GUARD ────────────────────────────────────────────────────────
+    if (isAttackInProgress()) {
+      const activeCount = executor.getActiveProcessesCount();
+      console.log(
+        `[PERIODIC-SYNC] ⚠ Skipped — ${activeCount} active attack process(es) running. ` +
+        `Sync deferred until attack completes.`
+      );
+      return;
+    }
+    // ────────────────────────────────────────────────────────────────────────
 
     try {
       const syncResult = await syncMethods();
@@ -1683,6 +1729,17 @@ async function startServer() {
           p2pNode.on(
             'methods_updated_from_peer',
             async (data) => {
+              // ── ATTACK GUARD ─────────────────────────────────────────────
+              if (isAttackInProgress()) {
+                const activeCount = executor.getActiveProcessesCount();
+                console.log(
+                  `[P2P-EVENT] ⚠ Methods update from peer ${data.nodeId} deferred — ` +
+                  `${activeCount} active attack process(es) running.`
+                );
+                return;
+              }
+              // ─────────────────────────────────────────────────────────────
+
               console.log(
                 `[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving and propagating IMMEDIATELY...`
               );
