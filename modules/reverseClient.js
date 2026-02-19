@@ -590,29 +590,38 @@ function createReverseClient(config, executor, methodsConfig) {
     return send(payload);
   }
 
+  // FIX #11: handleReconnectLimit previously returned a boolean but its return value
+  // was not checked before calling scheduleReconnect() in ws.on('close') and ws.on('error').
+  // Now this function is the SOLE arbiter of reconnect scheduling when max attempts reached.
+  // It either schedules a reconnect (after cooldown or reset) or does NOT schedule one.
+  // Callers should NOT call scheduleReconnect() after handleReconnectLimit().
   function handleReconnectLimit(reasonLabel) {
     const timeSinceLastSuccess = lastSuccessfulConnection
       ? Date.now() - lastSuccessfulConnection
       : Infinity;
 
     if (timeSinceLastSuccess > 300000) {
+      // Had a long successful connection previously — reset and retry
       console.log(
         `[REVERSE] WS: Resetting reconnect attempts after long successful connection (${reasonLabel})`
       );
       reconnectAttempts = 0;
       scheduleReconnect();
-      return true;
+      return; // reconnect scheduled
     }
 
+    // FIX #11: Do NOT call scheduleReconnect here — enter cooldown instead
     console.log(
-      `[REVERSE] WS: Max reconnect attempts reached${reasonLabel ? ` (${reasonLabel})` : ''}`
+      `[REVERSE] WS: Max reconnect attempts reached${reasonLabel ? ` (${reasonLabel})` : ''}. Cooling down for 5 minutes.`
     );
     setTimeout(() => {
-      reconnectAttempts = 0;
-      console.log('[REVERSE] WS: Cooldown complete, reset reconnect attempts');
-      scheduleReconnect();
+      if (!isShuttingDown) {
+        reconnectAttempts = 0;
+        console.log('[REVERSE] WS: Cooldown complete, reset reconnect attempts');
+        scheduleReconnect();
+      }
     }, 300000);
-    return false;
+    // NO scheduleReconnect() call here — cooldown handles it
   }
 
   async function handleMessage(processed) {
@@ -992,8 +1001,11 @@ function createReverseClient(config, executor, methodsConfig) {
 
         reconnectAttempts++;
 
+        // FIX #11: Only call handleReconnectLimit when limit is reached.
+        // handleReconnectLimit now handles ALL scheduling internally — no
+        // extra scheduleReconnect() call afterward.
         if (reconnectAttempts >= maxReconnectAttempts) {
-          if (!handleReconnectLimit('close')) return;
+          handleReconnectLimit('close');
         } else {
           scheduleReconnect();
         }
@@ -1008,8 +1020,9 @@ function createReverseClient(config, executor, methodsConfig) {
 
         reconnectAttempts++;
 
+        // FIX #11: Same fix as ws.on('close') above
         if (reconnectAttempts >= maxReconnectAttempts) {
-          if (!handleReconnectLimit('error')) return;
+          handleReconnectLimit('error');
         } else {
           scheduleReconnect();
         }

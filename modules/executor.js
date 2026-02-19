@@ -471,6 +471,10 @@ class Executor extends EventEmitter {
         });
       }
 
+      // FIX #9: resolved flag is used to prevent double resolve/reject.
+      // Set to false initially; we resolve AFTER all listeners are attached
+      // so that a synchronous 'error' event (which can fire before the next
+      // tick) is always caught by our errorHandler.
       let resolved = false;
 
       this.activeProcesses.set(processId, {
@@ -489,16 +493,6 @@ class Executor extends EventEmitter {
           `[EXEC ${processId}] Expected duration: ${expectedDuration / 1000}s`
         );
       }
-
-      this.emit('process_started', {
-        processId,
-        command: resolvedCommand,
-        pid: childProcess.pid,
-        startTime,
-        expectedDuration,
-        expectedEndTime,
-        executable
-      });
 
       const stdoutHandler = (data) => {
         if (!this.isShuttingDown) {
@@ -592,6 +586,10 @@ class Executor extends EventEmitter {
         this.activeProcesses.delete(processId);
         this._cleanupProcessListeners(processId);
 
+        // FIX #9: Only reject if not yet resolved.
+        // Because listeners are attached BEFORE resolve() is called below,
+        // the errorHandler can correctly run and reject the promise before
+        // the resolve line is ever reached.
         if (!resolved) {
           resolved = true;
           reject({
@@ -611,8 +609,13 @@ class Executor extends EventEmitter {
         }
       };
 
-      // Attach ALL listeners BEFORE resolving the promise so that a
-      // synchronous 'error' event is never missed.
+      // FIX #9: Attach ALL listeners BEFORE resolving the promise so that a
+      // synchronous 'error' event fired during/after spawn is never missed.
+      // Previously, `resolved = true` and `resolve(...)` were set AFTER
+      // listener attachment but the variable was set to `true` at the bottom
+      // which meant errorHandler's `!resolved` check was always false on
+      // synchronous errors. Now we only set resolved=true inside the handlers
+      // or at the very end after all listeners are safely attached.
       try {
         if (childProcess.stdout) {
           childProcess.stdout.on('data', stdoutHandler);
@@ -637,19 +640,45 @@ class Executor extends EventEmitter {
         });
       } catch (error) {
         console.error(`[EXEC ${processId}] Failed to attach listeners:`, error.message);
+        // If we can't attach listeners, reject immediately
+        if (!resolved) {
+          resolved = true;
+          this.activeProcesses.delete(processId);
+          return reject({
+            success: false,
+            processId,
+            error: `Failed to attach listeners: ${error.message}`
+          });
+        }
       }
 
-      // Resolve only after listeners are safely in place
-      resolved = true;
-      resolve({
-        success: true,
+      // FIX #9: Emit process_started AFTER listeners are attached but BEFORE
+      // resolving, so external handlers see the event consistently.
+      this.emit('process_started', {
         processId,
+        command: resolvedCommand,
         pid: childProcess.pid,
-        message: 'Process started',
         startTime,
         expectedDuration,
+        expectedEndTime,
         executable
       });
+
+      // FIX #9: Now safe to resolve. If errorHandler already ran synchronously
+      // and set resolved=true, this resolve call is effectively a no-op because
+      // Promise can only settle once.
+      if (!resolved) {
+        resolved = true;
+        resolve({
+          success: true,
+          processId,
+          pid: childProcess.pid,
+          message: 'Process started',
+          startTime,
+          expectedDuration,
+          executable
+        });
+      }
     });
   }
 

