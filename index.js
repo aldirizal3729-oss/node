@@ -959,6 +959,70 @@ fastify.post('/p2p/propagate-methods', async (request, reply) => {
   }
 });
 
+fastify.post('/p2p/tunnel', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.status(503).send({ status: 'error', error: 'P2P is not initialized' });
+  }
+
+  const { targetNodeId, messageType, payload } = request.body || {};
+
+  if (!targetNodeId || !messageType || !payload) {
+    return reply.status(400).send({ status: 'error', error: 'Missing targetNodeId, messageType, or payload' });
+  }
+
+  const result = await p2pNode.sendViaTunnel(targetNodeId, payload, messageType);
+
+  reply.send({
+    status: result.success ? 'ok' : 'error',
+    ...result
+  });
+});
+
+// P2P Reverse Pool Status
+fastify.get('/p2p/reverse-pool', async (request, reply) => {
+  if (!p2pNode) {
+    return reply.status(503).send({ status: 'error', error: 'P2P is not initialized' });
+  }
+
+  const reverseNodes = Array.from(p2pNode.reversePeers.keys()).map(nodeId => {
+    const peer = p2pNode.peers.get(nodeId);
+    return {
+      nodeId,
+      connectedAt: peer?.connectedAt,
+      lastSeen: peer?.lastSeen,
+      messagesReceived: peer?.messagesReceived,
+      uptime: peer ? Date.now() - peer.connectedAt : null
+    };
+  });
+
+  reply.send({
+    status: 'ok',
+    reversePool: {
+      count: p2pNode.reversePeers.size,
+      nodes: reverseNodes
+    },
+    nodeMode: nodeMode
+  });
+});
+
+fastify.get('/p2p/known-reverse', async (request, reply) => {
+  if (!p2pNode) return reply.status(503).send({ error: 'P2P not initialized' });
+
+  const routes = Array.from(p2pNode.knownReversePeers.entries()).map(([reverseId, relayId]) => ({
+    reverseNodeId: reverseId,
+    viaRelay: relayId,
+    relayConnected: p2pNode.peers.has(relayId)
+  }));
+
+  reply.send({
+    status: 'ok',
+    nodeMode,
+    knownReversePeers: {
+      count: routes.length,
+      routes
+    }
+  });
+});
 // ======================
 // INITIALIZATION HELPERS
 // ======================
@@ -1704,6 +1768,20 @@ async function startServer() {
         const p2pStarted = await p2pNode.startP2PServer(fastify);
         if (p2pStarted) {
           console.log('[P2P] ✓ P2P Hybrid Node started successfully');
+          
+          p2pNode.on('peer_message', (data) => {
+  const { nodeId, message } = data;
+  if (message.type === 'tunnel_delivery') {
+    console.log(`[TUNNEL] Received tunneled message from ${message.sourceNodeId} via ${message.relayNodeId}`);
+    // Process the tunneled payload as if it came directly
+    // The payload structure mirrors a normal P2P message
+    if (message.payload && message.messageType) {
+      p2pNode.emit(message.messageType, { nodeId: message.sourceNodeId, ...message.payload });
+    }
+  }
+});
+
+p2pNode.startReverseReconnect();
 
           p2pNode.on('peer_connected', (data) => {
             console.log(
@@ -1875,17 +1953,24 @@ async function startServer() {
     isReachable = modeInfo.reachable;
     sharedData.setReachable(isReachable);
 
-    // Set mode di P2P node
     if (p2pNode) {
       p2pNode.setNodeMode(nodeMode);
+      // setNodeMode() sudah otomatis set nodeReachable = (mode === 'DIRECT')
+      // tapi kita sync juga dengan hasil deteksi network
+      if (nodeMode === 'REVERSE') {
+        p2pNode.nodeReachable = false;
+        console.log('[P2P] REVERSE mode aktif — node ini akan menerima koneksi P2P inbound saja');
+        console.log('[P2P] DIRECT peers yang discover node ini dari master akan connect ke kita');
+      } else {
+        p2pNode.nodeReachable = isReachable;
+        console.log(`[P2P] DIRECT mode aktif — node reachable: ${isReachable}`);
+      }
     }
 
     console.log(
       `[INIT] Final mode: ${nodeMode}, Reachable: ${isReachable}`
     );
 
-    // Mulai operasi berbasis mode:
-    // -> di dalamnya: REGISTER DULU, baru jalanin heartbeat, sync, proxy updater, periodic sync.
     startModeBasedOperations(heartbeatInterval, methodsSyncInterval);
 
     await fetchServerInfo().catch(() => {});
