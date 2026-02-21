@@ -7,7 +7,6 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// FIX: Use a single constant for the default port to avoid inconsistency
 const DEFAULT_PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '5032', 10);
 
 function getStableNodeId() {
@@ -36,8 +35,10 @@ function getStableNodeId() {
       if (macAddress) break;
     }
 
-    // FIX: Use DEFAULT_PORT (consistent with SERVER.PORT) instead of hardcoded 5034
-    const uniqueString = `${os.hostname()}-${macAddress || 'no-mac'}-${process.pid}-${DEFAULT_PORT}-${Date.now()}`;
+    // FIX: Remove process.pid and Date.now() from uniqueString so the generated
+    // ID is deterministic — same machine always gets same ID even if .node_id
+    // file is accidentally deleted.
+    const uniqueString = `${os.hostname()}-${macAddress || 'no-mac'}-${DEFAULT_PORT}`;
     const nodeId = crypto
       .createHash('sha256')
       .update(uniqueString)
@@ -50,9 +51,12 @@ function getStableNodeId() {
     return nodeId;
   } catch (error) {
     console.error('[CONFIG] Error generating stable node_id:', error.message);
-    return `${os.hostname()}-${process.pid}-${Date.now()}-${Math.random()
-      .toString(36)
-      .substr(2, 9)}`;
+    // FIX: Fallback also removes Date.now()/random so it's at least hostname-stable
+    return crypto
+      .createHash('sha256')
+      .update(`${os.hostname()}-fallback-${DEFAULT_PORT}`)
+      .digest('hex')
+      .substring(0, 32);
   }
 }
 
@@ -85,6 +89,8 @@ const config = {
     ID: process.env.NODE_ID || getStableNodeId(),
     IP: process.env.SERVER_IP || null,
     ENV: process.env.NODE_ENV || 'production',
+    // FIX: MODE is initialized to null; set dynamically at runtime via sharedData.setNodeMode
+    MODE: null,
   },
 
   ENCRYPTION: {

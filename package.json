@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "colors": "^1.4.0",
     "crypto": "^1.0.1",
