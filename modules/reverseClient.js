@@ -38,6 +38,11 @@ function createReverseClient(config, executor, methodsConfig) {
   const maxReconnectAttempts = config.REVERSE?.MAX_RECONNECT_ATTEMPTS || 10;
   let lastSuccessfulConnection = null;
 
+  // FIX: Track whether we are currently in a close/error handler to prevent
+  // double-incrementing reconnectAttempts when both 'close' and 'error' fire
+  // for the same disconnection event.
+  let disconnectHandled = false;
+
   const masterDownDetection = {
     lastHeartbeatSuccess: Date.now(),
     consecutiveFailures: 0,
@@ -97,14 +102,6 @@ function createReverseClient(config, executor, methodsConfig) {
         if (!masterDownDetection.isMasterDown) {
           masterDownDetection.isMasterDown = true;
           console.log('[REVERSE] ⚠ Master appears to be down (multiple heartbeat failures)');
-
-          if (ws) {
-            console.log(
-              `[REVERSE] WebSocket state: ${
-                ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState]
-              }`
-            );
-          }
         }
       }
 
@@ -257,7 +254,7 @@ function createReverseClient(config, executor, methodsConfig) {
     if (!config.MASTER?.URL) {
       console.log('[REVERSE-HEARTBEAT] MASTER_URL not configured, skip REST heartbeat');
       updateMasterDownStatus(false);
-      return { success: false, error: 'NO_MASTER_URL_OR_FETCH' };
+      return { success: false, error: 'NO_MASTER_URL' };
     }
 
     try {
@@ -271,10 +268,6 @@ function createReverseClient(config, executor, methodsConfig) {
         ...status
       };
 
-      console.log(
-        `[REVERSE-HEARTBEAT] Sending heartbeat to ${config.MASTER.URL}/heartbeat...`
-      );
-
       const start = Date.now();
 
       let body;
@@ -286,7 +279,6 @@ function createReverseClient(config, executor, methodsConfig) {
       };
 
       if (isEncryptionEnabled()) {
-        console.log('[REVERSE-HEARTBEAT] Encrypting heartbeat data...');
         const encrypted = encryptionManager.createSecureMessage(requestBody, 'heartbeat');
         body = JSON.stringify(encrypted);
         headers['X-Encryption'] = 'enabled';
@@ -364,7 +356,7 @@ function createReverseClient(config, executor, methodsConfig) {
   async function registerWithMaster() {
     if (!config.MASTER?.URL) {
       console.log('[REVERSE-REGISTER] MASTER_URL not configured, skip registration');
-      return { success: false, error: 'NO_MASTER_URL_OR_FETCH' };
+      return { success: false, error: 'NO_MASTER_URL' };
     }
 
     try {
@@ -437,12 +429,6 @@ function createReverseClient(config, executor, methodsConfig) {
         }
 
         console.log('[REVERSE-REGISTER] ✓ Registered successfully to master');
-        console.log(
-          `[REVERSE-REGISTER] Methods: ${methodsSupported.length}, Version: ${methodsVersion.substring(
-            0,
-            8
-          )}`
-        );
 
         return {
           success: true,
@@ -563,7 +549,6 @@ function createReverseClient(config, executor, methodsConfig) {
     if (pingInterval) {
       clearInterval(pingInterval);
       pingInterval = null;
-      console.log('[REVERSE] WS: Ping interval cleaned up');
     }
   }
 
@@ -590,27 +575,20 @@ function createReverseClient(config, executor, methodsConfig) {
     return send(payload);
   }
 
-  // FIX #11: handleReconnectLimit previously returned a boolean but its return value
-  // was not checked before calling scheduleReconnect() in ws.on('close') and ws.on('error').
-  // Now this function is the SOLE arbiter of reconnect scheduling when max attempts reached.
-  // It either schedules a reconnect (after cooldown or reset) or does NOT schedule one.
-  // Callers should NOT call scheduleReconnect() after handleReconnectLimit().
   function handleReconnectLimit(reasonLabel) {
     const timeSinceLastSuccess = lastSuccessfulConnection
       ? Date.now() - lastSuccessfulConnection
       : Infinity;
 
     if (timeSinceLastSuccess > 300000) {
-      // Had a long successful connection previously — reset and retry
       console.log(
         `[REVERSE] WS: Resetting reconnect attempts after long successful connection (${reasonLabel})`
       );
       reconnectAttempts = 0;
       scheduleReconnect();
-      return; // reconnect scheduled
+      return;
     }
 
-    // FIX #11: Do NOT call scheduleReconnect here — enter cooldown instead
     console.log(
       `[REVERSE] WS: Max reconnect attempts reached${reasonLabel ? ` (${reasonLabel})` : ''}. Cooling down for 5 minutes.`
     );
@@ -621,7 +599,6 @@ function createReverseClient(config, executor, methodsConfig) {
         scheduleReconnect();
       }
     }, 300000);
-    // NO scheduleReconnect() call here — cooldown handles it
   }
 
   async function handleMessage(processed) {
@@ -832,7 +809,6 @@ function createReverseClient(config, executor, methodsConfig) {
       }
 
       case 'heartbeat_ack':
-        // intentionally empty
         break;
 
       default:
@@ -907,9 +883,14 @@ function createReverseClient(config, executor, methodsConfig) {
         handshakeTimeout: 10000
       });
 
+      // FIX: Reset disconnect guard for each new connection attempt
+      disconnectHandled = false;
+
       ws.on('open', async () => {
         console.log('[REVERSE] WS: ✓ Connected to master');
 
+        // FIX: Reset disconnect guard on successful connection
+        disconnectHandled = false;
         reconnectAttempts = 0;
         lastSuccessfulConnection = Date.now();
         masterDownDetection.isMasterDown = false;
@@ -941,10 +922,7 @@ function createReverseClient(config, executor, methodsConfig) {
           send(msg);
         }
 
-        if (pingInterval) {
-          clearInterval(pingInterval);
-          pingInterval = null;
-        }
+        cleanupPingInterval();
         pingInterval = setInterval(() => {
           if (ws && ws.readyState === WebSocket.OPEN) {
             try {
@@ -999,11 +977,12 @@ function createReverseClient(config, executor, methodsConfig) {
 
         if (isShuttingDown) return;
 
+        // FIX: Prevent double-increment when both 'close' and 'error' fire
+        if (disconnectHandled) return;
+        disconnectHandled = true;
+
         reconnectAttempts++;
 
-        // FIX #11: Only call handleReconnectLimit when limit is reached.
-        // handleReconnectLimit now handles ALL scheduling internally — no
-        // extra scheduleReconnect() call afterward.
         if (reconnectAttempts >= maxReconnectAttempts) {
           handleReconnectLimit('close');
         } else {
@@ -1018,15 +997,19 @@ function createReverseClient(config, executor, methodsConfig) {
 
         if (isShuttingDown) return;
 
+        // FIX: Prevent double-increment when both 'error' and 'close' fire
+        if (disconnectHandled) return;
+        disconnectHandled = true;
+
         reconnectAttempts++;
 
-        // FIX #11: Same fix as ws.on('close') above
         if (reconnectAttempts >= maxReconnectAttempts) {
           handleReconnectLimit('error');
         } else {
           scheduleReconnect();
         }
       });
+
     } catch (error) {
       console.error('[REVERSE] WS: Connection error:', error);
       if (!isShuttingDown) {
@@ -1058,17 +1041,15 @@ function createReverseClient(config, executor, methodsConfig) {
           }
         } else {
           console.error(
-            `[REVERSE] ✗ Background heartbeat failed:`,
+            '[REVERSE] ✗ Background heartbeat failed:',
             result.error
           );
-          console.log(`[REVERSE] Will retry in ${interval / 1000} seconds...`);
         }
       } catch (error) {
         console.error(
-          `[REVERSE] ✗ Background heartbeat error:`,
+          '[REVERSE] ✗ Background heartbeat error:',
           error.message
         );
-        console.log(`[REVERSE] Will retry in ${interval / 1000} seconds...`);
       }
     }
 
@@ -1081,7 +1062,7 @@ function createReverseClient(config, executor, methodsConfig) {
 
       heartbeatInterval = setInterval(executeHeartbeat, interval);
       console.log(
-        `[REVERSE] Started INFINITE RETRY background heartbeat every ${interval}ms`
+        `[REVERSE] Started background heartbeat every ${interval}ms`
       );
     }
 

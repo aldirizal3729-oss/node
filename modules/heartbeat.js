@@ -33,6 +33,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
   let currentMethodsConfig = methodsConfig || {};
   let encryptionManager = null;
 
+  // FIX: Deduplicated encryption init - single try/catch block
   if (config.ENCRYPTION?.ENABLED) {
     try {
       const { default: EncryptionManager } = await import('./encryption.js');
@@ -46,7 +47,15 @@ async function createHeartbeat(config, executor, methodsConfig) {
       console.log('[HEARTBEAT] Encryption loaded');
     } catch (error) {
       console.error('[HEARTBEAT] Failed to load encryption:', error.message);
+      encryptionManager = null;
     }
+  }
+
+  // FIX: Track current node mode dynamically instead of hardcoding 'DIRECT'
+  let currentNodeMode = config.NODE?.MODE || 'DIRECT';
+
+  function setNodeMode(mode) {
+    currentNodeMode = mode;
   }
 
   function isEncryptionEnabled() {
@@ -74,6 +83,12 @@ async function createHeartbeat(config, executor, methodsConfig) {
   }
 
   function buildRequestPayload({ path, bodyData, mode, extraHeaders = {}, tag }) {
+    // FIX: ensureMasterUrl check happens before buildRequestPayload is called in callers,
+    // but add a safety guard here too
+    if (!config.MASTER?.URL) {
+      throw new Error('MASTER_URL not configured');
+    }
+
     const headers = {
       'Content-Type': 'application/json',
       'X-Node-ID': config.NODE.ID,
@@ -150,7 +165,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
 
       return {
         timestamp: new Date().toISOString(),
-        mode: 'DIRECT',
+        // FIX: Use dynamic mode instead of hardcoded 'DIRECT'
+        mode: currentNodeMode,
         node_id: config.NODE.ID,
         system: {
           platform: os.platform(),
@@ -179,7 +195,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
           supported: Object.keys(currentMethodsConfig)
         },
         connection: {
-          type: 'direct',
+          // FIX: Use dynamic mode
+          type: currentNodeMode === 'REVERSE' ? 'websocket' : 'direct',
           ip: config.NODE.IP || null,
           port: config.SERVER.PORT,
           encryption: !!config.ENCRYPTION?.ENABLED
@@ -195,7 +212,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
 
       return {
         timestamp: new Date().toISOString(),
-        mode: 'DIRECT',
+        mode: currentNodeMode,
         error: error.message
       };
     }
@@ -218,6 +235,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
       const methodsSupported = Object.keys(currentMethodsConfig);
       const methodsCount = methodsSupported.length;
 
+      const isDirect = currentNodeMode !== 'REVERSE';
+
       const bodyData = {
         node_id: config.NODE.ID,
         hostname: os.hostname(),
@@ -228,13 +247,13 @@ async function createHeartbeat(config, executor, methodsConfig) {
         timestamp: new Date().toISOString(),
         methods_version: methodsVersion,
         methods_count: methodsCount,
-        mode: 'DIRECT',
-        connection_type: 'direct',
+        mode: currentNodeMode,
+        connection_type: isDirect ? 'direct' : 'websocket',
         capabilities: {
           encryption: isEncryptionEnabled(),
           version: config.ENCRYPTION?.VERSION || 'none',
-          direct_access: true,
-          reverse_only: false
+          direct_access: isDirect,
+          reverse_only: !isDirect
         }
       };
 
@@ -242,13 +261,14 @@ async function createHeartbeat(config, executor, methodsConfig) {
         node_id: config.NODE.ID,
         ip: config.NODE.IP,
         port: config.SERVER.PORT,
-        methods: methodsCount
+        methods: methodsCount,
+        mode: currentNodeMode
       });
 
       const { url, options } = buildRequestPayload({
         path: '/register',
         bodyData,
-        mode: 'DIRECT',
+        mode: currentNodeMode,
         tag: 'register'
       });
 
@@ -316,18 +336,13 @@ async function createHeartbeat(config, executor, methodsConfig) {
         ...statusWithoutNodeId
       };
 
-      console.log('[HEARTBEAT] Sending heartbeat with node_id:', config.NODE.ID);
-      console.log('[HEARTBEAT] Mode set to:', status.mode);
-      console.log('[HEARTBEAT] Connection type:', status.connection?.type);
-      console.log('[HEARTBEAT] Status keys:', Object.keys(status));
-
       const { url, options } = buildRequestPayload({
         path: '/heartbeat',
         bodyData: requestBody,
-        mode: 'DIRECT',
+        mode: currentNodeMode,
         tag: 'heartbeat',
         extraHeaders: {
-          'X-Connection-Type': 'direct'
+          'X-Connection-Type': currentNodeMode === 'REVERSE' ? 'websocket' : 'direct'
         }
       });
 
@@ -348,13 +363,6 @@ async function createHeartbeat(config, executor, methodsConfig) {
       console.log(
         `[HEARTBEAT] ✗ Heartbeat failed: HTTP ${res.status} - ${errorText}`
       );
-
-      if (!isEncryptionEnabled()) {
-        console.log(
-          '[HEARTBEAT] Request body sent:',
-          JSON.stringify(requestBody, null, 2)
-        );
-      }
 
       return {
         success: false,
@@ -421,8 +429,8 @@ async function createHeartbeat(config, executor, methodsConfig) {
     }
   }
 
+  // FIX: sendEncryptedHeartbeat delegates to sendHeartbeat (encryption is handled there)
   async function sendEncryptedHeartbeat() {
-    // Tetap delegasi ke sendHeartbeat agar kompatibel
     return sendHeartbeat();
   }
 
@@ -440,17 +448,11 @@ async function createHeartbeat(config, executor, methodsConfig) {
             '[HEARTBEAT] ✗ Background heartbeat failed:',
             result.error
           );
-          console.log(
-            `[HEARTBEAT] Will retry in ${interval / 1000} seconds...`
-          );
         }
       } catch (error) {
         console.error(
           '[HEARTBEAT] ✗ Background heartbeat error:',
           error.message
-        );
-        console.log(
-          `[HEARTBEAT] Will retry in ${interval / 1000} seconds...`
         );
       }
     }
@@ -461,7 +463,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
       }
 
       console.log(
-        `[HEARTBEAT] Starting INFINITE RETRY background heartbeat every ${interval}ms`
+        `[HEARTBEAT] Starting background heartbeat every ${interval}ms`
       );
 
       setTimeout(executeHeartbeat, 2000);
@@ -491,6 +493,7 @@ async function createHeartbeat(config, executor, methodsConfig) {
     getFullStatus,
     updateMethodsVersion,
     updateMethodsConfig,
+    setNodeMode,
     getMethodsCount,
     getMethodsVersion: getMethodsVersionHash,
     isEncryptionEnabled,

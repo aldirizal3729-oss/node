@@ -18,16 +18,16 @@ class EncryptionManager {
       SHARED_SECRET: null,
       NODE_ID: null
     };
-    
+
     // Apply configuration
     if (config && config.ENCRYPTION) {
       Object.assign(this.config, config.ENCRYPTION);
     }
-    
+
     if (config && config.NODE && config.NODE.ID) {
       this.config.NODE_ID = config.NODE.ID;
     }
-    
+
     // Set shared secret
     this.sharedSecret = null;
     if (this.config.SHARED_SECRET) {
@@ -35,13 +35,13 @@ class EncryptionManager {
     } else if (config && config.SHARED_SECRET) {
       this.sharedSecret = config.SHARED_SECRET;
     }
-    
-    // FIX Bug #9: Validate AFTER all initialization, disable before throwing
+
+    // Validate AFTER all initialization
     if (this.config.ENABLED && !this.sharedSecret) {
-      this.config.ENABLED = false; // Disable to prevent partial initialization
+      this.config.ENABLED = false;
       throw new Error('SHARED_SECRET is required when encryption is enabled');
     }
-    
+
     console.log('[ENCRYPTION] Initialized', {
       enabled: this.config.ENABLED,
       version: this.config.VERSION,
@@ -51,165 +51,138 @@ class EncryptionManager {
   }
 
   generateKey(salt) {
-    try {
-      if (!salt || !Buffer.isBuffer(salt)) {
-        throw new Error('Invalid salt: must be a Buffer');
-      }
-      
-      if (salt.length !== this.config.SALT_LENGTH) {
-        console.warn(
-          `[ENCRYPTION] Warning: Salt length mismatch. Expected ${this.config.SALT_LENGTH}, got ${salt.length}`
-        );
-      }
-      
-      if (!this.sharedSecret) {
-        throw new Error('Shared secret not configured');
-      }
-      
-      const key = crypto.pbkdf2Sync(
-        this.sharedSecret,
-        salt,
-        this.config.KEY_DERIVATION.ITERATIONS,
-        this.config.KEY_DERIVATION.KEYLENGTH,
-        this.config.KEY_DERIVATION.DIGEST
-      );
-      
-      return key;
-    } catch (error) {
-      console.error('[ENCRYPTION] Key generation error:', error.message);
-      throw error;
+    if (!salt || !Buffer.isBuffer(salt)) {
+      throw new Error('Invalid salt: must be a Buffer');
     }
+
+    if (salt.length !== this.config.SALT_LENGTH) {
+      console.warn(
+        `[ENCRYPTION] Warning: Salt length mismatch. Expected ${this.config.SALT_LENGTH}, got ${salt.length}`
+      );
+    }
+
+    if (!this.sharedSecret) {
+      throw new Error('Shared secret not configured');
+    }
+
+    return crypto.pbkdf2Sync(
+      this.sharedSecret,
+      salt,
+      this.config.KEY_DERIVATION.ITERATIONS,
+      this.config.KEY_DERIVATION.KEYLENGTH,
+      this.config.KEY_DERIVATION.DIGEST
+    );
   }
 
   encrypt(data) {
-    try {
-      if (!data) {
-        throw new Error('No data to encrypt');
-      }
-      
-      if (!this.config.ENABLED || !this.sharedSecret) {
-        throw new Error('Encryption is not enabled or configured');
-      }
-      
-      const salt = crypto.randomBytes(this.config.SALT_LENGTH);
-      const iv = crypto.randomBytes(this.config.IV_LENGTH);
-      const key = this.generateKey(salt);
-      
-      const dataToEncrypt = typeof data === 'string' ? data : JSON.stringify(data);
-      
-      const cipher = crypto.createCipheriv(
-        this.config.ALGORITHM,
-        key,
-        iv,
-        { authTagLength: this.config.AUTH_TAG_LENGTH }
-      );
-      
-      let encrypted = cipher.update(dataToEncrypt, 'utf8', 'hex');
-      encrypted += cipher.final('hex');
-      const authTag = cipher.getAuthTag();
-      
-      const result = {
-        encrypted,
-        iv: iv.toString('hex'),
-        salt: salt.toString('hex'),
-        authTag: authTag.toString('hex'),
-        timestamp: Date.now(),
-        version: this.config.VERSION,
-        nodeId: this.config.NODE_ID
-      };
-      
-      return result;
-    } catch (error) {
-      console.error('[ENCRYPTION] Encryption error:', error.message);
-      throw error;
+    if (!data) {
+      throw new Error('No data to encrypt');
     }
+
+    if (!this.config.ENABLED || !this.sharedSecret) {
+      throw new Error('Encryption is not enabled or configured');
+    }
+
+    const salt = crypto.randomBytes(this.config.SALT_LENGTH);
+    const iv = crypto.randomBytes(this.config.IV_LENGTH);
+    const key = this.generateKey(salt);
+
+    const dataToEncrypt = typeof data === 'string' ? data : JSON.stringify(data);
+
+    const cipher = crypto.createCipheriv(
+      this.config.ALGORITHM,
+      key,
+      iv,
+      { authTagLength: this.config.AUTH_TAG_LENGTH }
+    );
+
+    let encrypted = cipher.update(dataToEncrypt, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag();
+
+    return {
+      encrypted,
+      iv: iv.toString('hex'),
+      salt: salt.toString('hex'),
+      authTag: authTag.toString('hex'),
+      timestamp: Date.now(),
+      version: this.config.VERSION,
+      nodeId: this.config.NODE_ID
+    };
   }
 
   decrypt(encryptedPackage) {
+    if (!encryptedPackage || typeof encryptedPackage !== 'object') {
+      throw new Error('Invalid encrypted package: not an object');
+    }
+
+    if (!this.config.ENABLED || !this.sharedSecret) {
+      throw new Error('Encryption is not enabled or configured');
+    }
+
+    const { encrypted, iv, salt, authTag } = encryptedPackage;
+
+    if (!encrypted || typeof encrypted !== 'string' || encrypted.length === 0) {
+      throw new Error('Missing or invalid encrypted data');
+    }
+
+    if (!iv || typeof iv !== 'string' || iv.length === 0) {
+      throw new Error('Missing or invalid IV');
+    }
+
+    if (!salt || typeof salt !== 'string' || salt.length === 0) {
+      throw new Error('Missing or invalid salt');
+    }
+
+    if (!authTag || typeof authTag !== 'string' || authTag.length === 0) {
+      throw new Error('Missing or invalid authTag');
+    }
+
+    let ivBuffer, saltBuffer, authTagBuffer;
     try {
-      if (!encryptedPackage || typeof encryptedPackage !== 'object') {
-        throw new Error('Invalid encrypted package: not an object');
-      }
-      
-      if (!this.config.ENABLED || !this.sharedSecret) {
-        throw new Error('Encryption is not enabled or configured');
-      }
-      
-      const { encrypted, iv, salt, authTag } = encryptedPackage;
-      
-      if (!encrypted || typeof encrypted !== 'string' || encrypted.length === 0) {
-        throw new Error('Missing or invalid encrypted data');
-      }
-      
-      if (!iv || typeof iv !== 'string' || iv.length === 0) {
-        throw new Error('Missing or invalid IV');
-      }
-      
-      if (!salt || typeof salt !== 'string' || salt.length === 0) {
-        throw new Error('Missing or invalid salt');
-      }
-      
-      if (!authTag || typeof authTag !== 'string' || authTag.length === 0) {
-        throw new Error('Missing or invalid authTag');
-      }
-      
-      let ivBuffer, saltBuffer, authTagBuffer;
-      try {
-        ivBuffer = Buffer.from(iv, 'hex');
-        saltBuffer = Buffer.from(salt, 'hex');
-        authTagBuffer = Buffer.from(authTag, 'hex');
-      } catch (bufferError) {
-        throw new Error(`Invalid hex encoding: ${bufferError.message}`);
-      }
-      
-      if (ivBuffer.length !== this.config.IV_LENGTH) {
-        console.warn(
-          `[ENCRYPTION] Warning: IV length mismatch. Expected ${this.config.IV_LENGTH}, got ${ivBuffer.length}`
-        );
-      }
-      
-      if (saltBuffer.length !== this.config.SALT_LENGTH) {
-        console.warn(
-          `[ENCRYPTION] Warning: Salt length mismatch. Expected ${this.config.SALT_LENGTH}, got ${saltBuffer.length}`
-        );
-      }
-      
-      if (authTagBuffer.length !== this.config.AUTH_TAG_LENGTH) {
-        console.warn(
-          `[ENCRYPTION] Warning: AuthTag length mismatch. Expected ${this.config.AUTH_TAG_LENGTH}, got ${authTagBuffer.length}`
-        );
-      }
-      
-      const key = this.generateKey(saltBuffer);
-      
-      const decipher = crypto.createDecipheriv(
-        this.config.ALGORITHM,
-        key,
-        ivBuffer,
-        { authTagLength: this.config.AUTH_TAG_LENGTH }
+      ivBuffer = Buffer.from(iv, 'hex');
+      saltBuffer = Buffer.from(salt, 'hex');
+      authTagBuffer = Buffer.from(authTag, 'hex');
+    } catch (bufferError) {
+      throw new Error(`Invalid hex encoding: ${bufferError.message}`);
+    }
+
+    if (ivBuffer.length !== this.config.IV_LENGTH) {
+      console.warn(
+        `[ENCRYPTION] Warning: IV length mismatch. Expected ${this.config.IV_LENGTH}, got ${ivBuffer.length}`
       );
-      
-      decipher.setAuthTag(authTagBuffer);
-      
-      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      
-      try {
-        return JSON.parse(decrypted);
-      } catch {
-        return decrypted;
-      }
-    } catch (error) {
-      console.error('[ENCRYPTION] Decryption error:', error.message);
-      console.error('[ENCRYPTION] Error details:', {
-        hasPackage: !!encryptedPackage,
-        packageKeys: encryptedPackage ? Object.keys(encryptedPackage) : 'no package',
-        hasEncrypted: !!(encryptedPackage && encryptedPackage.encrypted),
-        hasIv: !!(encryptedPackage && encryptedPackage.iv),
-        hasSalt: !!(encryptedPackage && encryptedPackage.salt),
-        hasAuthTag: !!(encryptedPackage && encryptedPackage.authTag)
-      });
-      throw error;
+    }
+
+    if (saltBuffer.length !== this.config.SALT_LENGTH) {
+      console.warn(
+        `[ENCRYPTION] Warning: Salt length mismatch. Expected ${this.config.SALT_LENGTH}, got ${saltBuffer.length}`
+      );
+    }
+
+    if (authTagBuffer.length !== this.config.AUTH_TAG_LENGTH) {
+      console.warn(
+        `[ENCRYPTION] Warning: AuthTag length mismatch. Expected ${this.config.AUTH_TAG_LENGTH}, got ${authTagBuffer.length}`
+      );
+    }
+
+    const key = this.generateKey(saltBuffer);
+
+    const decipher = crypto.createDecipheriv(
+      this.config.ALGORITHM,
+      key,
+      ivBuffer,
+      { authTagLength: this.config.AUTH_TAG_LENGTH }
+    );
+
+    decipher.setAuthTag(authTagBuffer);
+
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+
+    try {
+      return JSON.parse(decrypted);
+    } catch {
+      return decrypted;
     }
   }
 
@@ -241,8 +214,8 @@ class EncryptionManager {
     message.signature = signature;
 
     const encrypted = this.encrypt(message);
-    
-    const envelope = {
+
+    return {
       envelope: 'secure',
       version: this.config.VERSION,
       payload: encrypted,
@@ -254,8 +227,6 @@ class EncryptionManager {
         encrypted: true
       }
     };
-    
-    return envelope;
   }
 
   processSecureMessage(envelope) {
@@ -267,9 +238,8 @@ class EncryptionManager {
           shouldFallback: true
         };
       }
-      
+
       if (envelope.envelope === 'plain') {
-        // FIX Bug #11: Validate payload exists
         if (!envelope.payload) {
           return {
             success: false,
@@ -277,7 +247,7 @@ class EncryptionManager {
             shouldFallback: true
           };
         }
-        
+
         return {
           success: true,
           data: envelope.payload,
@@ -286,7 +256,7 @@ class EncryptionManager {
           metadata: envelope.metadata || {}
         };
       }
-      
+
       if (envelope.envelope !== 'secure') {
         return {
           success: false,
@@ -295,7 +265,6 @@ class EncryptionManager {
         };
       }
 
-      // FIX Bug #11: Validate secure envelope has payload
       if (!envelope.payload) {
         return {
           success: false,
@@ -305,7 +274,7 @@ class EncryptionManager {
       }
 
       const decrypted = this.decrypt(envelope.payload);
-      
+
       if (decrypted.signature) {
         if (!this.verifySignature(decrypted, decrypted.signature)) {
           throw new Error('Signature verification failed');
@@ -334,7 +303,7 @@ class EncryptionManager {
       };
     } catch (error) {
       console.error('[ENCRYPTION] Message processing error:', error.message);
-      
+
       if (
         error.message.includes('not enabled') ||
         error.message.includes('not configured')
@@ -346,7 +315,7 @@ class EncryptionManager {
           rawError: error
         };
       }
-      
+
       return {
         success: false,
         error: error.message,
@@ -357,14 +326,14 @@ class EncryptionManager {
   }
 
   createSignature(data) {
+    if (!this.sharedSecret) {
+      return '';
+    }
+
+    const dataToSign = { ...data };
+    delete dataToSign.signature;
+
     try {
-      if (!this.sharedSecret) {
-        return '';
-      }
-      
-      const dataToSign = { ...data };
-      delete dataToSign.signature;
-      
       const hmac = crypto.createHmac('sha256', this.sharedSecret);
       hmac.update(JSON.stringify(dataToSign));
       return hmac.digest('hex');
@@ -375,28 +344,28 @@ class EncryptionManager {
   }
 
   verifySignature(data, signature) {
+    if (!this.sharedSecret || !signature) {
+      return false;
+    }
+
+    const dataToVerify = { ...data };
+    delete dataToVerify.signature;
+
     try {
-      if (!this.sharedSecret || !signature) {
-        return false;
-      }
-      
-      const dataToVerify = { ...data };
-      delete dataToVerify.signature;
-      
       const expected = this.createSignature(dataToVerify);
-      
+
       if (!expected) {
         return false;
       }
-      
+
       const expectedBuffer = Buffer.from(expected, 'hex');
       const signatureBuffer = Buffer.from(signature, 'hex');
-      
-      // FIX Bug #10: Check length BEFORE timingSafeEqual to prevent timing attacks
+
+      // Check length BEFORE timingSafeEqual to prevent timing attacks
       if (expectedBuffer.length !== signatureBuffer.length) {
         return false;
       }
-      
+
       return crypto.timingSafeEqual(expectedBuffer, signatureBuffer);
     } catch (error) {
       console.error('[ENCRYPTION] Signature verification error:', error.message);
@@ -427,29 +396,31 @@ class EncryptionManager {
           message: 'Encryption is disabled'
         };
       }
-      
+
       const testData = {
         message: 'Encryption test',
-        timestamp: Date.now(),
+        timestamp: 12345678, // FIX: Use fixed timestamp to avoid flaky comparison
         nodeId: this.config.NODE_ID || 'test',
         test: true
       };
-      
+
       const encrypted = this.encrypt(testData);
       const decrypted = this.decrypt(encrypted);
-      
-      const testDataStr = JSON.stringify(testData);
-      const decryptedStr =
-        typeof decrypted === 'string' ? decrypted : JSON.stringify(decrypted);
-      
-      const success = testDataStr === decryptedStr;
-      
+
+      // FIX: Compare objects structurally rather than JSON strings to avoid key-ordering issues
+      const originalStr = JSON.stringify(testData, Object.keys(testData).sort());
+      const decryptedStr = typeof decrypted === 'object'
+        ? JSON.stringify(decrypted, Object.keys(testData).sort())
+        : decrypted;
+
+      const success = originalStr === decryptedStr;
+
       if (!success) {
         console.warn('[ENCRYPTION] Self-test failed:');
         console.warn('Original:', testData);
         console.warn('Decrypted:', decrypted);
       }
-      
+
       return {
         success,
         enabled: true,
